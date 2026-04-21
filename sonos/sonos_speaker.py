@@ -68,10 +68,18 @@ _INFO_PROBE_TIMEOUT = 5.0
 
 # Upper bound on how long we'll wait for the Sonos household to
 # converge on a new topology after we issue ``modifyGroupMembers``.
-# Push events on a healthy LAN arrive in 300ms–2s; a 10s ceiling is
-# generous enough to cover a slow/busy household without hanging a
-# user-facing play call forever.
-_TOPOLOGY_SETTLE_TIMEOUT = 10.0
+# Push events on a healthy LAN arrive in 300ms–2s, but household-wide
+# groupings of 12+ speakers routinely take 15–20s to fully converge,
+# and aiosonos occasionally swallows push events during heavy topology
+# activity. ``_wait_for_group`` polls ``client.groups`` as a fallback
+# so a missed event doesn't wedge the wait — this ceiling is just the
+# "we really do need to give up" limit for pathological cases.
+_TOPOLOGY_SETTLE_TIMEOUT = 30.0
+
+# How often ``_wait_for_group`` rechecks ``client.groups`` while
+# waiting for topology to settle. Cheap — reads cached state — so we
+# can poll aggressively without generating network traffic.
+_TOPOLOGY_POLL_INTERVAL = 0.5
 
 # Spotify URIs as they appear in MusicItem.uri: ``spotify:track:abc123``
 # etc. We route these to ``playback.load_content`` with a Spotify
@@ -1145,17 +1153,25 @@ async def _wait_for_group(
     client: SonosLocalApiClient,
     predicate: Any,
     timeout: float,
+    poll_interval: float = _TOPOLOGY_POLL_INTERVAL,
 ) -> str:
     """Wait (bounded) for a group matching ``predicate`` to appear.
 
     Adapted from Home Assistant's ``SonosSpeaker.wait_for_groups``
-    pattern: subscribe to groups/player events, call the topology-
-    changing command, then block on an ``asyncio.Event`` until a
-    predicate over ``client.groups`` returns true. Required for
-    operations where Sonos's response doesn't identify the new group
-    directly — notably soloing a speaker via ``modifyGroupMembers``,
-    whose ``GroupInfo`` response describes the *remnant* group rather
-    than the new solo group.
+    pattern but with a belt-and-braces poll loop: subscribe to
+    groups/player events *and* recheck ``client.groups`` every
+    ``poll_interval`` seconds until a predicate returns true. Required
+    for operations where Sonos's response doesn't identify the new
+    group directly — notably soloing a speaker via
+    ``modifyGroupMembers``, whose ``GroupInfo`` response describes the
+    *remnant* group rather than the new solo group.
+
+    Why poll as well as subscribe: on large households (12+ speakers)
+    aiosonos occasionally swallows push events during the storm of
+    updates that accompanies a full-house regroup, so an event-only
+    wait can time out even though the group has already formed and
+    ``client.groups`` reflects it. The poll is a cheap cache read —
+    no network traffic — so it's effectively free insurance.
 
     Returns the id of the first matching group. Raises ``RuntimeError``
     on timeout (rather than hanging the caller's play command).
@@ -1178,6 +1194,16 @@ async def _wait_for_group(
         if _check():
             settled.set()
 
+    async def _poll() -> None:
+        while not settled.is_set():
+            try:
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                return
+            if _check():
+                settled.set()
+                return
+
     unsub = client.subscribe(
         _on_event,
         event_filter=(
@@ -1187,19 +1213,26 @@ async def _wait_for_group(
             EventType.PLAYER_UPDATED,
         ),
     )
+    poll_task = asyncio.create_task(_poll())
     try:
-        await asyncio.wait_for(settled.wait(), timeout=timeout)
-    except asyncio.TimeoutError as exc:
-        # One final check — the event might have landed in the gap
-        # between our last subscription callback and the timeout
-        # firing.
-        if _check():
-            return found[0]
-        raise RuntimeError(
-            f"Timed out after {timeout:.1f}s waiting for Sonos "
-            f"topology to settle"
-        ) from exc
+        try:
+            await asyncio.wait_for(settled.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            # One final check — an event or poll tick might have
+            # landed in the gap between the last callback and the
+            # timeout firing.
+            if _check():
+                return found[0]
+            raise RuntimeError(
+                f"Timed out after {timeout:.1f}s waiting for Sonos "
+                f"topology to settle"
+            ) from exc
     finally:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
         unsub()
     return found[0]
 

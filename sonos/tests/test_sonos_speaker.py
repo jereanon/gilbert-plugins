@@ -814,6 +814,85 @@ async def test_ensure_group_waits_for_membership_to_settle() -> None:
     )
 
 
+async def test_ensure_group_settles_via_polling_when_events_are_dropped() -> None:
+    """On large households aiosonos occasionally swallows push events
+    during the storm of updates that accompanies a full-house regroup.
+    ``_wait_for_group`` polls ``client.groups`` as a fallback so a
+    missed event doesn't wedge the wait — simulate that case by having
+    ``modify_group_members`` mutate the group's ``player_ids`` without
+    firing any subscription callbacks, and assert the wait still
+    completes (instead of raising ``RuntimeError`` on timeout)."""
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+
+    backend, client, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A",
+        group_in=group,
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    b_client.groups = [group]
+    backend._clients["RINCON_B"] = b_client
+
+    # Subscribe captures callbacks but we deliberately NEVER invoke
+    # them — this is the "events got dropped" scenario.
+    client.subscribe = lambda cb, **_kw: (lambda: None)
+
+    async def simulated_modify(
+        _group_id: str,
+        player_ids_to_add: list[str],
+        player_ids_to_remove: list[str],
+    ) -> dict:
+        new_members = [
+            *(p for p in group.player_ids if p not in player_ids_to_remove),
+            *player_ids_to_add,
+        ]
+
+        # Update the cached group state after a brief delay, WITHOUT
+        # firing any subscription callbacks. The poll loop inside
+        # _wait_for_group must see this change.
+        async def _delayed_update() -> None:
+            await asyncio.sleep(0.05)
+            group.player_ids = new_members
+
+        asyncio.create_task(_delayed_update())
+        return {
+            "_objectType": "groupInfo",
+            "group": {
+                "_objectType": "group",
+                "id": "group-1",
+                "name": "Zone",
+                "coordinatorId": "RINCON_A",
+                "playerIds": new_members,
+            },
+        }
+
+    client.api.groups.modify_group_members = AsyncMock(
+        side_effect=simulated_modify
+    )
+
+    await backend.play_uri(
+        PlayRequest(
+            uri="http://gilbert/song.mp3",
+            speaker_ids=["RINCON_A", "RINCON_B"],
+        )
+    )
+
+    # If polling didn't kick in we'd have hung until the 30s topology
+    # timeout and raised ``RuntimeError``; reaching here is the pass.
+    client.api.playback_session.create_session.assert_awaited()
+
+
 async def test_create_session_uses_elected_coordinator_not_anchor() -> None:
     """Sonos's local WebSocket API requires ``createSession`` to be
     issued through the **coordinator's** WebSocket — not through any
