@@ -414,19 +414,50 @@ class SonosSpeaker(SpeakerBackend):
         async def _listen() -> None:
             # ``start_listening`` fetches initial state + keeps the
             # connection alive, dispatching push events to subscribers.
-            # Runs until the WebSocket closes or the task is cancelled.
-            try:
-                await client.start_listening(init_ready)
-            except (ConnectionClosed, SonosException):
-                logger.debug(
-                    "Sonos listener for %s closed", metadata.name, exc_info=True
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - report once and exit
-                logger.exception(
-                    "Unexpected error in Sonos listener for %s", metadata.name
-                )
+            # It blocks until the WebSocket closes — Sonos firmware
+            # updates, network blips, and speaker reboots all land
+            # here. Without a reconnect loop the client stays in
+            # ``self._clients`` as a dead handle and every subsequent
+            # command raises ``InvalidState: Not connected``. Loop
+            # with backoff until the service is stopped (which
+            # cancels this task).
+            backoff = 2.0
+            while True:
+                try:
+                    await client.start_listening(init_ready)
+                    logger.info(
+                        "Sonos listener for %s returned cleanly — reconnecting",
+                        metadata.name,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (ConnectionClosed, SonosException) as exc:
+                    logger.info(
+                        "Sonos listener for %s closed (%s) — reconnecting in %.1fs",
+                        metadata.name,
+                        exc,
+                        backoff,
+                    )
+                except Exception:  # noqa: BLE001 - log and reconnect
+                    logger.exception(
+                        "Unexpected error in Sonos listener for %s — reconnecting in %.1fs",
+                        metadata.name,
+                        backoff,
+                    )
+
+                try:
+                    await asyncio.sleep(backoff)
+                    await client.connect()
+                    backoff = 2.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - keep trying with backoff
+                    logger.debug(
+                        "Sonos reconnect to %s failed — will retry",
+                        metadata.name,
+                        exc_info=True,
+                    )
+                    backoff = min(backoff * 2, 60.0)
 
         task = asyncio.create_task(
             _listen(), name=f"sonos-listen-{metadata.player_id}"
