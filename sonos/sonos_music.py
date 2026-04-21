@@ -391,6 +391,7 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
     """
 
     backend_name = "sonos"
+    supports_queue = True
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:

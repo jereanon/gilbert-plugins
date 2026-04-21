@@ -213,6 +213,58 @@ class SonosSmapiClient:
         await self._seek_track(coord_ip, 1)
         await self._play(coord_ip)
 
+    async def enqueue_spotify(
+        self,
+        coord_ip: str,
+        coord_rincon_id: str,
+        kind: str,
+        spotify_id: str,
+        title: str,
+    ) -> None:
+        """Append a Spotify item to the coordinator's queue.
+
+        Unlike ``play_spotify``, does NOT clear the queue, re-point
+        AVTransport, seek, or call Play — it just appends. If the
+        speaker isn't currently playing from its own queue, the enqueued
+        item won't start automatically; the caller is expected to only
+        invoke this when the queue is already the active source (i.e.
+        music is currently playing from a prior ``play_spotify`` call).
+
+        Tries each known SMAPI service number in turn so households
+        registered under different Spotify SMAPI integrations (2311
+        vs. 3079) both work without user intervention.
+        """
+        last_exc: SmapiError | None = None
+        for sn in _SPOTIFY_SMAPI_SERVICE_NUMBERS:
+            pair = build_spotify_enqueue(kind, spotify_id, title, sn)
+            try:
+                await self._add_uri_to_queue(
+                    coord_ip, pair.enqueue_uri, pair.didl_metadata
+                )
+                logger.info(
+                    "Sonos SMAPI enqueue-only succeeded: coord=%s kind=%s id=%s sn=%d",
+                    coord_ip,
+                    kind,
+                    spotify_id,
+                    sn,
+                )
+                # Make sure the coordinator is pointed at its own queue
+                # so the newly-enqueued item will be reached as playback
+                # advances past the current track. Safe to call even when
+                # already set — Sonos silently accepts the idempotent URI.
+                await self._set_queue_as_source(coord_ip, coord_rincon_id)
+                return
+            except SmapiError as exc:
+                logger.info(
+                    "Sonos SMAPI enqueue-only with sn=%d failed: %s — "
+                    "trying next service number",
+                    sn,
+                    exc,
+                )
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
     # ------------------------------------------------------------------
     # SOAP primitives
     # ------------------------------------------------------------------

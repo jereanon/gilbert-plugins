@@ -735,6 +735,72 @@ class SonosSpeaker(SpeakerBackend):
             station_metadata=station_metadata,
         )
 
+    async def enqueue_uri(self, request: PlayRequest) -> None:
+        """Append a Spotify URI to the group coordinator's queue.
+
+        Non-Spotify URIs raise ``NotImplementedError`` — the generic
+        HTTP-stream playback path uses ``playback_session`` which isn't
+        a queue. The music service guards on ``supports_queue`` before
+        calling this, so the NotImplementedError path is a backstop for
+        misuse rather than an expected outcome.
+        """
+        logger.info(
+            "Sonos enqueue_uri: uri=%s title=%r speaker_ids=%s",
+            request.uri,
+            request.title,
+            request.speaker_ids,
+        )
+        spotify = _extract_spotify_ref(request.uri)
+        if spotify is None:
+            raise NotImplementedError(
+                "Sonos enqueue only supports Spotify URIs; got "
+                f"{request.uri!r}"
+            )
+
+        target_ids = request.speaker_ids or list(self._player_metadata.keys())
+        if not target_ids:
+            raise RuntimeError("No speakers available")
+
+        seen: set[str] = set()
+        live: list[str] = []
+        for tid in target_ids:
+            if tid in seen or tid not in self._clients:
+                continue
+            seen.add(tid)
+            live.append(tid)
+        if not live:
+            raise RuntimeError(
+                f"None of the requested speakers ({target_ids}) are connected"
+            )
+
+        coord_player_id, _group_id = await self._ensure_group(live)
+        if self._smapi is None:
+            raise RuntimeError("Sonos SMAPI client is not initialized")
+
+        meta = self._player_metadata.get(coord_player_id)
+        if meta is None:
+            raise RuntimeError(
+                f"Cannot enqueue Spotify — no metadata for coordinator "
+                f"{coord_player_id!r}"
+            )
+
+        try:
+            await self._smapi.enqueue_spotify(
+                coord_ip=meta.ip_address,
+                coord_rincon_id=coord_player_id,
+                kind=spotify.kind,
+                spotify_id=spotify.id,
+                title=request.title,
+            )
+        except SmapiError as exc:
+            logger.error(
+                "Sonos SMAPI enqueue FAILED: coord=%s spotify=%s error=%s",
+                coord_player_id,
+                spotify.uri,
+                exc,
+            )
+            raise
+
     async def _load_spotify_content(
         self,
         coord_player_id: str,

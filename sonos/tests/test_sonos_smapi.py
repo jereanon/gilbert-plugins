@@ -231,6 +231,58 @@ async def test_play_spotify_falls_back_to_alternate_service_number() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enqueue_spotify_emits_only_add_and_set_source() -> None:
+    """``enqueue_spotify`` must NOT clear the queue, seek, or call Play —
+    appending a track mid-playback shouldn't stop whatever's playing.
+    Just an AddURIToQueue followed by SetAVTransportURI (idempotent —
+    makes sure the transport points at the local queue so the new track
+    will be reached as playback advances)."""
+    recorder = _CallRecorder()
+    http = AsyncClient(transport=MockTransport(recorder.handler), timeout=5.0)
+    client = SonosSmapiClient(http_client=http)
+
+    await client.enqueue_spotify(
+        coord_ip="192.168.86.232",
+        coord_rincon_id="RINCON_542A1BE1908601400",
+        kind="track",
+        spotify_id="712uvW1Vezq8WpQi38v2L9",
+        title="Black Dog",
+    )
+
+    actions = [action for action, _ in recorder.calls]
+    av_ns = "urn:schemas-upnp-org:service:AVTransport:1"
+    assert actions == [
+        f"{av_ns}#AddURIToQueue",
+        f"{av_ns}#SetAVTransportURI",
+    ]
+    # Still points at the coordinator's own queue — new track reachable.
+    set_body = recorder.calls[1][1].decode()
+    assert "x-rincon-queue:RINCON_542A1BE1908601400#0" in set_body
+
+
+@pytest.mark.asyncio
+async def test_enqueue_spotify_falls_back_to_alternate_service_number() -> None:
+    """Same fallback semantics as ``play_spotify``: households registered
+    under the US SMAPI variant should succeed on the second attempt."""
+    recorder = _CallRecorder(fail_services={2311})
+    http = AsyncClient(transport=MockTransport(recorder.handler), timeout=5.0)
+    client = SonosSmapiClient(http_client=http)
+
+    await client.enqueue_spotify(
+        coord_ip="192.168.86.232",
+        coord_rincon_id="RINCON_COORD",
+        kind="track",
+        spotify_id="abc",
+        title="Test",
+    )
+
+    add_bodies = [b for a, b in recorder.calls if a.endswith("#AddURIToQueue")]
+    assert len(add_bodies) == 2
+    assert b"SA_RINCON2311_" in add_bodies[0]
+    assert b"SA_RINCON3079_" in add_bodies[1]
+
+
+@pytest.mark.asyncio
 async def test_play_spotify_raises_when_all_service_numbers_fail() -> None:
     """If every SMAPI service number rejects the enqueue, surface the
     failure to the caller instead of silently pretending playback

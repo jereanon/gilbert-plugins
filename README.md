@@ -407,7 +407,7 @@ Sonos speaker control (S2 only) + Spotify-backed music search. Two backends regi
 
 **Backends registered**
 - `SpeakerBackend.backend_name = "sonos"` — playback, volume, grouping, TTS announcements (via native `audio_clip`), now-playing, Spotify URI handoff. Requires S2 firmware on every target speaker; run `scripts/check_sonos_s2.py` to verify before enabling.
-- `MusicBackend.backend_name = "sonos"` — Spotify search, user library, playlists via Spotify's Web API. Apple Music / Amazon Music / other services are NOT supported — they went away with the SMAPI drop.
+- `MusicBackend.backend_name = "sonos"` — Spotify search, user library, playlists via Spotify's Web API. Apple Music / Amazon Music / other services are NOT supported — they went away with the SMAPI drop. Sets `supports_queue = True`: the music service exposes `add_to_queue` / `/music queue <title>` and appends to the speaker queue via SMAPI's `AddURIToQueue` without stopping current playback.
 
 **Configure** (Settings → Media → Speakers / Music)
 
