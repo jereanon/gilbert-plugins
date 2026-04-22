@@ -231,12 +231,13 @@ async def test_play_spotify_falls_back_to_alternate_service_number() -> None:
 
 
 @pytest.mark.asyncio
-async def test_enqueue_spotify_emits_only_add_and_set_source() -> None:
-    """``enqueue_spotify`` must NOT clear the queue, seek, or call Play —
-    appending a track mid-playback shouldn't stop whatever's playing.
-    Just an AddURIToQueue followed by SetAVTransportURI (idempotent —
-    makes sure the transport points at the local queue so the new track
-    will be reached as playback advances)."""
+async def test_enqueue_spotify_only_adds_does_not_touch_transport() -> None:
+    """Regression guard: ``enqueue_spotify`` must be a pure
+    ``AddURIToQueue``. No SetAVTransportURI, no Seek, no Play. Calling
+    SetAVTransportURI mid-playback flips the transport source and can
+    cause whatever else is playing to cut out / the queue to start
+    playing on its own — that was the user-visible bug that prompted
+    this split."""
     recorder = _CallRecorder()
     http = AsyncClient(transport=MockTransport(recorder.handler), timeout=5.0)
     client = SonosSmapiClient(http_client=http)
@@ -251,12 +252,30 @@ async def test_enqueue_spotify_emits_only_add_and_set_source() -> None:
 
     actions = [action for action, _ in recorder.calls]
     av_ns = "urn:schemas-upnp-org:service:AVTransport:1"
+    assert actions == [f"{av_ns}#AddURIToQueue"]
+
+
+@pytest.mark.asyncio
+async def test_resume_queue_only_sets_source_and_plays() -> None:
+    """``resume_queue`` just re-points the transport at the queue and
+    presses Play — no AddURIToQueue, no Seek. Used to start/resume
+    queue playback after queue items were loaded separately."""
+    recorder = _CallRecorder()
+    http = AsyncClient(transport=MockTransport(recorder.handler), timeout=5.0)
+    client = SonosSmapiClient(http_client=http)
+
+    await client.resume_queue(
+        coord_ip="192.168.86.232",
+        coord_rincon_id="RINCON_542A1BE1908601400",
+    )
+
+    actions = [action for action, _ in recorder.calls]
+    av_ns = "urn:schemas-upnp-org:service:AVTransport:1"
     assert actions == [
-        f"{av_ns}#AddURIToQueue",
         f"{av_ns}#SetAVTransportURI",
+        f"{av_ns}#Play",
     ]
-    # Still points at the coordinator's own queue — new track reachable.
-    set_body = recorder.calls[1][1].decode()
+    set_body = recorder.calls[0][1].decode()
     assert "x-rincon-queue:RINCON_542A1BE1908601400#0" in set_body
 
 

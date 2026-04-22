@@ -213,6 +213,22 @@ class SonosSmapiClient:
         await self._seek_track(coord_ip, 1)
         await self._play(coord_ip)
 
+    async def resume_queue(
+        self,
+        coord_ip: str,
+        coord_rincon_id: str,
+    ) -> None:
+        """Press Play on the coordinator's queue.
+
+        Re-points AVTransport at the coordinator's own queue (idempotent
+        — safe to call even when already set) then fires ``Play``. Use
+        this to start/resume queue playback after a queue was built by
+        successive ``enqueue_spotify`` calls, or to resume after a
+        direct Spotify load left the transport pointed elsewhere.
+        """
+        await self._set_queue_as_source(coord_ip, coord_rincon_id)
+        await self._play(coord_ip)
+
     async def enqueue_spotify(
         self,
         coord_ip: str,
@@ -223,17 +239,22 @@ class SonosSmapiClient:
     ) -> None:
         """Append a Spotify item to the coordinator's queue.
 
-        Unlike ``play_spotify``, does NOT clear the queue, re-point
-        AVTransport, seek, or call Play — it just appends. If the
-        speaker isn't currently playing from its own queue, the enqueued
-        item won't start automatically; the caller is expected to only
-        invoke this when the queue is already the active source (i.e.
-        music is currently playing from a prior ``play_spotify`` call).
+        Pure ``AddURIToQueue`` — nothing else. Intentionally does NOT
+        call ``SetAVTransportURI`` after the add: flipping the transport
+        source while a different source is playing (e.g. a direct
+        Spotify load) interrupts playback and, worse, can cause the
+        speaker to start playing the queue immediately. ``resume_queue``
+        is the explicit entry point for "switch to the queue and play."
+
+        The ``coord_rincon_id`` arg is no longer strictly needed (it
+        fed the now-removed SetAVTransportURI call) but kept on the
+        signature for symmetry with ``play_spotify`` / ``resume_queue``.
 
         Tries each known SMAPI service number in turn so households
         registered under different Spotify SMAPI integrations (2311
         vs. 3079) both work without user intervention.
         """
+        del coord_rincon_id  # kept on signature for symmetry; unused
         last_exc: SmapiError | None = None
         for sn in _SPOTIFY_SMAPI_SERVICE_NUMBERS:
             pair = build_spotify_enqueue(kind, spotify_id, title, sn)
@@ -248,11 +269,6 @@ class SonosSmapiClient:
                     spotify_id,
                     sn,
                 )
-                # Make sure the coordinator is pointed at its own queue
-                # so the newly-enqueued item will be reached as playback
-                # advances past the current track. Safe to call even when
-                # already set — Sonos silently accepts the idempotent URI.
-                await self._set_queue_as_source(coord_ip, coord_rincon_id)
                 return
             except SmapiError as exc:
                 logger.info(

@@ -735,6 +735,59 @@ class SonosSpeaker(SpeakerBackend):
             station_metadata=station_metadata,
         )
 
+    async def play_queue(self, speaker_ids: list[str] | None = None) -> None:
+        """Start or resume playback of the group coordinator's queue.
+
+        No URIs involved — this just points AVTransport at the
+        coordinator's queue and fires Play. Relies on the queue having
+        been built beforehand by ``enqueue_uri`` (or a prior
+        ``play_uri`` that seeded the queue via SMAPI).
+        """
+        target_ids = (
+            speaker_ids if speaker_ids else list(self._player_metadata.keys())
+        )
+        if not target_ids:
+            raise RuntimeError("No speakers available")
+
+        seen: set[str] = set()
+        live: list[str] = []
+        for tid in target_ids:
+            if tid in seen or tid not in self._clients:
+                continue
+            seen.add(tid)
+            live.append(tid)
+        if not live:
+            raise RuntimeError(
+                f"None of the requested speakers ({target_ids}) are connected"
+            )
+
+        coord_player_id, _group_id = await self._ensure_group(live)
+        if self._smapi is None:
+            raise RuntimeError("Sonos SMAPI client is not initialized")
+
+        meta = self._player_metadata.get(coord_player_id)
+        if meta is None:
+            raise RuntimeError(
+                f"Cannot play queue — no metadata for coordinator "
+                f"{coord_player_id!r}"
+            )
+
+        logger.info(
+            "Sonos play_queue: coord=%s(%s)", coord_player_id, meta.ip_address
+        )
+        try:
+            await self._smapi.resume_queue(
+                coord_ip=meta.ip_address,
+                coord_rincon_id=coord_player_id,
+            )
+        except SmapiError as exc:
+            logger.error(
+                "Sonos SMAPI play_queue FAILED: coord=%s error=%s",
+                coord_player_id,
+                exc,
+            )
+            raise
+
     async def enqueue_uri(self, request: PlayRequest) -> None:
         """Append a Spotify URI to the group coordinator's queue.
 
