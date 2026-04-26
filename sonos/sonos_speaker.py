@@ -46,6 +46,7 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult
 from gilbert.interfaces.speaker import (
+    LoopMode,
     NowPlaying,
     PlaybackState,
     PlayRequest,
@@ -135,6 +136,7 @@ class SonosSpeaker(SpeakerBackend):
     """Sonos speaker backend driven by aiosonos (S2 local WebSocket)."""
 
     backend_name = "sonos"
+    supports_repeat = True
 
     @classmethod
     def backend_actions(cls) -> list[ConfigAction]:
@@ -1117,6 +1119,56 @@ class SonosSpeaker(SpeakerBackend):
             except FailedCommand:
                 logger.debug(
                     "Pause failed for group %s",
+                    group.id,
+                    exc_info=True,
+                )
+
+    async def set_repeat(
+        self,
+        mode: LoopMode,
+        speaker_ids: list[str] | None = None,
+    ) -> None:
+        """Apply a queue repeat-mode to the groups containing ``speaker_ids``.
+
+        Sonos exposes two boolean flags on its ``setPlayModes`` API —
+        ``repeat`` (queue-level repeat-all) and ``repeatOne`` (track-
+        level). We translate ``LoopMode`` to that pair:
+
+        - ``OFF``   → repeat=False, repeatOne=False
+        - ``TRACK`` → repeat=False, repeatOne=True
+        - ``ALL``   → repeat=True,  repeatOne=False
+
+        Dedupes by group id (members share the same queue), and routes
+        through the group coordinator's WebSocket since the play-modes
+        command is group-scoped on the local API.
+        """
+        targets = speaker_ids or list(self._player_metadata.keys())
+        repeat, repeat_one = {
+            LoopMode.OFF: (False, False),
+            LoopMode.TRACK: (False, True),
+            LoopMode.ALL: (True, False),
+        }[mode]
+
+        seen_groups: set[str] = set()
+        for pid in targets:
+            client = self._clients.get(pid)
+            if client is None:
+                continue
+            group = client.player.group
+            if group is None or group.id in seen_groups:
+                continue
+            seen_groups.add(group.id)
+            coord_client = self._clients.get(group.coordinator_id, client)
+            try:
+                await coord_client.api.playback.set_play_modes(
+                    group.id,
+                    repeat=repeat,
+                    repeat_one=repeat_one,
+                )
+            except FailedCommand:
+                logger.warning(
+                    "Failed to set repeat=%s on group %s",
+                    mode.value,
                     group.id,
                     exc_info=True,
                 )

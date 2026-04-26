@@ -142,7 +142,7 @@ DeepSeek chat backend, speaking the [OpenAI-compatible DeepSeek API](https://api
 
 ### elevenlabs
 
-High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.announce` flow, the Radio DJ's narration, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
+High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.announce` flow, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
 
 **Backend registered** — `TTSBackend.backend_name = "elevenlabs"`.
 
@@ -406,8 +406,11 @@ Slack signing secrets aren't needed — Socket Mode doesn't use HTTP webhooks, s
 Sonos speaker control (S2 only) + Spotify-backed music search. Two backends registered by one plugin: speaker control uses the Sonos S2 local WebSocket API via `aiosonos`; music browse/search talks directly to Spotify's Web API via OAuth (playback still routes through the speaker's own linked Spotify account).
 
 **Backends registered**
-- `SpeakerBackend.backend_name = "sonos"` — playback, volume, grouping, TTS announcements (via native `audio_clip`), now-playing, Spotify URI handoff. Requires S2 firmware on every target speaker; run `scripts/check_sonos_s2.py` to verify before enabling.
-- `MusicBackend.backend_name = "sonos"` — Spotify search, user library, playlists via Spotify's Web API. Apple Music / Amazon Music / other services are NOT supported — they went away with the SMAPI drop. Sets `supports_queue = True`: the music service exposes the queue trio — `add_to_queue` / `/music queue <title>` (appends via SMAPI `AddURIToQueue`), `play_queue` / `/music play-queue` (re-points AVTransport at the queue + `Play`), and `queue_item` (button-invoked sibling of `play_item`).
+- `SpeakerBackend.backend_name = "sonos"` — playback, volume, grouping, TTS announcements (via native `audio_clip`), now-playing, Spotify URI handoff, queue repeat-mode (`set_repeat`, `supports_repeat = True`). Requires S2 firmware on every target speaker; run `scripts/check_sonos_s2.py` to verify before enabling.
+- `MusicBackend.backend_name = "sonos"` — Spotify search, user library, playlists via Spotify's Web API. Apple Music / Amazon Music / other services are NOT supported — they went away with the SMAPI drop. Capability flags:
+  - `supports_queue = True` — exposes the queue trio: `add_to_queue` / `/music queue <title>` (appends via SMAPI `AddURIToQueue`), `play_queue` / `/music play-queue` (re-points AVTransport at the queue + `Play`), and `queue_item` (button-invoked sibling of `play_item`).
+  - `supports_stations = True` — exposes `/music station <seed>` backed by Spotify `/v1/recommendations` (track/artist/genre/free-text seeds).
+  - `supports_loop = True` — exposes `/music loop [off|track|all]`, which routes to the speaker's repeat-mode.
 
 **Configure** (Settings → Media → Speakers / Music)
 

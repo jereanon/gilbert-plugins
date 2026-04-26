@@ -170,6 +170,7 @@ def _make_backend_with_mock_speaker(
     client.api.playback_session.load_stream_url = AsyncMock()
     client.api.playback = MagicMock()
     client.api.playback.load_content = AsyncMock()
+    client.api.playback.set_play_modes = AsyncMock()
     # subscribe() needs to return an unsubscribe callable for
     # _wait_for_group's subscription teardown path.
     client.subscribe = MagicMock(return_value=lambda: None)
@@ -705,8 +706,83 @@ def test_supports_grouping_is_true() -> None:
     assert SonosSpeaker().supports_grouping is True
 
 
+def test_supports_repeat_is_true() -> None:
+    """Sonos has native queue repeat-mode support — gates the
+    ``/music loop`` tool registration in MusicService."""
+    assert SonosSpeaker.supports_repeat is True
+
+
 def test_backend_name() -> None:
     assert SonosSpeaker.backend_name == "sonos"
+
+
+# ── Repeat / loop mode ────────────────────────────────────────────────
+
+
+async def test_set_repeat_track_calls_set_play_modes_with_repeat_one() -> None:
+    """LoopMode.TRACK → setPlayModes(repeat=False, repeat_one=True).
+    Routes through the group coordinator's WebSocket since
+    ``setPlayModes`` is a group-scoped command on the local API."""
+    from gilbert.interfaces.speaker import LoopMode as _LoopMode
+
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
+
+    await backend.set_repeat(_LoopMode.TRACK, ["RINCON_COORD"])
+
+    client.api.playback.set_play_modes.assert_awaited_once()
+    kwargs = client.api.playback.set_play_modes.call_args.kwargs
+    assert kwargs["repeat"] is False
+    assert kwargs["repeat_one"] is True
+
+
+async def test_set_repeat_off_clears_both_flags() -> None:
+    """LoopMode.OFF must explicitly clear BOTH flags so a subsequent
+    'turn off repeat' actually disables whichever mode was on."""
+    from gilbert.interfaces.speaker import LoopMode as _LoopMode
+
+    backend, client, _player, _group = _make_backend_with_mock_speaker()
+
+    await backend.set_repeat(_LoopMode.OFF, ["RINCON_COORD"])
+
+    kwargs = client.api.playback.set_play_modes.call_args.kwargs
+    assert kwargs["repeat"] is False
+    assert kwargs["repeat_one"] is False
+
+
+async def test_set_repeat_dedupes_across_group_members() -> None:
+    """Two speakers in the same group share one queue — the play-mode
+    command should fire ONCE per group, not once per member."""
+    from gilbert.interfaces.speaker import LoopMode as _LoopMode
+
+    group = MagicMock()
+    group.id = "group-1"
+    group.player_ids = ["RINCON_A", "RINCON_B"]
+    group.coordinator_id = "RINCON_A"
+    group.playback_state = "PLAYBACK_STATE_IDLE"
+
+    backend, _client, _p, _g = _make_backend_with_mock_speaker(
+        player_id="RINCON_A", group_in=group
+    )
+    backend._player_metadata["RINCON_B"] = _PlayerMetadata(
+        player_id="RINCON_B",
+        household_id="HH-TEST",
+        name="Lounge",
+        ip_address="192.168.1.21",
+        model="Sonos One",
+    )
+    b_client = MagicMock()
+    b_client.player = MagicMock(group=group)
+    b_client.api = MagicMock()
+    b_client.api.playback = MagicMock()
+    b_client.api.playback.set_play_modes = AsyncMock()
+    backend._clients["RINCON_B"] = b_client
+
+    await backend.set_repeat(_LoopMode.ALL, ["RINCON_A", "RINCON_B"])
+
+    # Coordinator client gets the call; B's client should not be hit
+    # twice for the same group.
+    coord_client = backend._clients["RINCON_A"]
+    coord_client.api.playback.set_play_modes.assert_awaited_once()
 
 
 # ── Duplicate player_id handling ─────────────────────────────────────

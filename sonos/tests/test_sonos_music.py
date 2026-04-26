@@ -258,6 +258,97 @@ async def test_search_station_maps_to_playlist() -> None:
     fake_spotify.search.assert_awaited_once_with("jazz", "playlist", 3)
 
 
+# ── Stations ──────────────────────────────────────────────────────────
+
+
+async def test_start_station_with_track_item_uses_seed_tracks() -> None:
+    """A ``MusicItem`` of kind TRACK feeds straight into Spotify's
+    ``seed_tracks`` parameter — no second search needed when the
+    caller already has a resolved track in hand."""
+    backend = SonosMusic()
+    await backend.initialize({"client_id": "cid", "client_secret": "csec"})
+    fake_spotify = MagicMock()
+    fake_spotify.recommendations = AsyncMock(
+        return_value=[
+            {
+                "id": "rec1",
+                "name": "Recommended",
+                "uri": "spotify:track:rec1",
+                "duration_ms": 200_000,
+                "artists": [{"name": "Some Artist"}],
+                "album": {"images": []},
+            }
+        ]
+    )
+    backend._spotify = fake_spotify
+
+    seed = MusicItem(
+        id="seed-id", title="Seed Song", kind=MusicItemKind.TRACK,
+        uri="spotify:track:seed-id",
+    )
+    results = await backend.start_station(seed, limit=5)
+
+    fake_spotify.recommendations.assert_awaited_once_with(
+        seed_tracks=["seed-id"],
+        seed_artists=None,
+        seed_genres=None,
+        limit=5,
+    )
+    assert len(results) == 1
+    assert results[0].kind == MusicItemKind.TRACK
+
+
+async def test_start_station_with_freetext_falls_back_to_artist_search() -> None:
+    """For a free-text seed we try genre seeds first; on no match the
+    backend searches Spotify for an artist by that name and uses its
+    id as ``seed_artists`` — covers 'play a station based on Wilco'
+    where the seed isn't a Spotify genre keyword."""
+    backend = SonosMusic()
+    await backend.initialize({"client_id": "cid", "client_secret": "csec"})
+    fake_spotify = MagicMock()
+    fake_spotify.available_genre_seeds = AsyncMock(return_value=["jazz", "rock"])
+    fake_spotify.search = AsyncMock(
+        return_value=[{"id": "artist-42", "name": "Wilco"}]
+    )
+    fake_spotify.recommendations = AsyncMock(return_value=[])
+    backend._spotify = fake_spotify
+
+    await backend.start_station("Wilco", limit=10)
+
+    fake_spotify.search.assert_awaited_with("Wilco", "artist", 1)
+    fake_spotify.recommendations.assert_awaited_once_with(
+        seed_tracks=None,
+        seed_artists=["artist-42"],
+        seed_genres=None,
+        limit=10,
+    )
+
+
+async def test_start_station_404_surfaces_legacy_app_error() -> None:
+    """Spotify deprecated /recommendations for new apps in late 2024 —
+    a 404 from this endpoint means the user's Spotify app doesn't
+    have legacy access. Surface that as an actionable message rather
+    than a raw HTTPStatusError."""
+    import httpx
+
+    backend = SonosMusic()
+    await backend.initialize({"client_id": "cid", "client_secret": "csec"})
+    fake_spotify = MagicMock()
+    fake_spotify.available_genre_seeds = AsyncMock(return_value=["jazz"])
+    fake_spotify.recommendations = AsyncMock(
+        side_effect=httpx.HTTPStatusError(
+            "Not Found",
+            request=MagicMock(),
+            response=MagicMock(status_code=404),
+        )
+    )
+    backend._spotify = fake_spotify
+
+    seed = MusicItem(id="t", title="t", kind=MusicItemKind.TRACK, uri="spotify:track:t")
+    with pytest.raises(MusicSearchUnavailableError, match="legacy access"):
+        await backend.start_station(seed)
+
+
 # ── Config params / actions surface ─────────────────────────────────
 
 

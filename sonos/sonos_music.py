@@ -264,6 +264,42 @@ class _SpotifyClient:
         # ``/me/tracks`` wraps each track in ``{added_at, track: {...}}``.
         return [i["track"] for i in items if isinstance(i, dict) and i.get("track")]
 
+    async def recommendations(
+        self,
+        seed_tracks: list[str] | None = None,
+        seed_artists: list[str] | None = None,
+        seed_genres: list[str] | None = None,
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Spotify's ``/recommendations`` — returns track dicts seeded
+        by up to 5 combined ids/genres.
+
+        Note: Spotify deprecated this endpoint for *new* applications
+        in late 2024 but kept it live for apps that already had access.
+        If your Spotify app was registered after the cutoff and the
+        request 404s, the station tool surfaces the error to the user.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if seed_tracks:
+            params["seed_tracks"] = ",".join(seed_tracks[:5])
+        if seed_artists:
+            params["seed_artists"] = ",".join(seed_artists[:5])
+        if seed_genres:
+            params["seed_genres"] = ",".join(seed_genres[:5])
+        if not (seed_tracks or seed_artists or seed_genres):
+            raise ValueError("recommendations() requires at least one seed")
+        data = await self._authed_get("/recommendations", params=params)
+        items = data.get("tracks") or []
+        return [t for t in items if isinstance(t, dict)]
+
+    async def available_genre_seeds(self) -> list[str]:
+        """Return Spotify's list of valid genre seeds for ``/recommendations``."""
+        data = await self._authed_get(
+            "/recommendations/available-genre-seeds"
+        )
+        seeds = data.get("genres") or []
+        return [str(g) for g in seeds if isinstance(g, str)]
+
 
 # ── Spotify ↔ MusicItem mappers ──────────────────────────────────────
 
@@ -392,6 +428,8 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
 
     backend_name = "sonos"
     supports_queue = True
+    supports_stations = True
+    supports_loop = True
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
@@ -666,6 +704,111 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
                 title=item.title,
             )
         raise ValueError(f"MusicItem has no uri and no id: {item.title}")
+
+    # ── Stations ─────────────────────────────────────────────────────
+
+    async def start_station(
+        self,
+        seed: MusicItem | str,
+        limit: int = 30,
+    ) -> list[MusicItem]:
+        """Resolve ``seed`` into a list of station tracks via Spotify's
+        ``/recommendations`` endpoint.
+
+        Seed dispatch:
+
+        - ``MusicItem`` of kind TRACK / ARTIST → use its id directly as
+          ``seed_tracks`` / ``seed_artists``.
+        - ``MusicItem`` of any other kind → fall through to the
+          string path on the item title.
+        - ``str`` → first try to match Spotify's available genre seeds
+          (case-insensitive). If no genre match, search Spotify for an
+          artist with the seed as its name; if found, use as
+          ``seed_artists``. As a last resort search for a track and use
+          ``seed_tracks``. Each step uses an existing Spotify endpoint
+          we already wire elsewhere — no new auth scopes needed.
+        """
+        client = self._require_client()
+
+        seed_tracks: list[str] = []
+        seed_artists: list[str] = []
+        seed_genres: list[str] = []
+        resolved_label = ""
+
+        if isinstance(seed, MusicItem):
+            if seed.kind == MusicItemKind.TRACK and seed.id:
+                seed_tracks.append(seed.id)
+                resolved_label = f"track:{seed.title}"
+            elif seed.kind == MusicItemKind.ARTIST and seed.id:
+                seed_artists.append(seed.id)
+                resolved_label = f"artist:{seed.title}"
+            else:
+                seed = seed.title
+
+        if isinstance(seed, str):
+            text = seed.strip()
+            if not text:
+                raise ValueError("station seed is empty")
+
+            try:
+                genres = await client.available_genre_seeds()
+            except httpx.HTTPStatusError:
+                genres = []
+            text_low = text.lower()
+            matched_genre = next(
+                (g for g in genres if g.lower() == text_low),
+                None,
+            )
+            if matched_genre is not None:
+                seed_genres.append(matched_genre)
+                resolved_label = f"genre:{matched_genre}"
+            else:
+                # Try artist match before track — "play a station based
+                # on Wilco" is overwhelmingly artist-shaped.
+                artist_hits = await client.search(text, "artist", 1)
+                if artist_hits:
+                    seed_artists.append(str(artist_hits[0].get("id") or ""))
+                    resolved_label = f"artist:{artist_hits[0].get('name', text)}"
+                else:
+                    track_hits = await client.search(text, "track", 1)
+                    if track_hits:
+                        seed_tracks.append(str(track_hits[0].get("id") or ""))
+                        resolved_label = f"track:{track_hits[0].get('name', text)}"
+
+        if not (seed_tracks or seed_artists or seed_genres):
+            raise MusicSearchUnavailableError(
+                f"Couldn't resolve station seed {seed!r} to a Spotify track, artist, or genre"
+            )
+
+        try:
+            tracks = await client.recommendations(
+                seed_tracks=seed_tracks or None,
+                seed_artists=seed_artists or None,
+                seed_genres=seed_genres or None,
+                limit=limit,
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 401:
+                raise MusicSearchUnavailableError(
+                    "Spotify auth token rejected. Re-link Spotify in Settings → Media → Music."
+                ) from exc
+            if status == 404:
+                # Spotify deprecated /recommendations for new apps in
+                # late 2024. Apps registered after the cutoff get a 404.
+                raise MusicSearchUnavailableError(
+                    "Spotify's recommendations API isn't available for this app — "
+                    "stations require a Spotify app with legacy access to "
+                    "/recommendations."
+                ) from exc
+            raise
+
+        logger.info(
+            "Spotify station seeded by %s returned %d tracks",
+            resolved_label,
+            len(tracks),
+        )
+        return [_spotify_track_to_music_item(t) for t in tracks]
 
     # ── Config actions ───────────────────────────────────────────────
 

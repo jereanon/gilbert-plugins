@@ -61,4 +61,3 @@ Multiplayer music guessing game plugin for Gilbert. Players guess songs from sho
 - `src/gilbert/interfaces/ui.py` — ToolOutput, UIBlock, UIElement
 - `src/gilbert/core/services/music.py` — MusicService (search, play_track)
 - `src/gilbert/core/services/speaker.py` — SpeakerService (stop, announce)
-- `src/gilbert/core/services/radio_dj.py` — similar entertainment service pattern
