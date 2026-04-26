@@ -25,6 +25,7 @@ The table below is an index — jump to each plugin's detail section for configu
 
 | Plugin | Provides | Third-party deps | Category |
 |---|---|---|---|
+| [american-standard](#american-standard) | `ThermostatBackend "american-standard"` | `nexia` | Climate |
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
@@ -34,6 +35,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
+| [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
@@ -46,6 +48,35 @@ The table below is an index — jump to each plugin's detail section for configu
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
+
+---
+
+### american-standard
+
+American Standard / Trane / Nexia / Asair thermostat integration via the [Nexia cloud](https://www.mynexia.com/). Speaks Nexia's HTTPS API through the [`nexia`](https://pypi.org/project/nexia/) async library (the same one Home Assistant uses). Each *zone* on the account is exposed as a Gilbert thermostat — multi-zone HVAC systems show up as one entity per zone with the gateway name as the area.
+
+**Backend registered**
+- `ThermostatBackend.backend_name = "american-standard"` — `supports_cooling = True`, `supports_heating = True`, `supports_fan_mode = True`, `supports_humidity = True`. Mode set covers `off`, `heat`, `cool`, `auto`; fan modes are pulled dynamically from each thermostat's reported labels (typically `auto`, `on`, `circulate`).
+
+**Slash commands** — provided by the core `thermostats` service, not by this plugin directly. All thermostat commands live under the `/climate` namespace. With this backend selected:
+- `/climate list`, `/climate status <name|area>`
+- `/climate mode <name|area> <off|heat|cool|auto>`
+- `/climate heat <name|area> <temp>`, `/climate cool <name|area> <temp>`
+- `/climate range <name|area> <heat> <cool>` (sets the AUTO-mode comfort band)
+- `/climate fan <name|area> <auto|on|circulate>`
+
+Names match either a zone name (e.g. *Upstairs*) or the gateway / thermostat name (e.g. *Main HVAC*, which addresses every zone on that gateway).
+
+**Configure** (Settings → Climate → Thermostats, with the `american-standard` backend selected)
+- `username` — Account email used to log in to the Nexia / American Standard / Trane / Asair app.
+- `password` *(sensitive)* — Account password.
+- `brand` — `nexia` for Nexia / Trane / American Standard accounts; `asair` for Asair-branded accounts. Default `nexia`.
+
+The plugin persists Nexia's per-account device UUID under `.gilbert/plugin-data/american-standard/nexia-state-<username>.json` so reconnecting after a restart doesn't re-register as a new device (which would eventually trip Nexia's account-lockout protection).
+
+**Config action** — `test_connection`: logs in with a fresh, short-lived `aiohttp.ClientSession` and reports the discovered thermostat + zone counts.
+
+**Third-party deps** — `nexia>=2.7.0`.
 
 ---
 
@@ -243,6 +274,33 @@ Multiplayer music guessing game managed by the AI. The AI picks a track, plays a
 - `hint_threshold` — Seconds remaining before a hint drops (default `10.0`).
 
 **No third-party Python dependencies.**
+
+---
+
+### lutron-radiora
+
+Lutron RadioRA 2 / HomeWorks integration. Registers two backends — one for the core `lights` service and one for the core `shades` service — both speaking telnet to the main repeater via [`pylutron`](https://pypi.org/project/pylutron/). Areas, dimmer/switch types, and shade outputs are auto-discovered from the repeater's XML database, so there's no per-room config.
+
+**Backends registered**
+- `LightsBackend.backend_name = "lutron-radiora"` — every non-shade output. `supports_dimming = True`; per-light `LightInfo.supports_dimming` reflects pylutron's `Output.is_dimmable` so the lights service skips switch-only loads when the user asks to set brightness.
+- `ShadesBackend.backend_name = "lutron-radiora"` — every `SYSTEM_SHADE` / `MOTOR` output. `supports_position = True`, `supports_stop = True`.
+
+**Slash commands** — provided by the core `lights` and `shades` services, not by this plugin directly. With this backend selected:
+- `/lights list`, `/lights status <name|area>`, `/lights on <name|area> [pct]`, `/lights off <name|area>`, `/lights toggle <name|area>`, `/lights brightness <name|area> <pct>`
+- `/shades list`, `/shades status <name|area>`, `/shades open <name|area>`, `/shades close <name|area>`, `/shades position <name|area> <pct>`, `/shades stop <name|area>`
+
+Names match either the Lutron output name (e.g. *Kitchen Pendants*) or the area / room name (e.g. *Kitchen*, which addresses every output in that area).
+
+**Configure** (Settings → Lighting → Lights / Shades, with the `lutron-radiora` backend selected)
+- `host` — Hostname or IP of the RadioRA 2 / HomeWorks main repeater.
+- `username` — Telnet username (RadioRA 2 default: `lutron`).
+- `password` *(sensitive)* — Telnet password (RadioRA 2 default: `integration`).
+
+Both backends advertise the same connection parameters so the lights and shades pages each have their own copy. Pointing both at the same repeater is fine — the plugin keeps one shared bridge regardless of how many backends are active.
+
+**Config action** — `test_connection`: connects to the repeater and reports the discovered light + shade counts.
+
+**Third-party deps** — `pylutron>=0.4.1`.
 
 ---
 

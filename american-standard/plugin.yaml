@@ -1,0 +1,10 @@
+name: american-standard
+version: "1.0.0"
+description: "American Standard / Trane / Nexia thermostat integration via the Nexia cloud."
+
+provides:
+  - nexia_thermostat
+
+requires: []
+
+depends_on: []

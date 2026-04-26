@@ -1,0 +1,11 @@
+name: lutron-radiora
+version: "1.0.0"
+description: "Lutron RadioRA 2 / HomeWorks integration — control lights and shades via the main repeater."
+
+provides:
+  - lutron_lights
+  - lutron_shades
+
+requires: []
+
+depends_on: []
