@@ -415,3 +415,334 @@ async def test_config_cache_defaults() -> None:
     assert stats["max_entries"] == 256
     assert stats["ttl_seconds"] == 1800.0
     await backend.close()
+
+
+# --- Audio-tag injection ---
+
+
+def _stub_ai(content: str) -> AsyncMock:
+    """Build a fake AISamplingProvider whose complete_one_shot returns
+    ``content`` as the assistant message text."""
+    from gilbert.interfaces.ai import AIResponse, Message, MessageRole, StopReason
+
+    ai = AsyncMock()
+    ai.complete_one_shot = AsyncMock(
+        return_value=AIResponse(
+            message=Message(role=MessageRole.ASSISTANT, content=content),
+            model="claude-haiku-4-5-20251001",
+            stop_reason=StopReason.END_TURN,
+        )
+    )
+    # Simulate AISamplingProvider's other methods so isinstance checks pass.
+    ai.has_profile = MagicMock(return_value=False)
+    return ai
+
+
+async def test_audio_tags_disabled_by_default(backend: ElevenLabsTTS) -> None:
+    """Off by default — synthesize() must send the raw text untouched
+    even when an AI provider is wired up."""
+    await backend.initialize({"api_key": "sk-test"})
+    backend.set_ai_sampling(_stub_ai("[excited] Hello!"))
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(
+            SynthesisRequest(
+                text="Hello there, this is a moderately long sentence.",
+                voice_id="v1",
+            )
+        )
+        assert (
+            mock_post.call_args.kwargs["json"]["text"]
+            == "Hello there, this is a moderately long sentence."
+        )
+    await backend.close()
+
+
+async def test_audio_tags_injected_when_enabled(backend: ElevenLabsTTS) -> None:
+    """When enabled, the AI's tagged output must be what reaches the
+    ElevenLabs API — not the original text."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    ai = _stub_ai("[excited] Hello there!")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(SynthesisRequest(text="Hello there!", voice_id="v1"))
+        assert (
+            mock_post.call_args.kwargs["json"]["text"] == "[excited] Hello there!"
+        )
+
+    ai.complete_one_shot.assert_awaited_once()
+    await backend.close()
+
+
+async def test_audio_tags_skip_short_text(backend: ElevenLabsTTS) -> None:
+    """Inputs under the configured min_chars threshold bypass the AI
+    call — the latency cost isn't worth it for one-liners."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 50}
+    )
+    ai = _stub_ai("[excited] Hi!")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(SynthesisRequest(text="Hi!", voice_id="v1"))
+        assert mock_post.call_args.kwargs["json"]["text"] == "Hi!"
+
+    ai.complete_one_shot.assert_not_awaited()
+    await backend.close()
+
+
+async def test_audio_tags_skip_pretagged_input(backend: ElevenLabsTTS) -> None:
+    """If the caller authored tags by hand, respect them — never
+    re-run them through the director (which might add or strip tags
+    inconsistently)."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    ai = _stub_ai("[wrong] tags")
+    backend.set_ai_sampling(ai)
+    pre_tagged = "[whispers] this is already tagged, leave it alone."
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(SynthesisRequest(text=pre_tagged, voice_id="v1"))
+        assert mock_post.call_args.kwargs["json"]["text"] == pre_tagged
+
+    ai.complete_one_shot.assert_not_awaited()
+    await backend.close()
+
+
+async def test_audio_tags_fallback_on_ai_error(backend: ElevenLabsTTS) -> None:
+    """If the AI call blows up, synthesize() still succeeds with the
+    raw text — TTS must never depend on the director being healthy."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    ai = AsyncMock()
+    ai.complete_one_shot = AsyncMock(side_effect=RuntimeError("director offline"))
+    ai.has_profile = MagicMock(return_value=False)
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        result = await backend.synthesize(
+            SynthesisRequest(text="hello world, raw text expected", voice_id="v1")
+        )
+        assert (
+            mock_post.call_args.kwargs["json"]["text"]
+            == "hello world, raw text expected"
+        )
+
+    assert result.audio == b"audio-bytes"
+    await backend.close()
+
+
+async def test_audio_tags_cache_reused_for_same_input(
+    backend: ElevenLabsTTS,
+) -> None:
+    """Repeated identical inputs hit the tag cache — Haiku should run
+    once even if synthesize() is called many times."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    ai = _stub_ai("[curious] Same phrase again")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        for _ in range(3):
+            await backend.synthesize(
+                SynthesisRequest(text="Same phrase again", voice_id="v1")
+            )
+
+    assert ai.complete_one_shot.await_count == 1
+    await backend.close()
+
+
+async def test_audio_tags_cache_invalidates_on_prompt_change(
+    backend: ElevenLabsTTS,
+) -> None:
+    """Editing the system prompt and re-initializing must invalidate
+    cached tag entries — otherwise the new prompt's behavior would be
+    invisible until the LRU evicted old entries naturally."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_system_prompt": "PROMPT_A",
+        }
+    )
+    ai = _stub_ai("[excited] tagged-by-A")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(SynthesisRequest(text="phrase one", voice_id="v1"))
+
+    # Re-init with a new prompt — close + initialize again to simulate
+    # what the live-config-reload path does in real ops.
+    await backend.close()
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_system_prompt": "PROMPT_B",
+        }
+    )
+    ai_b = _stub_ai("[sad] tagged-by-B")
+    backend.set_ai_sampling(ai_b)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(SynthesisRequest(text="phrase one", voice_id="v1"))
+
+    ai_b.complete_one_shot.assert_awaited_once()
+    await backend.close()
+
+
+async def test_audio_tag_custom_system_prompt_reaches_ai(
+    backend: ElevenLabsTTS,
+) -> None:
+    """The configured system prompt is what the AI receives, not the
+    built-in default — verifying the field is actually plumbed."""
+    custom = "Be terse. Tag only with [whispers]."
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_system_prompt": custom,
+        }
+    )
+    ai = _stub_ai("[whispers] hi")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="long enough to inject", voice_id="v1")
+        )
+
+    assert ai.complete_one_shot.await_args.kwargs["system_prompt"] == custom
+    await backend.close()
+
+
+async def test_audio_tag_blank_prompt_falls_back_to_default(
+    backend: ElevenLabsTTS,
+) -> None:
+    """Blanking the field in Settings must NOT send an empty system
+    prompt to the AI — fall back to the built-in default instead."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_system_prompt": "   ",
+        }
+    )
+    ai = _stub_ai("[excited] hi")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="long enough to inject", voice_id="v1")
+        )
+
+    sent = ai.complete_one_shot.await_args.kwargs["system_prompt"]
+    assert "ElevenLabs v3 audio tags" in sent
+    await backend.close()
+
+
+async def test_audio_tag_profile_passed_to_ai(backend: ElevenLabsTTS) -> None:
+    """The configured ``audio_tag_profile`` must reach the AI call so
+    callers can opt into profile-level guardrails (cost tracking,
+    role overrides, tool whitelists)."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_profile": "fast_pipeline",
+        }
+    )
+    ai = _stub_ai("[excited] hi")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="long enough to inject", voice_id="v1")
+        )
+
+    assert (
+        ai.complete_one_shot.await_args.kwargs["profile_name"] == "fast_pipeline"
+    )
+    await backend.close()
+
+
+async def test_audio_tag_profile_blank_means_no_profile(backend: ElevenLabsTTS) -> None:
+    """When ``audio_tag_profile`` is blank, ``profile_name=None`` should
+    reach ``complete_one_shot`` — not the literal empty string, which
+    would look like a profile lookup that always misses."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+        }
+    )
+    ai = _stub_ai("[excited] hi")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="long enough to inject", voice_id="v1")
+        )
+
+    assert ai.complete_one_shot.await_args.kwargs["profile_name"] is None
+    await backend.close()

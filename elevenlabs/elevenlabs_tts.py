@@ -1,12 +1,15 @@
 """ElevenLabs TTS backend — text-to-speech via the ElevenLabs API."""
 
+import hashlib
 import logging
+import re
 import time
 from collections import OrderedDict
 from typing import Any
 
 import httpx
 
+from gilbert.interfaces.ai import AISamplingProvider, Message, MessageRole
 from gilbert.interfaces.configuration import (
     ConfigAction,
     ConfigActionResult,
@@ -22,6 +25,35 @@ from gilbert.interfaces.tts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default minimum length (chars) for a piece of text to be worth tagging.
+# Below this, the latency cost of an extra AI round-trip outweighs any
+# expressiveness gain — single-word announcements ("Hi.") aren't going
+# to read better with a tag.
+_DEFAULT_AUDIO_TAG_MIN_CHARS = 40
+
+# Default system prompt for the audio-tag director. Configurable per
+# install via ``audio_tag_system_prompt`` so users can tune the tag
+# vocabulary, density, or voice without editing code.
+_DEFAULT_AUDIO_TAG_SYSTEM_PROMPT = (
+    "You are an audio director adding ElevenLabs v3 audio tags to text "
+    "for TTS narration. Insert tags like [excited], [laughs], [whispers], "
+    "[angry], [sad], [sighs], [curious], [sarcastic] before clauses where "
+    "they'd improve delivery. Use sparingly — at most one tag per "
+    "sentence. Do not change the words. Return only the tagged text, no "
+    "preface, no explanation."
+)
+
+# Pattern that detects ``[lowercase_word]`` style tags already present in
+# the input. We skip the AI call entirely when the caller has authored
+# tags by hand — they know what they want and shouldn't pay the
+# round-trip.
+_TAG_RE = re.compile(r"\[[a-z][a-z _]*\]")
+
+# Tag-injector LRU bound — separate from the audio cache because the
+# values here are tiny (just the tagged string). Stored as an
+# OrderedDict so eviction is O(1) at the cold end.
+_AUDIO_TAG_CACHE_MAX = 256
 
 # ElevenLabs API base
 _BASE_URL = "https://api.elevenlabs.io/v1"
@@ -122,6 +154,54 @@ class ElevenLabsTTS(TTSBackend):
                 ),
                 default=_DEFAULT_CACHE_TTL_SECONDS,
             ),
+            ConfigParam(
+                key="enable_audio_tags",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "Send each text through a small AI model to inject "
+                    "ElevenLabs v3 audio tags ([excited], [laughs], etc.) "
+                    "for more expressive delivery. Requires an "
+                    "ElevenLabs v3 model; older models will speak the "
+                    "tags literally. Adds one AI round-trip per unique "
+                    "phrase (subsequent calls hit the tag cache)."
+                ),
+                default=False,
+            ),
+            ConfigParam(
+                key="audio_tag_profile",
+                type=ToolParameterType.STRING,
+                description=(
+                    "AI profile used for the audio-tag director call. "
+                    "Pick a fast, cheap profile (e.g. one targeting a "
+                    "Haiku-class model) — every tagged synthesis pays "
+                    "for one round-trip with this profile. Leave blank "
+                    "to use the AI service's default backend/model."
+                ),
+                default="",
+                choices_from="ai_profiles",
+            ),
+            ConfigParam(
+                key="audio_tag_system_prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "System prompt for the audio-tag director. Edit to "
+                    "change the tag vocabulary, density, or delivery "
+                    "style. Leave blank to use the built-in default."
+                ),
+                default=_DEFAULT_AUDIO_TAG_SYSTEM_PROMPT,
+                multiline=True,
+            ),
+            ConfigParam(
+                key="audio_tag_min_chars",
+                type=ToolParameterType.INTEGER,
+                description=(
+                    "Minimum text length (in characters) before audio "
+                    "tagging kicks in. Shorter inputs are sent to the "
+                    "TTS API verbatim — the latency of an extra AI call "
+                    "isn't worth it for one-liners."
+                ),
+                default=_DEFAULT_AUDIO_TAG_MIN_CHARS,
+            ),
         ]
 
     @classmethod
@@ -190,6 +270,19 @@ class ElevenLabsTTS(TTSBackend):
         self._cache_misses: int = 0
         self._cache_evictions: int = 0
 
+        # Audio-tag injection state. Disabled by default; enabled via
+        # ``enable_audio_tags`` once an AI sampling provider is wired in
+        # by the TTSService.
+        self._enable_audio_tags: bool = False
+        self._audio_tag_profile: str = ""
+        self._audio_tag_system_prompt: str = _DEFAULT_AUDIO_TAG_SYSTEM_PROMPT
+        self._audio_tag_min_chars: int = _DEFAULT_AUDIO_TAG_MIN_CHARS
+        self._ai_sampling: AISamplingProvider | None = None
+        # Cache: (text, prompt_hash) -> tagged_text. Keyed on the prompt
+        # hash so editing the system prompt invalidates without us having
+        # to walk the cache.
+        self._tag_cache: OrderedDict[tuple[str, str], str] = OrderedDict()
+
     async def initialize(self, config: dict[str, object]) -> None:
         api_key = config.get("api_key")
         if not api_key or not isinstance(api_key, str):
@@ -221,7 +314,34 @@ class ElevenLabsTTS(TTSBackend):
             except (TypeError, ValueError):
                 self._cache_ttl_seconds = float(_DEFAULT_CACHE_TTL_SECONDS)
 
+        self._enable_audio_tags = bool(config.get("enable_audio_tags", False))
+
+        tag_profile_raw = config.get("audio_tag_profile")
+        if isinstance(tag_profile_raw, str):
+            self._audio_tag_profile = tag_profile_raw.strip()
+        else:
+            self._audio_tag_profile = ""
+
+        tag_prompt_raw = config.get("audio_tag_system_prompt")
+        if isinstance(tag_prompt_raw, str) and tag_prompt_raw.strip():
+            self._audio_tag_system_prompt = tag_prompt_raw
+        else:
+            # Empty / non-string falls back to the built-in default — we
+            # never send an empty system prompt to the AI service.
+            self._audio_tag_system_prompt = _DEFAULT_AUDIO_TAG_SYSTEM_PROMPT
+
+        tag_min_raw = config.get("audio_tag_min_chars")
+        if tag_min_raw is not None:
+            try:
+                self._audio_tag_min_chars = max(0, int(str(tag_min_raw)))
+            except (TypeError, ValueError):
+                self._audio_tag_min_chars = _DEFAULT_AUDIO_TAG_MIN_CHARS
+
         self._cache.clear()
+        # Drop any stale tagged-text entries on (re)init. Cheap and
+        # avoids cross-config-revision bleed-through when the prompt or
+        # model id changes.
+        self._tag_cache.clear()
 
         self._client = httpx.AsyncClient(
             base_url=_BASE_URL,
@@ -244,6 +364,73 @@ class ElevenLabsTTS(TTSBackend):
             self._client = None
         # Release cached audio so a restart starts fresh.
         self._cache.clear()
+        self._tag_cache.clear()
+
+    # --- AICapableTTSBackend protocol ---
+
+    def set_ai_sampling(self, ai: object) -> None:
+        """Receive the AI sampling provider for audio-tag injection.
+
+        Narrowed at the boundary to keep ``set_ai_sampling`` callable
+        from generic TTS-service code that doesn't import
+        ``AISamplingProvider``.
+        """
+        if isinstance(ai, AISamplingProvider):
+            self._ai_sampling = ai
+
+    # --- Audio-tag injection ---
+
+    async def _inject_audio_tags(self, text: str) -> str:
+        """Return ``text`` with v3 audio tags inserted, or the original
+        text if injection is disabled, not applicable, or the AI call
+        fails. Never raises — failures fall back to raw text so TTS
+        keeps working even if the director model is down.
+        """
+        if not self._enable_audio_tags:
+            return text
+        if self._ai_sampling is None:
+            return text
+        if len(text) < self._audio_tag_min_chars:
+            return text
+        if _TAG_RE.search(text):
+            # Caller already authored tags by hand — respect them.
+            return text
+
+        prompt_hash = hashlib.sha1(
+            self._audio_tag_system_prompt.encode("utf-8")
+        ).hexdigest()
+        cache_key = (text, prompt_hash)
+        cached = self._tag_cache.get(cache_key)
+        if cached is not None:
+            self._tag_cache.move_to_end(cache_key)
+            return cached
+
+        try:
+            response = await self._ai_sampling.complete_one_shot(
+                messages=[Message(role=MessageRole.USER, content=text)],
+                system_prompt=self._audio_tag_system_prompt,
+                tools_override=[],
+                profile_name=self._audio_tag_profile or None,
+            )
+        except Exception:
+            logger.warning(
+                "Audio-tag injection failed; falling back to raw text",
+                exc_info=True,
+            )
+            return text
+
+        tagged = (response.message.content or "").strip()
+        if not tagged:
+            logger.debug(
+                "Audio-tag injector returned empty content; using raw text"
+            )
+            return text
+
+        self._tag_cache[cache_key] = tagged
+        self._tag_cache.move_to_end(cache_key)
+        while len(self._tag_cache) > _AUDIO_TAG_CACHE_MAX:
+            self._tag_cache.popitem(last=False)
+        return tagged
 
     # --- Cache ---
 
@@ -320,6 +507,22 @@ class ElevenLabsTTS(TTSBackend):
                 )
             else:
                 raise ValueError("No voice_id configured — set voice_id in TTS backend settings")
+
+        # Inject audio tags up-front so the cache key reflects the
+        # actual text the API will see. Two consecutive identical raw
+        # inputs reuse the same tagged version (via _tag_cache) and
+        # then the same audio (via _cache) — keeping cache hit rates
+        # intact when tagging is on.
+        tagged_text = await self._inject_audio_tags(request.text)
+        if tagged_text != request.text:
+            request = SynthesisRequest(
+                text=tagged_text,
+                voice_id=request.voice_id,
+                output_format=request.output_format,
+                speed=request.speed,
+                stability=request.stability,
+                similarity_boost=request.similarity_boost,
+            )
 
         # Cache hit check before touching the API
         cache_key = self._make_cache_key(request)
