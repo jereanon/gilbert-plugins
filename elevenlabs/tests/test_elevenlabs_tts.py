@@ -746,3 +746,123 @@ async def test_audio_tag_profile_blank_means_no_profile(backend: ElevenLabsTTS) 
 
     assert ai.complete_one_shot.await_args.kwargs["profile_name"] is None
     await backend.close()
+
+
+async def test_audio_tag_context_wraps_user_message(
+    backend: ElevenLabsTTS,
+) -> None:
+    """When the SynthesisRequest carries a ``context``, the user
+    message sent to the director must be the rendered template — not
+    the raw text — so the model can take the situation into account."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+        }
+    )
+    ai = _stub_ai("[curious] Did you find the wrench?")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(
+                text="Did you find the wrench?",
+                voice_id="v1",
+                context="Asking a coworker who's been searching the toolbox",
+            )
+        )
+
+    sent = ai.complete_one_shot.await_args.kwargs["messages"][0].content
+    assert "Did you find the wrench?" in sent
+    assert "Asking a coworker who's been searching the toolbox" in sent
+    assert sent.startswith("Context:")
+
+
+async def test_audio_tag_no_context_sends_raw_text(
+    backend: ElevenLabsTTS,
+) -> None:
+    """No context means no template wrapping — the user message is
+    just the raw text. Otherwise we'd waste tokens on empty Context:
+    headers and confuse the director's parsing."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+        }
+    )
+    ai = _stub_ai("[neutral] Just a sentence.")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="Just a sentence.", voice_id="v1")
+        )
+
+    sent = ai.complete_one_shot.await_args.kwargs["messages"][0].content
+    assert sent == "Just a sentence."
+
+
+async def test_audio_tag_context_cache_keys_include_context(
+    backend: ElevenLabsTTS,
+) -> None:
+    """The same text under two different contexts should produce two
+    Haiku calls and two cache entries — one tagged-text per context.
+    Otherwise switching context wouldn't change the delivery."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+        }
+    )
+    ai = _stub_ai("[neutral] Same text")
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ):
+        await backend.synthesize(
+            SynthesisRequest(text="Same text", voice_id="v1", context="happy")
+        )
+        await backend.synthesize(
+            SynthesisRequest(text="Same text", voice_id="v1", context="angry")
+        )
+        # Repeating the first context should hit the tag cache.
+        await backend.synthesize(
+            SynthesisRequest(text="Same text", voice_id="v1", context="happy")
+        )
+
+    assert ai.complete_one_shot.await_count == 2
+    await backend.close()
+
+
+async def test_audio_tag_invalid_template_falls_back_to_raw(
+    backend: ElevenLabsTTS,
+) -> None:
+    """A template missing required placeholders is rejected at config
+    load — synthesize() proceeds with the default template, so a bad
+    config doesn't take TTS down."""
+    await backend.initialize(
+        {
+            "api_key": "sk-test",
+            "enable_audio_tags": True,
+            "audio_tag_min_chars": 0,
+            "audio_tag_context_template": "no placeholders here",
+        }
+    )
+    # The bad template was rejected; the default is in effect now.
+    assert "{context}" in backend._audio_tag_context_template
+    assert "{text}" in backend._audio_tag_context_template
+    await backend.close()

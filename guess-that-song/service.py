@@ -928,6 +928,7 @@ class GuessGameService(Service):
             text,
             speaker_names=game.config.speakers or None,
             volume=game.config.volume,
+            context="Lively game-show host hosting a music guessing game",
         )
 
     async def _announce_round_start(self, game: GameState) -> None:

@@ -26,6 +26,12 @@ from gilbert.interfaces.tts import (
 
 logger = logging.getLogger(__name__)
 
+# Default template applied when the caller passes a non-empty
+# ``context`` on the synthesis request. Wraps the raw text with the
+# context as a hint for the audio-tag director model. Configurable per
+# install — leave blank in Settings to fall back to this default.
+_DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE = "Context: {context}\n\nText:\n{text}"
+
 # Default minimum length (chars) for a piece of text to be worth tagging.
 # Below this, the latency cost of an extra AI round-trip outweighs any
 # expressiveness gain — single-word announcements ("Hi.") aren't going
@@ -35,14 +41,27 @@ _DEFAULT_AUDIO_TAG_MIN_CHARS = 40
 # Default system prompt for the audio-tag director. Configurable per
 # install via ``audio_tag_system_prompt`` so users can tune the tag
 # vocabulary, density, or voice without editing code.
-_DEFAULT_AUDIO_TAG_SYSTEM_PROMPT = (
-    "You are an audio director adding ElevenLabs v3 audio tags to text "
-    "for TTS narration. Insert tags like [excited], [laughs], [whispers], "
-    "[angry], [sad], [sighs], [curious], [sarcastic] before clauses where "
-    "they'd improve delivery. Use sparingly — at most one tag per "
-    "sentence. Do not change the words. Return only the tagged text, no "
-    "preface, no explanation."
-)
+_DEFAULT_AUDIO_TAG_SYSTEM_PROMPT = """\
+You add ElevenLabs v3 audio tags to text for TTS narration. Tags are bracketed performance cues like [excited] or [whispers] that the v3 model interprets as delivery instructions, not text to read aloud.
+
+Tag categories and starter examples (you may use other words in these categories when they fit better):
+- Emotions: [happy], [sad], [excited], [angry], [curious], [sarcastic], [nervous], [tired], [bored], [amused], [wistful], [deadpan]
+- Vocal delivery: [whispers], [shouts], [soft-spoken], [conspiratorial]
+- Non-verbal sounds: [laughs], [chuckles], [sighs], [gasps], [exhales], [clears throat]
+- Pacing: [pauses], [hesitates], [slowly]
+
+You may invent tags outside these examples when a more precise word fits — e.g. [resigned], [smug], [breathless]. Use single-word or short hyphenated tags. Do not use full phrases.
+
+Rules:
+- Place tags immediately before the clause or sentence they modify.
+- Tags persist forward until another tag replaces them. If a strong tag like [whispers] or [angry] applies to only one sentence, follow it with a neutral tag like [neutral] or a new appropriate tag when the mood shifts.
+- Don't tag every sentence. Neutral delivery is the default — only tag where the words clearly call for a specific delivery. If you're unsure, leave it untagged.
+- Match the tag to what the words actually say, not the topic. A sentence about a funeral isn't automatically [sad]; it's [sad] only if the speaker sounds sad.
+- Sarcasm tags require a clear textual cue (contradiction, irony, obvious setup). Don't guess.
+- Never alter, add, remove, or reorder words. Preserve all original punctuation and capitalization — they're part of the delivery.
+- If the user message wraps the text with a "Context: ..." block before "Text:", treat the Context as background that informs tag choice — do not echo it. Tag and return only the content under "Text:".
+- Output only the tagged text. No preamble, no explanation, no code fences, no surrounding quotes.\
+"""
 
 # Pattern that detects ``[lowercase_word]`` style tags already present in
 # the input. We skip the AI call entirely when the caller has authored
@@ -192,6 +211,22 @@ class ElevenLabsTTS(TTSBackend):
                 multiline=True,
             ),
             ConfigParam(
+                key="audio_tag_context_template",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Template applied when the caller passes a "
+                    "``context`` on the synthesis request. Must include "
+                    "``{context}`` and ``{text}`` placeholders — the "
+                    "rendered string becomes the user message sent to "
+                    "the director. The default system prompt expects "
+                    "the ``Context: ... \\n\\nText: ...`` shape; if you "
+                    "edit this, edit the system prompt to match. Leave "
+                    "blank to use the built-in default."
+                ),
+                default=_DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE,
+                multiline=True,
+            ),
+            ConfigParam(
                 key="audio_tag_min_chars",
                 type=ToolParameterType.INTEGER,
                 description=(
@@ -276,6 +311,7 @@ class ElevenLabsTTS(TTSBackend):
         self._enable_audio_tags: bool = False
         self._audio_tag_profile: str = ""
         self._audio_tag_system_prompt: str = _DEFAULT_AUDIO_TAG_SYSTEM_PROMPT
+        self._audio_tag_context_template: str = _DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE
         self._audio_tag_min_chars: int = _DEFAULT_AUDIO_TAG_MIN_CHARS
         self._ai_sampling: AISamplingProvider | None = None
         # Cache: (text, prompt_hash) -> tagged_text. Keyed on the prompt
@@ -330,6 +366,22 @@ class ElevenLabsTTS(TTSBackend):
             # never send an empty system prompt to the AI service.
             self._audio_tag_system_prompt = _DEFAULT_AUDIO_TAG_SYSTEM_PROMPT
 
+        tag_ctx_raw = config.get("audio_tag_context_template")
+        if isinstance(tag_ctx_raw, str) and tag_ctx_raw.strip():
+            # The template is a Python format string; we only validate
+            # it contains the required placeholders. Anything more
+            # exotic is the user's responsibility.
+            if "{context}" in tag_ctx_raw and "{text}" in tag_ctx_raw:
+                self._audio_tag_context_template = tag_ctx_raw
+            else:
+                logger.warning(
+                    "audio_tag_context_template missing {context} or {text} "
+                    "placeholder; falling back to default"
+                )
+                self._audio_tag_context_template = _DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE
+        else:
+            self._audio_tag_context_template = _DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE
+
         tag_min_raw = config.get("audio_tag_min_chars")
         if tag_min_raw is not None:
             try:
@@ -380,11 +432,18 @@ class ElevenLabsTTS(TTSBackend):
 
     # --- Audio-tag injection ---
 
-    async def _inject_audio_tags(self, text: str) -> str:
+    async def _inject_audio_tags(self, text: str, context: str = "") -> str:
         """Return ``text`` with v3 audio tags inserted, or the original
         text if injection is disabled, not applicable, or the AI call
         fails. Never raises — failures fall back to raw text so TTS
         keeps working even if the director model is down.
+
+        ``context`` is an optional caller-supplied description of the
+        situation/mood that the director uses as a hint. When non-empty
+        it's wrapped around ``text`` via
+        ``audio_tag_context_template`` before being sent as the user
+        message; the cache key includes the context so two calls with
+        the same text but different contexts are tagged independently.
         """
         if not self._enable_audio_tags:
             return text
@@ -399,15 +458,32 @@ class ElevenLabsTTS(TTSBackend):
         prompt_hash = hashlib.sha1(
             self._audio_tag_system_prompt.encode("utf-8")
         ).hexdigest()
-        cache_key = (text, prompt_hash)
+        cache_key = (text, context, prompt_hash)
         cached = self._tag_cache.get(cache_key)
         if cached is not None:
             self._tag_cache.move_to_end(cache_key)
             return cached
 
+        if context:
+            try:
+                user_message = self._audio_tag_context_template.format(
+                    context=context, text=text
+                )
+            except (KeyError, IndexError):
+                # Bad template (e.g. extra unfilled placeholder) —
+                # skip the wrap rather than crash; the director still
+                # gets the raw text and we lose only the context hint.
+                logger.warning(
+                    "audio_tag_context_template format failed; sending raw text",
+                    exc_info=True,
+                )
+                user_message = text
+        else:
+            user_message = text
+
         try:
             response = await self._ai_sampling.complete_one_shot(
-                messages=[Message(role=MessageRole.USER, content=text)],
+                messages=[Message(role=MessageRole.USER, content=user_message)],
                 system_prompt=self._audio_tag_system_prompt,
                 tools_override=[],
                 profile_name=self._audio_tag_profile or None,
@@ -425,6 +501,17 @@ class ElevenLabsTTS(TTSBackend):
                 "Audio-tag injector returned empty content; using raw text"
             )
             return text
+
+        # One INFO line per non-cached injection so users can audit
+        # which tags the director chose. Subsequent identical inputs
+        # hit ``_tag_cache`` and skip this branch — keeping the log
+        # quiet under repeat traffic.
+        if context:
+            logger.info(
+                "Audio tags injected (context=%r): %r → %r", context, text, tagged
+            )
+        else:
+            logger.info("Audio tags injected: %r → %r", text, tagged)
 
         self._tag_cache[cache_key] = tagged
         self._tag_cache.move_to_end(cache_key)
@@ -504,6 +591,7 @@ class ElevenLabsTTS(TTSBackend):
                     speed=request.speed,
                     stability=request.stability,
                     similarity_boost=request.similarity_boost,
+                    context=request.context,
                 )
             else:
                 raise ValueError("No voice_id configured — set voice_id in TTS backend settings")
@@ -513,7 +601,7 @@ class ElevenLabsTTS(TTSBackend):
         # inputs reuse the same tagged version (via _tag_cache) and
         # then the same audio (via _cache) — keeping cache hit rates
         # intact when tagging is on.
-        tagged_text = await self._inject_audio_tags(request.text)
+        tagged_text = await self._inject_audio_tags(request.text, request.context)
         if tagged_text != request.text:
             request = SynthesisRequest(
                 text=tagged_text,
@@ -522,6 +610,7 @@ class ElevenLabsTTS(TTSBackend):
                 speed=request.speed,
                 stability=request.stability,
                 similarity_boost=request.similarity_boost,
+                context=request.context,
             )
 
         # Cache hit check before touching the API
