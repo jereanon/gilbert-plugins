@@ -935,6 +935,10 @@ class SonosSpeaker(SpeakerBackend):
         async def _one(pid: str) -> None:
             client = self._clients.get(pid)
             if client is None:
+                logger.warning(
+                    "Audio clip skipped on speaker %s: no connected client",
+                    self._name_for(pid),
+                )
                 return
             try:
                 await client.player.play_audio_clip(
