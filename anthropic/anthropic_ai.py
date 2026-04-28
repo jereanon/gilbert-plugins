@@ -192,6 +192,11 @@ class AnthropicAI(AIBackend):
         self._max_tokens = int(config.get("max_tokens", 16384))
         self._temperature = float(config.get("temperature", 0.7))
 
+        # Long read timeout: non-streaming completions on the largest
+        # models (Opus, big system prompts, many tools) can easily hold
+        # the connection past the previous 120s default before the
+        # final byte arrives. Connect/write stay short so genuine
+        # connectivity failures still surface fast.
         self._client = httpx.AsyncClient(
             base_url=_BASE_URL,
             headers={
@@ -199,7 +204,12 @@ class AnthropicAI(AIBackend):
                 "anthropic-version": _API_VERSION,
                 "content-type": "application/json",
             },
-            timeout=120.0,
+            timeout=httpx.Timeout(
+                connect=15.0,
+                read=600.0,
+                write=60.0,
+                pool=15.0,
+            ),
         )
         logger.info("Anthropic AI backend initialized (model=%s)", self._model)
 
