@@ -566,6 +566,58 @@ async def test_get_now_playing_falls_back_to_container_name() -> None:
     assert np.source == "linein"
 
 
+async def test_get_now_playing_routes_through_coordinator_when_member_meta_empty() -> None:
+    """When the queried speaker is a non-coordinator member of a group,
+    aiosonos's per-player WebSocket gets a ``groupCoordinatorChanged``
+    error trying to subscribe to the group's metadata, so it stores
+    ``playback_metadata = {}`` on the member's view of the group. The
+    coordinator's own client has the populated metadata. Without the
+    coordinator-routing fallback, querying the member returns
+    ``state=playing`` with everything blank — which is the bug the user
+    saw on a real two-speaker setup.
+    """
+    # Member speaker — empty metadata (the bug condition).
+    backend, member_client, _player_m, member_group = _make_backend_with_mock_speaker(
+        player_id="RINCON_MEMBER"
+    )
+    member_group.playback_metadata = {}
+    member_group.coordinator_id = "RINCON_COORD"
+    member_group.playback_state = "PLAYBACK_STATE_PLAYING"
+
+    # Coordinator's view of the same group — populated metadata.
+    coord_group = MagicMock()
+    coord_group.id = member_group.id
+    coord_group.coordinator_id = "RINCON_COORD"
+    coord_group.playback_state = "PLAYBACK_STATE_PLAYING"
+    coord_group.playback_metadata = {
+        "_objectType": "metadataStatus",
+        "currentItem": {
+            "track": {
+                "name": "Hotel California",
+                "artist": {"name": "Eagles"},
+                "album": {"name": "Hotel California"},
+                "images": [{"url": "https://img.example/hc.jpg"}],
+                "durationMillis": 391_000,
+            },
+        },
+        "container": {"type": "playlist", "name": "Classic Rock"},
+        "positionMillis": 60_000,
+    }
+    coord_player = MagicMock()
+    coord_player.id = "RINCON_COORD"
+    coord_player.group = coord_group
+    coord_client = MagicMock()
+    coord_client.player = coord_player
+    backend._clients["RINCON_COORD"] = coord_client
+
+    np = await backend.get_now_playing("RINCON_MEMBER")
+    assert np.title == "Hotel California"
+    assert np.artist == "Eagles"
+    assert np.album == "Hotel California"
+    assert np.album_art_url == "https://img.example/hc.jpg"
+    assert np.source == "playlist"
+
+
 async def test_get_now_playing_track_metadata_wins_over_container() -> None:
     """When both per-track and container metadata are present (a normal
     Spotify queue play), the track-level fields take precedence —

@@ -1238,7 +1238,26 @@ class SonosSpeaker(SpeakerBackend):
         if group is None:
             return NowPlaying(state=state)
 
+        # Sonos's per-player WebSocket only returns populated
+        # ``playback_metadata`` for groups led by THIS player. When the
+        # caller asks a member of a group led by another speaker,
+        # aiosonos's ``async_init`` catches the ``groupCoordinatorChanged``
+        # error and stores an empty dict for ``_playback_metadata_data``.
+        # Re-route through the coordinator's client when it's available
+        # — same group, same metadata — instead of returning empty.
         meta = group.playback_metadata
+        if not meta and group.coordinator_id and group.coordinator_id != speaker_id:
+            coord_client = self._clients.get(group.coordinator_id)
+            if coord_client is not None and coord_client is not client:
+                coord_group = coord_client.player.group
+                if coord_group is not None and coord_group.playback_metadata:
+                    meta = coord_group.playback_metadata
+                    logger.debug(
+                        "Sonos now-playing: re-routed %s -> coordinator %s "
+                        "(member's playback_metadata was empty)",
+                        speaker_id,
+                        group.coordinator_id,
+                    )
         if not meta:
             return NowPlaying(state=state)
 
