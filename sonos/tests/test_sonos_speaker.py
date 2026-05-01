@@ -517,6 +517,90 @@ async def test_get_now_playing_empty_when_no_metadata() -> None:
     assert np.album == ""
 
 
+async def test_get_now_playing_falls_back_to_stream_info() -> None:
+    """Radio (audioBroadcast) typically lacks ``currentItem.track`` but
+    ships a ``streamInfo`` string with the station's "now playing" text
+    plus a ``container`` describing the station. Without the fallback
+    ladder we'd report ``state=playing`` with everything else blank —
+    the exact bug the user reported with KCRW-style sources."""
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    group.playback_state = "PLAYBACK_STATE_PLAYING"
+    group.playback_metadata = {
+        "_objectType": "metadataStatus",
+        "streamInfo": "Bowie - Heroes",
+        "container": {
+            "_objectType": "container",
+            "type": "audioBroadcast",
+            "name": "KCRW",
+            "imageUrl": "https://img.example/kcrw.jpg",
+        },
+    }
+
+    np = await backend.get_now_playing("RINCON_COORD")
+    assert np.title == "Bowie - Heroes"
+    assert np.album == "KCRW"
+    assert np.album_art_url == "https://img.example/kcrw.jpg"
+    assert np.source == "audioBroadcast"
+
+
+async def test_get_now_playing_falls_back_to_container_name() -> None:
+    """Line-in / TV / AirPlay sources have no ``track`` and no
+    ``streamInfo`` but always have a ``container.name`` — surface that
+    as the title so the AI can say "playing from line-in" instead of
+    pretending nothing's playing."""
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    group.playback_state = "PLAYBACK_STATE_PLAYING"
+    group.playback_metadata = {
+        "_objectType": "metadataStatus",
+        "container": {
+            "_objectType": "container",
+            "type": "linein",
+            "name": "Line-In",
+        },
+    }
+
+    np = await backend.get_now_playing("RINCON_COORD")
+    assert np.title == "Line-In"
+    assert np.artist == ""
+    assert np.album == ""
+    assert np.source == "linein"
+
+
+async def test_get_now_playing_track_metadata_wins_over_container() -> None:
+    """When both per-track and container metadata are present (a normal
+    Spotify queue play), the track-level fields take precedence —
+    container is only a fallback. Album art also stays from the track,
+    not the container's playlist art."""
+    backend, _client, _player, group = _make_backend_with_mock_speaker()
+    group.playback_state = "PLAYBACK_STATE_PLAYING"
+    group.playback_metadata = {
+        "_objectType": "metadataStatus",
+        "currentItem": {
+            "track": {
+                "name": "All Falls Down",
+                "artist": {"name": "Kanye"},
+                "album": {"name": "College Dropout"},
+                "images": [{"url": "https://img.example/cd.jpg"}],
+                "durationMillis": 220_000,
+            },
+        },
+        "container": {
+            "type": "playlist",
+            "name": "My Mix Vol. 3",
+            "imageUrl": "https://img.example/playlist.jpg",
+        },
+    }
+
+    np = await backend.get_now_playing("RINCON_COORD")
+    assert np.title == "All Falls Down"
+    assert np.artist == "Kanye"
+    assert np.album == "College Dropout"
+    assert np.album_art_url == "https://img.example/cd.jpg"
+    # ``source`` still reflects the container even when the track wins —
+    # callers that care about "where is this coming from" still get it.
+    assert np.source == "playlist"
+
+
 # ── Declarative grouping ─────────────────────────────────────────────
 
 

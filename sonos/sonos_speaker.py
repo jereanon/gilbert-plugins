@@ -1206,7 +1206,29 @@ class SonosSpeaker(SpeakerBackend):
         )
 
     async def get_now_playing(self, speaker_id: str) -> NowPlaying:
-        """Pull the latest metadata for whatever's playing on the speaker's group."""
+        """Pull the latest metadata for whatever's playing on the speaker's group.
+
+        Sonos exposes track metadata in different places depending on
+        the source. Per-song queue playback (Spotify track, local
+        library) populates ``currentItem.track``. Radio / SiriusXM /
+        line-in / TV input / AirPlay populates ``container`` (source
+        name + image) and sometimes ``streamInfo`` (a free-form
+        "now playing" string the station ships with the stream). Only
+        looking at ``track`` left every non-track source rendering as
+        empty title/artist/album with ``state=playing`` — confusing
+        for users and for the AI deciding what to say.
+
+        The fallback ladder, in order:
+          1. ``currentItem.track.name`` → use full track-level fields.
+          2. ``streamInfo`` (radio's "now playing") → title=streamInfo,
+             album=container.name (so "Some Song" / "KCRW").
+          3. ``container.name`` → title=container.name, no artist
+             (line-in, TV, generic source label).
+          4. Nothing → empty NowPlaying with ``state`` only.
+
+        Album art falls back from ``track.images`` →
+        ``container.imageUrl`` so radio / playlist art still shows up.
+        """
         client = self._clients.get(speaker_id)
         state = await self.get_playback_state(speaker_id)
         if client is None:
@@ -1223,17 +1245,47 @@ class SonosSpeaker(SpeakerBackend):
         # aiosonos's ``MetadataStatus`` is a ``TypedDict`` — at runtime
         # it's a plain dict, so fields MUST be accessed via ``.get(...)``
         # (not ``getattr``, which always returns the default because
-        # dicts don't expose keys as attributes). Track/Album/Artist
-        # objects inside it are also TypedDicts — same rule.
+        # dicts don't expose keys as attributes). Track/Album/Artist/
+        # Container objects inside it are also TypedDicts — same rule.
         current_item = meta.get("currentItem") or {}
         track = current_item.get("track") or {}
+        container = meta.get("container") or {}
+        stream_info = str(meta.get("streamInfo") or "").strip()
+
         title = str(track.get("name") or "")
         artist = str((track.get("artist") or {}).get("name") or "")
         album = str((track.get("album") or {}).get("name") or "")
-        images = track.get("images") or []
-        album_art = str((images[0].get("url") if images else "") or "")
+        track_images = track.get("images") or []
+        album_art = str(
+            (track_images[0].get("url") if track_images else "") or ""
+        )
         duration_ms = int(track.get("durationMillis") or 0)
         position_ms = int(meta.get("positionMillis") or 0)
+        source_type = str(container.get("type") or "")
+
+        if not title:
+            container_name = str(container.get("name") or "")
+            if stream_info:
+                # Radio with a stream-supplied "now playing" string —
+                # use it as the title and the station name as the album
+                # so the UI/AI sees both.
+                title = stream_info
+                if not album:
+                    album = container_name
+            elif container_name:
+                # Source-only: line-in, TV input, AirPlay, an unloaded
+                # Spotify Connect handoff, etc. ``container.type`` is
+                # surfaced separately on ``NowPlaying.source`` so the
+                # caller can phrase "playing from line-in" instead of
+                # the bare label.
+                title = container_name
+
+        if not album_art:
+            container_images = container.get("images") or []
+            if container_images:
+                album_art = str(container_images[0].get("url") or "")
+            elif container.get("imageUrl"):
+                album_art = str(container.get("imageUrl") or "")
 
         return NowPlaying(
             state=state,
@@ -1243,6 +1295,7 @@ class SonosSpeaker(SpeakerBackend):
             album_art_url=album_art,
             duration_seconds=duration_ms / 1000.0,
             position_seconds=position_ms / 1000.0,
+            source=source_type,
         )
 
     # ── Grouping ─────────────────────────────────────────────────────
