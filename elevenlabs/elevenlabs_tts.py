@@ -209,6 +209,7 @@ class ElevenLabsTTS(TTSBackend):
                 ),
                 default=_DEFAULT_AUDIO_TAG_SYSTEM_PROMPT,
                 multiline=True,
+                ai_prompt=True,
             ),
             ConfigParam(
                 key="audio_tag_context_template",
@@ -225,6 +226,7 @@ class ElevenLabsTTS(TTSBackend):
                 ),
                 default=_DEFAULT_AUDIO_TAG_CONTEXT_TEMPLATE,
                 multiline=True,
+                ai_prompt=True,
             ),
             ConfigParam(
                 key="audio_tag_min_chars",
