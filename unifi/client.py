@@ -34,13 +34,22 @@ class UniFiClient:
         verify_ssl: bool = False,
         timeout: float = 15.0,
     ) -> None:
-        self._host = host.rstrip("/")
+        # UniFi OS only serves its API over HTTPS — HTTP requests get a 301 to
+        # the https URL, which httpx may downgrade to GET, breaking login. Force
+        # the upgrade up front so users can paste either scheme.
+        normalized = host.rstrip("/")
+        if normalized.startswith("http://"):
+            normalized = "https://" + normalized[len("http://") :]
+        elif not normalized.startswith("https://"):
+            normalized = "https://" + normalized
+        self._host = normalized
         self._username = username
         self._password = password
         self._client = httpx.AsyncClient(
             base_url=self._host,
             verify=verify_ssl,
             timeout=timeout,
+            follow_redirects=True,
         )
         self._logged_in = False
 

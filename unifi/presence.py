@@ -78,7 +78,6 @@ class UniFiPresenceBackend(PresenceBackend):
                 description="UniFi Network username.",
                 default="",
                 restart_required=True,
-                sensitive=True,
             ),
             ConfigParam(
                 key="unifi_network.password",
@@ -107,7 +106,6 @@ class UniFiPresenceBackend(PresenceBackend):
                 description="UniFi Protect username.",
                 default="",
                 restart_required=True,
-                sensitive=True,
             ),
             ConfigParam(
                 key="unifi_protect.password",

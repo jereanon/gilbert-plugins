@@ -66,17 +66,34 @@ class UniFiProtect:
         cameras: list[Camera] = []
         for c in data if isinstance(data, list) else []:
             feature_flags = c.get("featureFlags", {}) or {}
-            model_name = c.get("type", "")
-            is_doorbell = feature_flags.get("hasChime", False) or "doorbell" in model_name.lower()
+            model_name = c.get("type", "") or ""
+            market_name = c.get("marketName", "") or ""
+            # UniFi has shipped doorbells across several feature-flag names —
+            # hasChime on older firmware, isDoorbell / hasButton on newer.
+            is_doorbell = (
+                bool(feature_flags.get("hasChime", False))
+                or bool(feature_flags.get("isDoorbell", False))
+                or bool(feature_flags.get("hasButton", False))
+                or "doorbell" in model_name.lower()
+                or "doorbell" in market_name.lower()
+            )
             cameras.append(
                 Camera(
                     camera_id=c.get("id", ""),
                     name=c.get("name", ""),
-                    model=model_name,
+                    model=model_name or market_name,
                     state=c.get("state", ""),
                     last_motion=c.get("lastMotion", 0),
                     is_doorbell=is_doorbell,
                 )
+            )
+        if cameras:
+            doorbells = [c.name for c in cameras if c.is_doorbell]
+            logger.debug(
+                "Protect cameras: %d total, %d doorbells (%s)",
+                len(cameras),
+                len(doorbells),
+                ", ".join(doorbells) or "none",
             )
         return cameras
 
