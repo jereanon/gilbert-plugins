@@ -22,9 +22,10 @@ def _service(tmp_path: Path, lifecycle: str = "eager") -> tuple[BrowserService, 
     fake_pw = MagicMock()
     fake_pw.chromium.launch = AsyncMock()
     fake_pw.chromium.connect = AsyncMock()
+    # ``stop()`` is on the Playwright instance, NOT the context manager.
+    fake_pw.stop = AsyncMock()
     fake_pw_cm = MagicMock()
     fake_pw_cm.start = AsyncMock(return_value=fake_pw)
-    fake_pw_cm.stop = AsyncMock()
     return svc, fake_pw_cm
 
 
@@ -41,8 +42,11 @@ async def test_eager_lifecycle_blocks_until_pool_ready(tmp_path: Path):
         # By the time start() returned, the pool must be ready.
         assert svc._pool is not None
         fake_pw_cm.start.assert_awaited_once()
+        # Capture the playwright instance so we can verify stop() lands
+        # on it (not on the context manager).
+        pw = fake_pw_cm.start.return_value
         await svc.stop()
-    fake_pw_cm.stop.assert_awaited_once()
+    pw.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio

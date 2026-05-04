@@ -249,6 +249,11 @@ class BrowserService(Service):
         """Boot Playwright, optionally start the Docker container, and
         connect the ``ContextPool``. Idempotent only when wrapped by
         ``_ensure_pool_ready``."""
+        # Reap any container leftovers from previous crashed runs
+        # before starting a new one. Best-effort; failures are logged
+        # but don't block the new container.
+        await BrowserContainer.prune_stale()
+
         self._pw_cm = async_playwright()
         try:
             self._pw = await self._pw_cm.start()
@@ -362,13 +367,18 @@ class BrowserService(Service):
         if self._pool is not None:
             await self._pool.stop()
             self._pool = None
-        if self._pw_cm is not None:
+        if self._pw is not None:
+            # ``stop()`` lives on the Playwright instance (returned by
+            # ``async_playwright().start()``), NOT on the
+            # PlaywrightContextManager that ``async_playwright()``
+            # itself returns — that object only supports
+            # ``__aenter__`` / ``__aexit__``.
             try:
-                await self._pw_cm.stop()
+                await self._pw.stop()
             except Exception:
                 logger.exception("playwright stop failed")
-            self._pw_cm = None
-            self._pw = None
+        self._pw_cm = None
+        self._pw = None
         if self._container is not None:
             try:
                 await self._container.stop()
