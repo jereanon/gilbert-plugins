@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
+import shutil
 import socket
 import tempfile
 import time
@@ -55,6 +57,40 @@ class _Session:
     started_at: float
     last_used: float
     target_url: str = ""
+
+
+def _discover_chromium() -> str:
+    """Return a path to a usable Chromium binary, or empty string.
+
+    Tries (in order): ``chromium`` on PATH, ``chromium-browser`` on PATH,
+    ``google-chrome`` on PATH, ``chrome`` on PATH, then any
+    ``chrome-linux*/chrome`` under Playwright's per-user browser cache
+    at ``~/.cache/ms-playwright/chromium-*/``. The Playwright cache
+    fallback means a host that's already run ``uv run playwright install
+    chromium`` doesn't need a separate system Chrome install just for
+    the VNC flow.
+    """
+    for candidate in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+    home = os.environ.get("HOME") or str(Path.home())
+    cache = Path(home) / ".cache" / "ms-playwright"
+    if cache.is_dir():
+        for child in sorted(cache.iterdir(), reverse=True):
+            # Match both ``chromium-XXXX`` (full Chromium) and
+            # ``chromium_headless_shell-XXXX``; the headless shell can
+            # also drive a headed display under Xvfb.
+            if not (child.is_dir() and child.name.startswith(("chromium-", "chromium_"))):
+                continue
+            for inner in child.glob("chrome-linux*/chrome"):
+                if inner.is_file():
+                    return str(inner)
+            # Some image variants use chrome-headless-shell as the binary
+            for inner in child.glob("chrome-linux*/chrome-headless-shell"):
+                if inner.is_file():
+                    return str(inner)
+    return ""
 
 
 def _free_tcp_port() -> int:
@@ -175,7 +211,23 @@ class VncSessionManager:
             procs.append(websockify)
 
             # Headed Chromium pointed at Xvfb DISPLAY.
-            chromium = self._chromium_binary or "chromium"
+            # Discover a usable binary at runtime — the Linux package
+            # is variously named ``chromium`` (Arch / Fedora / Snap),
+            # ``chromium-browser`` (Debian / Ubuntu), or ``google-chrome``
+            # (the proprietary build). Falls back to the Chromium
+            # binary Playwright already downloaded into the user's
+            # cache (~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome)
+            # so the VNC flow works on a host that has Playwright +
+            # Docker but no system Chrome.
+            chromium = self._chromium_binary or _discover_chromium()
+            if not chromium:
+                raise RuntimeError(
+                    "No Chromium binary found on the host. The VNC live-"
+                    "login flow needs a system Chromium / Google Chrome "
+                    "(``apt install chromium`` on Debian/Ubuntu, "
+                    "``brew install chromium`` on macOS) OR the Playwright "
+                    "browser cache from ``uv run playwright install chromium``."
+                )
             chromium_args = [
                 chromium,
                 f"--user-data-dir={user_data_dir}",
@@ -188,7 +240,11 @@ class VncSessionManager:
                 chromium_args.append(target_url)
             chromium_proc = await asyncio.create_subprocess_exec(
                 *chromium_args,
-                env={"DISPLAY": f":{display}", "PATH": "/usr/bin:/bin:/usr/local/bin"},
+                env={
+                    "DISPLAY": f":{display}",
+                    "PATH": "/usr/bin:/bin:/usr/local/bin",
+                    "HOME": os.environ.get("HOME", "/tmp"),
+                },
             )
             procs.append(chromium_proc)
 

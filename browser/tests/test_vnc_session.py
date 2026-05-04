@@ -33,7 +33,12 @@ def fake_subprocess(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_start_session_spawns_four_procs(tmp_path: Path, fake_subprocess):
-    mgr = VncSessionManager(data_dir=tmp_path, max_per_user=2, max_total=5)
+    # Pin chromium_binary so the test doesn't depend on the host's
+    # discovery — _discover_chromium would otherwise return whatever
+    # chromium is on PATH or in Playwright's cache, which varies.
+    mgr = VncSessionManager(
+        data_dir=tmp_path, max_per_user=2, max_total=5, chromium_binary="chromium"
+    )
     session = await mgr.start_session("u1", target_url="https://example.com/login")
     try:
         assert session.session_id
@@ -46,15 +51,14 @@ async def test_start_session_spawns_four_procs(tmp_path: Path, fake_subprocess):
         assert "Xvfb" in cmds
         assert "x11vnc" in cmds
         assert "websockify" in cmds
-        # Chromium fallback default is "chromium".
-        assert any(c in ("chromium", "google-chrome") for c in cmds)
+        assert "chromium" in cmds
     finally:
         await mgr.stop_session(session.session_id)
 
 
 @pytest.mark.asyncio
 async def test_target_url_passed_to_chromium(tmp_path: Path, fake_subprocess):
-    mgr = VncSessionManager(data_dir=tmp_path)
+    mgr = VncSessionManager(data_dir=tmp_path, chromium_binary="chromium")
     target = "https://x.test/login"
     session = await mgr.start_session("u1", target_url=target)
     try:
