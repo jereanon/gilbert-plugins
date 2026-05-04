@@ -45,6 +45,13 @@ export function BrowserCredentialsPanel() {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState<BrowserCredentialDraft | null>(null);
   const [vncCredentialId, setVncCredentialId] = useState<string | null>(null);
+  // Ad-hoc VNC session: user enters a URL and gets a noVNC window
+  // pointed at it without first saving a credential. Useful when the
+  // agent has been blocked by anti-bot tech and just needs the user
+  // to complete a one-time challenge — cookies persist into the
+  // headless context regardless.
+  const [vncTargetUrl, setVncTargetUrl] = useState<string | null>(null);
+  const [adHocOpen, setAdHocOpen] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ["browser", "credentials"],
@@ -84,8 +91,8 @@ export function BrowserCredentialsPanel() {
 
   return (
     <div className="rounded-md border p-4 sm:p-6">
-      <div className="flex items-start justify-between gap-3 mb-4">
-        <div>
+      <div className="flex items-start justify-between gap-3 mb-4 flex-wrap">
+        <div className="min-w-0">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <KeyRoundIcon className="size-4" /> Saved logins
           </h2>
@@ -94,9 +101,19 @@ export function BrowserCredentialsPanel() {
             are encrypted at rest with a per-installation key.
           </p>
         </div>
-        <Button size="sm" onClick={() => setEditing({ ...EMPTY_DRAFT })}>
-          <PlusIcon className="size-4 mr-1" /> Add
-        </Button>
+        <div className="flex flex-wrap gap-2 shrink-0">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setAdHocOpen(true)}
+            title="Open a VNC browser to a URL — no saved credential needed. Use when the agent hits a Cloudflare / captcha / bot block and just needs you to complete the challenge once."
+          >
+            <MonitorIcon className="size-4 mr-1" /> Start interactive session
+          </Button>
+          <Button size="sm" onClick={() => setEditing({ ...EMPTY_DRAFT })}>
+            <PlusIcon className="size-4 mr-1" /> Add
+          </Button>
+        </div>
       </div>
 
       {isLoading ? (
@@ -177,7 +194,84 @@ export function BrowserCredentialsPanel() {
           }}
         />
       )}
+      {vncTargetUrl && (
+        <BrowserVncSessionDialog
+          targetUrl={vncTargetUrl}
+          onClose={() => {
+            setVncTargetUrl(null);
+            refresh();
+          }}
+        />
+      )}
+      {adHocOpen && (
+        <AdHocVncDialog
+          onCancel={() => setAdHocOpen(false)}
+          onStart={(url) => {
+            setAdHocOpen(false);
+            setVncTargetUrl(url);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function AdHocVncDialog({
+  onCancel,
+  onStart,
+}: {
+  onCancel: () => void;
+  onStart: (url: string) => void;
+}) {
+  const [url, setUrl] = useState("");
+  const submit = () => {
+    const v = url.trim();
+    if (!v) return;
+    // Auto-add scheme if the user pasted a bare hostname.
+    const withScheme = /^https?:\/\//i.test(v) ? v : `https://${v}`;
+    onStart(withScheme);
+  };
+  return (
+    <Dialog open onOpenChange={(o) => { if (!o) onCancel(); }}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Start interactive browser session</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Opens a real Chromium window over VNC pointed at the URL
+            below. Useful when an agent is blocked by Cloudflare /
+            captcha / 'unusual traffic' challenges — complete it once
+            here, your cookies persist into the agent's headless
+            browser context.
+          </p>
+          <div className="space-y-1">
+            <Label htmlFor="adhoc-url">URL</Label>
+            <Input
+              id="adhoc-url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://kayak.com"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  submit();
+                }
+              }}
+            />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={!url.trim()}>
+            Open
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
