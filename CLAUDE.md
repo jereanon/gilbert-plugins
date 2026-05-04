@@ -136,36 +136,71 @@ my-plugin/
 
 Core's Vite build picks every `<plugin>/frontend/panels.ts` (and `.tsx`) up automatically via an `import.meta.glob` in `frontend/src/plugins/index.ts` — adding a plugin's UI is purely additive, no edits to core. Plugin TypeScript can import core helpers via the `@/` alias (`@/components/ui/button`, `@/hooks/useWebSocket`, etc.); core never imports from the plugin.
 
-To surface a panel:
+### Backend hooks (all default `[]`)
 
-1. In Python: declare a `UIPanel` from `Plugin.ui_panels()`:
+```python
+from gilbert.interfaces.plugin import UIPanel, UIRoute, NavContribution, DashboardCard
 
-   ```python
-   from gilbert.interfaces.plugin import UIPanel
+class FooPlugin(Plugin):
+    def ui_panels(self) -> list[UIPanel]:
+        """Mount a component into a slot on someone else's page."""
+        return [UIPanel(panel_id="foo.thing", slot="account.extensions",
+                        label="My thing", required_role="user")]
 
-   def ui_panels(self) -> list[UIPanel]:
-       return [
-           UIPanel(
-               panel_id="myplugin.thing",
-               slot="account.extensions",   # or "settings.<category>"
-               label="My thing",
-               required_role="user",         # or "admin"
-           ),
-       ]
-   ```
+    def ui_routes(self) -> list[UIRoute]:
+        """A full SPA page the plugin owns. Optionally synthesizes a
+        nav entry and / or a dashboard card."""
+        return [UIRoute(path="/foo", panel_id="foo.page",
+                        label="Foo", icon="package",
+                        add_to_nav=True, nav_parent_group="system",
+                        show_in_dashboard=True,
+                        required_role="user")]
 
-2. In TypeScript: register the React component under the same `panel_id`:
+    def nav_contributions(self) -> list[NavContribution]:
+        """Standalone nav items (no associated route)."""
+        return [NavContribution(label="Quick reset", action="restart_host",
+                                icon="rotate-ccw", parent_group="system",
+                                required_role="admin")]
 
-   ```ts
-   // <plugin>/frontend/panels.ts
-   import { registerPanel } from "@/lib/plugin-panels";
-   import { ThingPanel } from "./ThingPanel";
-   registerPanel("myplugin.thing", ThingPanel);
-   ```
+    def dashboard_cards(self) -> list[DashboardCard]:
+        """Cards on the / landing page (use UIRoute(show_in_dashboard=True)
+        for the common case)."""
+        return [DashboardCard(title="Foo", description="…", url="/foo",
+                              icon="package", required_role="user")]
+```
 
-The frontend's `<PluginPanelSlot slot="…">` mounts every registered panel for that slot, filtered by `required_role`. Panels with no registered React component are silently skipped (e.g. when the plugin is loaded backend-only without its frontend bundle).
+### TypeScript registration (same for panels and routes)
 
-WS RPCs unique to the plugin should live in a per-plugin hook (`<plugin>/frontend/api.ts` exporting `useFooApi`) using the underlying `rpc()` from `useWebSocket`. Don't bolt them onto core's `useWsApi`.
+```ts
+// <plugin>/frontend/panels.ts
+import { registerPanel } from "@/lib/plugin-panels";
+import { ThingPanel } from "./ThingPanel";
+import { FooPage } from "./FooPage";
+
+registerPanel("foo.thing", ThingPanel);   // for ui_panels()
+registerPanel("foo.page", FooPage);       // for ui_routes()
+```
+
+The frontend's `<PluginPanelSlot slot="…">` mounts every registered panel for that slot, filtered by `required_role`. `<PluginRoutes>` (already mounted from `App.tsx`) injects a `<Route>` for every declared `ui_routes()` entry. Panels / routes whose components aren't registered in the SPA bundle are silently skipped — this happens when a plugin is loaded backend-only without its frontend module.
+
+### Built-in slots
+
+- `account.extensions` — per-user Account page (`/account`). Per-user UI like saved logins / OAuth tokens.
+- `settings.<category>` — admin Settings page, scoped to a config category (e.g. `settings.browser`). Mount additional admin UI under your `config_category`.
+- `header.widgets` — top nav bar, between the connection indicator and the notification bell. Live-status widgets.
+- `dashboard.top` / `dashboard.bottom` — banner-style widgets above / below the standard card grid on the landing page.
+
+### Declaring your own slots
+
+Plugins are free to drop `<PluginPanelSlot slot="myplugin.thing">` inside their own pages. Other plugins (or your future self) can register components targeting that slot — same mechanism, no extra plumbing. Use this when your plugin has natural extension points (e.g. a "session list" page that should let other plugins add per-session action buttons).
+
+### Plugin-local API hook
+
+WS RPCs unique to the plugin live in a per-plugin hook (`<plugin>/frontend/api.ts` exporting `useFooApi`) using the underlying `rpc()` from `useWebSocket`. Don't bolt them onto core's `useWsApi`.
+
+### npm workspace
+
+Each `<plugin>/frontend/` is an npm workspace member of the repo-root `package.json`. Drop a `package.json` next to your `panels.ts` declaring `peerDependencies` on the host SPA libs (`react`, `@tanstack/react-query`, etc.) and any extra `dependencies` your plugin needs. `npm install` from the repo root hoists everything.
 
 ## Runtime dependencies (non-pip)
 
