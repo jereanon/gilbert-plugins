@@ -163,6 +163,81 @@ async def test_get_tools_returns_definitions(tmp_path: Path):
     assert "browser_get_text" in names
     assert "browser_get_html" in names
     assert "browser_screenshot" in names
+    # browser_extract is gated behind ai_chat — not advertised when missing.
+    assert "browser_extract" not in names
+
+
+@pytest.mark.asyncio
+async def test_get_tools_includes_extract_when_ai_sampling_available(tmp_path: Path):
+    svc = BrowserService(data_dir=tmp_path, storage=MagicMock())
+    svc._ai_sampling = MagicMock()  # presence is what matters
+    names = {t.name for t in svc.get_tools()}
+    assert "browser_extract" in names
+
+
+@pytest.mark.asyncio
+async def test_browser_extract_calls_ai_sampling_with_prompt(tmp_path: Path):
+    svc, page = _service_with_page(tmp_path)
+    page.locator.return_value.inner_text = AsyncMock(return_value="page body text")
+
+    fake_message = MagicMock()
+    fake_message.content = '{"answer": 42}'
+    fake_response = MagicMock()
+    fake_response.message = fake_message
+    ai = MagicMock()
+    ai.complete_one_shot = AsyncMock(return_value=fake_response)
+    svc._ai_sampling = ai
+
+    out = await svc.execute_tool(
+        "browser_extract",
+        {
+            "_user_id": "u",
+            "instruction": "extract the answer",
+            "json_schema": '{"type":"object"}',
+        },
+    )
+    ai.complete_one_shot.assert_awaited_once()
+    kwargs = ai.complete_one_shot.call_args.kwargs
+    assert "extraction" in kwargs["system_prompt"].lower() or "json" in kwargs["system_prompt"].lower()
+    user_msg = kwargs["messages"][0]
+    assert "extract the answer" in user_msg.content
+    assert "page body text" in user_msg.content
+    assert out == '{"answer": 42}'
+
+
+@pytest.mark.asyncio
+async def test_browser_extract_strips_code_fences(tmp_path: Path):
+    svc, page = _service_with_page(tmp_path)
+    page.locator.return_value.inner_text = AsyncMock(return_value="x")
+    fake_resp = MagicMock()
+    fake_resp.message.content = "```json\n{\"a\": 1}\n```"
+    svc._ai_sampling = MagicMock()
+    svc._ai_sampling.complete_one_shot = AsyncMock(return_value=fake_resp)
+    out = await svc.execute_tool(
+        "browser_extract", {"_user_id": "u", "instruction": "x"}
+    )
+    assert out.strip() == '{"a": 1}'
+
+
+@pytest.mark.asyncio
+async def test_browser_extract_without_ai_sampling_returns_error(tmp_path: Path):
+    svc, _ = _service_with_page(tmp_path)
+    svc._ai_sampling = None
+    out = await svc.execute_tool(
+        "browser_extract", {"_user_id": "u", "instruction": "x"}
+    )
+    assert "error" in out.lower()
+    assert "ai sampling" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_browser_extract_requires_instruction(tmp_path: Path):
+    svc, _ = _service_with_page(tmp_path)
+    svc._ai_sampling = MagicMock()
+    svc._ai_sampling.complete_one_shot = AsyncMock()
+    out = await svc.execute_tool("browser_extract", {"_user_id": "u"})
+    assert "instruction" in out.lower()
+    svc._ai_sampling.complete_one_shot.assert_not_awaited()
 
 
 @pytest.mark.asyncio

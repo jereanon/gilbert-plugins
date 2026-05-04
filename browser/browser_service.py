@@ -16,6 +16,7 @@ from typing import Any
 
 from playwright.async_api import async_playwright
 
+from gilbert.interfaces.ai import Message, MessageRole
 from gilbert.interfaces.attachments import FileAttachment
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
@@ -25,7 +26,7 @@ from gilbert.interfaces.workspace import WorkspaceProvider
 from .context_pool import ContextPool
 from .credentials import BrowserCredential, CredentialStore
 from .login_runner import LoginRunner
-from .tools import INTERACTION_TOOLS, READ_ONLY_TOOLS
+from .tools import INTERACTION_TOOLS, READ_ONLY_TOOLS, SMART_TOOLS
 from .vnc import VncSessionManager
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ class BrowserService(Service):
         self._page_locks: dict[str, asyncio.Lock] = {}
         # Resolved capabilities, set in start().
         self._workspace: WorkspaceProvider | None = None
+        self._ai_sampling: Any | None = None
         # Credential store, initialized in start().
         self._creds: CredentialStore | None = None
         # VNC session manager, initialized in start().
@@ -114,6 +116,14 @@ class BrowserService(Service):
             logger.warning("workspace service does not implement WorkspaceProvider")
             ws = None
         self._workspace = ws
+
+        # AI sampling capability for browser_extract. Optional — the
+        # tool returns an explicit error when unavailable.
+        ai_chat = resolver.get_capability("ai_chat")
+        # Only require complete_one_shot duck-typed; the AI service
+        # implements AISamplingProvider in interfaces/ai.py.
+        if ai_chat is not None and hasattr(ai_chat, "complete_one_shot"):
+            self._ai_sampling = ai_chat
 
         # Credential store — opens / generates the per-installation
         # Fernet key under <data_dir>/fernet.key (mode 0600).
@@ -194,7 +204,12 @@ class BrowserService(Service):
     # ------------------------------------------------------------------
 
     def get_tools(self, user_ctx: Any | None = None) -> list[ToolDefinition]:
-        return list(READ_ONLY_TOOLS) + list(INTERACTION_TOOLS)
+        tools: list[ToolDefinition] = list(READ_ONLY_TOOLS) + list(INTERACTION_TOOLS)
+        # Only advertise the AI-assisted extract tool when an AI
+        # sampling service is actually wired in.
+        if self._ai_sampling is not None:
+            tools.extend(SMART_TOOLS)
+        return tools
 
     async def execute_tool(
         self, name: str, arguments: dict[str, Any]
@@ -230,6 +245,8 @@ class BrowserService(Service):
                     return await self._tool_select(user_id, arguments)
                 if name == "browser_login":
                     return await self._tool_login(user_id, arguments)
+                if name == "browser_extract":
+                    return await self._tool_extract(user_id, arguments)
             except Exception as exc:
                 logger.exception("browser tool %s failed", name)
                 return f"error: {type(exc).__name__}: {exc}"
@@ -370,6 +387,49 @@ class BrowserService(Service):
         page = await self._get_or_create_page(user_id)
         await page.locator(selector).select_option(value, timeout=_INTERACT_TIMEOUT_MS)
         return f"Selected {value} in {selector}"
+
+    async def _tool_extract(self, user_id: str, args: dict[str, Any]) -> str:
+        if self._ai_sampling is None:
+            return "error: AI sampling service unavailable"
+        instruction = str(args.get("instruction", "")).strip()
+        if not instruction:
+            return "error: instruction required"
+        json_schema = str(args.get("json_schema", "")).strip()
+
+        page = await self._get_or_create_page(user_id)
+        body_text = await page.locator("body").inner_text()
+        body_text = _WHITESPACE_RUN.sub(" ", body_text or "").strip()
+        # Cap input — long pages blow up the model context.
+        if len(body_text) > 30_000:
+            body_text = body_text[:30_000] + " …[truncated]"
+
+        user_message = (
+            f"## Instruction\n{instruction}\n\n"
+            f"## Schema\n{json_schema or '(none — return any sensible JSON shape)'}\n\n"
+            f"## Page text\n{body_text}"
+        )
+
+        try:
+            response = await self._ai_sampling.complete_one_shot(
+                messages=[Message(role=MessageRole.USER, content=user_message)],
+                system_prompt=self._extraction_prompt,
+            )
+        except Exception as exc:
+            return f"error: AI sampling failed: {exc}"
+
+        text = response.message.content if response and response.message else ""
+        if not text:
+            return "error: AI returned no content"
+        # Strip ``` fences if the model added them despite the instruction.
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
 
     async def _tool_login(self, user_id: str, args: dict[str, Any]) -> str:
         if self._creds is None:

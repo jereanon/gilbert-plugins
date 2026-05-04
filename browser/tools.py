@@ -183,6 +183,42 @@ _SELECT_TOOL = ToolDefinition(
 )
 
 
+_EXTRACT_TOOL = ToolDefinition(
+    name="browser_extract",
+    description=(
+        "Extract structured JSON from the current page using a small "
+        "AI sampling call. Provide a free-form ``instruction`` describing "
+        "what to pull out and an optional ``json_schema`` (as a string) "
+        "that the result should match. Returns the JSON the model "
+        "produced, or an error string if it couldn't be parsed."
+    ),
+    parameters=[
+        ToolParameter(
+            name="instruction",
+            type=ToolParameterType.STRING,
+            description=(
+                "Plain-language description of what to extract — e.g. "
+                "'list every product card with name, price, and rating'."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="json_schema",
+            type=ToolParameterType.STRING,
+            description=(
+                "Optional JSON Schema (as a string) the output should "
+                "conform to. The model is told to match the schema; "
+                "validation is best-effort."
+            ),
+            required=False,
+            default="",
+        ),
+    ],
+    required_role="user",
+    parallel_safe=False,
+)
+
+
 _LOGIN_TOOL = ToolDefinition(
     name="browser_login",
     description=(
@@ -224,3 +260,6 @@ INTERACTION_TOOLS: list[ToolDefinition] = [
     _SELECT_TOOL,
     _LOGIN_TOOL,
 ]
+
+# Smart tools — use the AI sampling capability under the hood.
+SMART_TOOLS: list[ToolDefinition] = [_EXTRACT_TOOL]
