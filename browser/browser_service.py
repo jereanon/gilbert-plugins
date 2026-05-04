@@ -17,11 +17,14 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 from gilbert.interfaces.attachments import FileAttachment
+from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
-from gilbert.interfaces.tools import ToolDefinition, ToolResult
+from gilbert.interfaces.tools import ToolDefinition, ToolParameterType, ToolResult
 from gilbert.interfaces.workspace import WorkspaceProvider
 
 from .context_pool import ContextPool
+from .credentials import BrowserCredential, CredentialStore
+from .login_runner import LoginRunner
 from .tools import INTERACTION_TOOLS, READ_ONLY_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -34,9 +37,37 @@ _INTERACT_TIMEOUT_MS = 15_000
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
+_DEFAULT_EXTRACTION_PROMPT = """\
+You are a web data extractor. The user is browsing a page in an
+automated session and needs you to pull structured data out of the
+rendered text.
+
+Return ONE valid JSON object that matches the requested schema. Do not
+include explanations, markdown fences, or any text outside the JSON.
+
+If a requested field cannot be confidently extracted from the page,
+use ``null`` (for nullable fields) or the schema's documented default.
+Never invent or guess data that the page does not contain.\
+"""
+
+_DEFAULT_LOGIN_HEURISTICS_PROMPT = """\
+You are a login-form analyzer. Given a page's HTML, identify CSS
+selectors for the username, password, and submit elements of the
+primary login form on the page.
+
+Return JSON of the form ``{"username_selector": "...",
+"password_selector": "...", "submit_selector": "..."}``. Use ``""``
+(empty string) for any selector you cannot determine confidently.\
+"""
+
+
 class BrowserService(Service):
     slash_namespace = "browser"
     tool_provider_name = "browser"
+
+    # Configurable
+    config_namespace = "browser"
+    config_category = "Browser"
 
     def __init__(self, *, data_dir: Path, storage: Any) -> None:
         self._data_dir = data_dir
@@ -54,11 +85,21 @@ class BrowserService(Service):
         self._page_locks: dict[str, asyncio.Lock] = {}
         # Resolved capabilities, set in start().
         self._workspace: WorkspaceProvider | None = None
+        # Credential store, initialized in start().
+        self._creds: CredentialStore | None = None
+        # Cached config values; refreshed by on_config_changed().
+        self._idle_timeout = 600
+        self._max_users = 8
+        self._vnc_idle_timeout = 900
+        self._vnc_max_per_user = 2
+        self._vnc_max_total = 5
+        self._extraction_prompt = _DEFAULT_EXTRACTION_PROMPT
+        self._login_heuristics_prompt = _DEFAULT_LOGIN_HEURISTICS_PROMPT
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="browser",
-            capabilities=frozenset({"browser", "ai_tools"}),
+            capabilities=frozenset({"browser", "ai_tools", "ws_handlers"}),
             requires=frozenset(),
             optional=frozenset({"workspace", "configuration", "ai_chat"}),
             ai_calls=frozenset(),
@@ -70,6 +111,15 @@ class BrowserService(Service):
             logger.warning("workspace service does not implement WorkspaceProvider")
             ws = None
         self._workspace = ws
+
+        # Credential store — opens / generates the per-installation
+        # Fernet key under <data_dir>/fernet.key (mode 0600).
+        if self._storage is not None:
+            self._creds = CredentialStore(
+                storage=self._storage,
+                key_path=self._data_dir / "fernet.key",
+            )
+            await self._creds.start()
 
         self._pw_cm = async_playwright()
         try:
@@ -155,6 +205,8 @@ class BrowserService(Service):
                     return await self._tool_press(user_id, arguments)
                 if name == "browser_select":
                     return await self._tool_select(user_id, arguments)
+                if name == "browser_login":
+                    return await self._tool_login(user_id, arguments)
             except Exception as exc:
                 logger.exception("browser tool %s failed", name)
                 return f"error: {type(exc).__name__}: {exc}"
@@ -295,6 +347,232 @@ class BrowserService(Service):
         page = await self._get_or_create_page(user_id)
         await page.locator(selector).select_option(value, timeout=_INTERACT_TIMEOUT_MS)
         return f"Selected {value} in {selector}"
+
+    async def _tool_login(self, user_id: str, args: dict[str, Any]) -> str:
+        if self._creds is None:
+            return "error: credential store unavailable"
+        cred_id = str(args.get("credential_id", "")).strip()
+        if not cred_id:
+            return "error: credential_id required"
+        try:
+            cred: BrowserCredential = await self._creds.get(cred_id, user_id)
+        except KeyError:
+            return f"error: no credential with id {cred_id}"
+        except PermissionError:
+            return "error: that credential belongs to another user"
+        page = await self._get_or_create_page(user_id)
+        ok, msg = await LoginRunner(page).run(cred)
+        return msg if ok else f"error: {msg}"
+
+    # ------------------------------------------------------------------
+    # WS RPC handlers (credentials)
+    # ------------------------------------------------------------------
+
+    def get_ws_handlers(self) -> dict[str, Any]:
+        return {
+            "browser.credentials.list": self._ws_credentials_list,
+            "browser.credentials.save": self._ws_credentials_save,
+            "browser.credentials.delete": self._ws_credentials_delete,
+        }
+
+    @staticmethod
+    def _conn_user_id(conn: Any) -> str:
+        try:
+            return getattr(conn, "user_id", "") or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _err(frame: dict[str, Any], msg: str, code: int = 400) -> dict[str, Any]:
+        return {
+            "type": "gilbert.error",
+            "ref": frame.get("id"),
+            "error": msg,
+            "code": code,
+        }
+
+    async def _ws_credentials_list(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._creds is None:
+            return self._err(frame, "credential store unavailable", 503)
+        creds = await self._creds.list_for_user(user_id)
+        return {
+            "type": "browser.credentials.list.result",
+            "ref": frame.get("id"),
+            "credentials": [
+                {
+                    "id": c.id,
+                    "site": c.site,
+                    "label": c.label,
+                    "username": c.username,
+                    "login_url": c.login_url,
+                }
+                for c in creds
+            ],
+        }
+
+    async def _ws_credentials_save(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._creds is None:
+            return self._err(frame, "credential store unavailable", 503)
+        cred_id = str(frame.get("credential_id", "")).strip()
+        if cred_id:
+            # Update — owner check via get().
+            try:
+                existing = await self._creds.get(cred_id, user_id)
+            except KeyError:
+                return self._err(frame, "credential not found", 404)
+            except PermissionError:
+                return self._err(frame, "not your credential", 403)
+            new_password = str(frame.get("password", "")).strip()
+            password = new_password if new_password else existing.password
+        else:
+            password = str(frame.get("password", "")).strip()
+            if not password:
+                return self._err(frame, "password required for new credentials")
+
+        cred = BrowserCredential(
+            id=cred_id,
+            user_id=user_id,
+            site=str(frame.get("site", "")).strip(),
+            label=str(frame.get("label", "")).strip(),
+            username=str(frame.get("username", "")).strip(),
+            password=password,
+            login_url=str(frame.get("login_url", "")).strip(),
+            username_selector=str(frame.get("username_selector", "")).strip(),
+            password_selector=str(frame.get("password_selector", "")).strip(),
+            submit_selector=str(frame.get("submit_selector", "")).strip(),
+        )
+        if not cred.site or not cred.username:
+            return self._err(frame, "site and username are required")
+        saved = await self._creds.save(cred)
+        return {
+            "type": "browser.credentials.save.result",
+            "ref": frame.get("id"),
+            "id": saved.id,
+            "ok": True,
+        }
+
+    async def _ws_credentials_delete(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._creds is None:
+            return self._err(frame, "credential store unavailable", 503)
+        cred_id = str(frame.get("credential_id", "")).strip()
+        if not cred_id:
+            return self._err(frame, "credential_id required")
+        try:
+            await self._creds.delete(cred_id, user_id)
+        except KeyError:
+            # Idempotent — already gone.
+            pass
+        except PermissionError:
+            return self._err(frame, "not your credential", 403)
+        return {
+            "type": "browser.credentials.delete.result",
+            "ref": frame.get("id"),
+            "ok": True,
+        }
+
+    # ------------------------------------------------------------------
+    # Configurable
+    # ------------------------------------------------------------------
+
+    def config_params(self) -> list[ConfigParam]:
+        return [
+            ConfigParam(
+                key="idle_timeout_seconds",
+                type=ToolParameterType.INTEGER,
+                description=(
+                    "Close a user's browser context after this many idle "
+                    "seconds. Default 600 (10 minutes)."
+                ),
+                default=600,
+            ),
+            ConfigParam(
+                key="max_concurrent_users",
+                type=ToolParameterType.INTEGER,
+                description=(
+                    "Hard cap on simultaneous browser contexts (server-wide). "
+                    "Each context uses ~100-150 MB; tune to host RAM."
+                ),
+                default=8,
+            ),
+            ConfigParam(
+                key="vnc_idle_timeout_seconds",
+                type=ToolParameterType.INTEGER,
+                description="Close inactive VNC live-login sessions after this many seconds.",
+                default=900,
+            ),
+            ConfigParam(
+                key="vnc_max_concurrent_per_user",
+                type=ToolParameterType.INTEGER,
+                description="Per-user cap on simultaneous VNC live-login sessions.",
+                default=2,
+            ),
+            ConfigParam(
+                key="vnc_max_concurrent_total",
+                type=ToolParameterType.INTEGER,
+                description="Server-wide cap on simultaneous VNC live-login sessions.",
+                default=5,
+            ),
+            ConfigParam(
+                key="extraction_prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "System prompt used by browser_extract to convert "
+                    "rendered page text into structured JSON."
+                ),
+                default=_DEFAULT_EXTRACTION_PROMPT,
+                multiline=True,
+                ai_prompt=True,
+            ),
+            ConfigParam(
+                key="login_heuristics_prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "System prompt used to detect login-form selectors "
+                    "from HTML when none are configured on the credential."
+                ),
+                default=_DEFAULT_LOGIN_HEURISTICS_PROMPT,
+                multiline=True,
+                ai_prompt=True,
+            ),
+        ]
+
+    async def on_config_changed(self, config: dict[str, Any]) -> None:
+        self._idle_timeout = int(config.get("idle_timeout_seconds", 600) or 600)
+        self._max_users = int(config.get("max_concurrent_users", 8) or 8)
+        self._vnc_idle_timeout = int(
+            config.get("vnc_idle_timeout_seconds", 900) or 900
+        )
+        self._vnc_max_per_user = int(
+            config.get("vnc_max_concurrent_per_user", 2) or 2
+        )
+        self._vnc_max_total = int(
+            config.get("vnc_max_concurrent_total", 5) or 5
+        )
+        self._extraction_prompt = (
+            config.get("extraction_prompt") or _DEFAULT_EXTRACTION_PROMPT
+        )
+        self._login_heuristics_prompt = (
+            config.get("login_heuristics_prompt") or _DEFAULT_LOGIN_HEURISTICS_PROMPT
+        )
+        # Live-tunable: propagate the idle timeout to the running pool
+        # so a config change takes effect without a service restart.
+        if self._pool is not None:
+            self._pool._idle_timeout = self._idle_timeout
 
     @staticmethod
     def _unique_name(out_dir: Path, base: str) -> str:

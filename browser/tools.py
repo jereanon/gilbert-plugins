@@ -183,6 +183,27 @@ _SELECT_TOOL = ToolDefinition(
 )
 
 
+_LOGIN_TOOL = ToolDefinition(
+    name="browser_login",
+    description=(
+        "Log into a site using a credential the user has saved. The "
+        "credential ID comes from the Settings → Browser → Credentials "
+        "panel. Username and password never appear in the tool arguments "
+        "— they're resolved server-side from the encrypted store."
+    ),
+    parameters=[
+        ToolParameter(
+            name="credential_id",
+            type=ToolParameterType.STRING,
+            description="The id of a saved browser credential.",
+            required=True,
+        ),
+    ],
+    required_role="user",
+    parallel_safe=False,
+)
+
+
 # Read-only tools — safe to fan out across users since they only touch
 # their own per-user Page. Within a single user they still serialize on
 # the page lock, but parallel-safe is about cross-tool-call contention.
@@ -201,4 +222,5 @@ INTERACTION_TOOLS: list[ToolDefinition] = [
     _FILL_TOOL,
     _PRESS_TOOL,
     _SELECT_TOOL,
+    _LOGIN_TOOL,
 ]
