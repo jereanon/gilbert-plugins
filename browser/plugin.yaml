@@ -1,0 +1,10 @@
+name: browser
+version: "1.0.0"
+description: "Headless Chrome browser access for AI tools — navigate, click, screenshot, login flows, VNC live login"
+
+provides:
+  - browser
+
+requires: []
+
+depends_on: []

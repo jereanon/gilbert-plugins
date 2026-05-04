@@ -1,0 +1,13 @@
+[project]
+name = "gilbert-plugin-browser"
+version = "1.0.0"
+description = "Headless Chrome browser tools for Gilbert"
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.45",
+    # Fernet for at-rest credential encryption.
+    "cryptography>=42",
+]
+
+[tool.uv]
+package = false
