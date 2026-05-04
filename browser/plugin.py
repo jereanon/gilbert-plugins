@@ -38,22 +38,42 @@ class BrowserPlugin(Plugin):
     def runtime_dependencies(self) -> list[RuntimeDependency]:
         return [
             RuntimeDependency(
-                name="chromium",
+                name="docker (preferred)",
                 description=(
-                    "Headless Chrome binaries + the OS shared libraries "
-                    "they load. Check actually launches a headless "
-                    "browser, so any missing piece (binary, libnss3, "
-                    "libatk, …) surfaces here as one failure."
+                    "Docker daemon, used to run Playwright + Chromium "
+                    "in a container with all OS deps baked in. With "
+                    "Docker the host stays clean — no playwright "
+                    "install-deps / sudo apt-get gymnastics. The "
+                    "browser plugin uses Docker by default when "
+                    "available; falls back to host-native Playwright "
+                    "if not."
+                ),
+                check_cmd="docker info",
+                install_hint=(
+                    "Install Docker Desktop (macOS/Windows) or docker.io "
+                    "(Linux: sudo apt-get install docker.io). Then add "
+                    "your user to the docker group so the daemon is "
+                    "reachable without sudo: "
+                    "'sudo usermod -aG docker $USER' and re-login."
+                ),
+            ),
+            RuntimeDependency(
+                name="chromium (host-native fallback)",
+                description=(
+                    "Only needed when Docker isn't available — the "
+                    "plugin falls back to launching Chromium on the "
+                    "host. Check actually launches a headless browser "
+                    "to surface missing OS shared libs alongside missing "
+                    "binaries."
                 ),
                 check_cmd=f"uv run python -c '{_CHROMIUM_LAUNCH_CHECK_PY}'",
                 install_hint=(
-                    "Install the browser binaries with: "
-                    "'uv run playwright install chromium "
-                    "chromium-headless-shell'. "
-                    "If the launch still fails, install the OS shared "
-                    "libraries Chromium needs using your system's "
-                    "package manager — see "
-                    "https://playwright.dev/python/docs/browsers#install-system-dependencies"
+                    "If you can install Docker, prefer that and ignore "
+                    "this check. Otherwise: 'uv run playwright install "
+                    "chromium chromium-headless-shell' for the "
+                    "binaries, then install Chromium's OS shared libs "
+                    "using your system's package manager (see "
+                    "https://playwright.dev/python/docs/browsers#install-system-dependencies)."
                 ),
                 auto_install_cmd=(
                     "uv run playwright install chromium chromium-headless-shell"

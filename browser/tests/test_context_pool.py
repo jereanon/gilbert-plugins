@@ -90,6 +90,38 @@ async def test_pool_evicts_idle_contexts(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pool_connects_to_remote_when_ws_endpoint_set(tmp_path: Path):
+    """When ws_endpoint is set, the pool calls chromium.connect() instead
+    of chromium.launch()."""
+    contexts = [AsyncMock()]
+    contexts[0].storage_state = AsyncMock()
+    contexts[0].close = AsyncMock()
+    browser = AsyncMock()
+    browser.new_context = AsyncMock(side_effect=contexts)
+    browser.close = AsyncMock()
+    chromium = MagicMock()
+    chromium.launch = AsyncMock()
+    chromium.connect = AsyncMock(return_value=browser)
+    pw = MagicMock()
+    pw.chromium = chromium
+
+    pool = ContextPool(
+        data_dir=tmp_path,
+        playwright=pw,
+        idle_timeout_seconds=60,
+        ws_endpoint="ws://127.0.0.1:9999/",
+    )
+    await pool.start()
+    try:
+        chromium.connect.assert_awaited_with("ws://127.0.0.1:9999/")
+        chromium.launch.assert_not_called()
+        await pool.get_for_user("u1")
+        browser.new_context.assert_awaited()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
 async def test_get_for_user_rejects_empty_user_id(tmp_path: Path):
     pool, _browser, _ = _make_pool(tmp_path, n_contexts=0)
     await pool.start()

@@ -20,6 +20,7 @@ if _pkg_name not in sys.modules:
     # std-plugins/unifi/tests/conftest.py for the reasoning behind
     # NOT passing ``submodule_search_locations``.
     for _mod_name in (
+        "container",
         "context_pool",
         "credentials",
         "login_runner",

@@ -5,6 +5,13 @@ storage state (cookies + localStorage) is persisted under
 ``<data_dir>/users/<user_id>/state.json`` so logins survive plugin
 restarts. Inactive contexts are closed after ``idle_timeout_seconds``
 of no use, and their storage state is flushed on the way out.
+
+The pool can drive either a local ``chromium.launch()`` browser or a
+remote ``chromium.connect(ws_endpoint)`` browser — set ``ws_endpoint``
+in the constructor when running against a Playwright-in-Docker
+container. Storage state file paths are HOST-side either way: the
+remote browser receives storage state as bytes over the WS protocol,
+so no volume mount is needed.
 """
 
 from __future__ import annotations
@@ -31,10 +38,15 @@ class ContextPool:
         data_dir: Path,
         playwright: Any,
         idle_timeout_seconds: int = 600,
+        ws_endpoint: str | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._pw = playwright
         self._idle_timeout = idle_timeout_seconds
+        # When set, the pool connects to a remote browser (Playwright in
+        # Docker via run-server). When None, launches a local headless
+        # Chromium on the host.
+        self._ws_endpoint = ws_endpoint
         self._browser: Any | None = None
         self._entries: dict[str, _Entry] = {}
         self._lock = asyncio.Lock()
@@ -42,7 +54,10 @@ class ContextPool:
         self._stopped = False
 
     async def start(self) -> None:
-        self._browser = await self._pw.chromium.launch(headless=True)
+        if self._ws_endpoint is not None:
+            self._browser = await self._pw.chromium.connect(self._ws_endpoint)
+        else:
+            self._browser = await self._pw.chromium.launch(headless=True)
         self._reaper = asyncio.create_task(self._reap_loop())
 
     async def stop(self) -> None:

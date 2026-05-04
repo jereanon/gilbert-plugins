@@ -23,6 +23,7 @@ from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.tools import ToolDefinition, ToolParameterType, ToolResult
 from gilbert.interfaces.workspace import WorkspaceProvider
 
+from .container import BrowserContainer
 from .context_pool import ContextPool
 from .credentials import BrowserCredential, CredentialStore
 from .login_runner import LoginRunner
@@ -98,8 +99,12 @@ class BrowserService(Service):
         self._vnc_idle_timeout = 900
         self._vnc_max_per_user = 2
         self._vnc_max_total = 5
+        self._mode = "auto"  # "auto" | "docker" | "host"
+        self._docker_image = ""  # blank → derived from playwright version
         self._extraction_prompt = _DEFAULT_EXTRACTION_PROMPT
         self._login_heuristics_prompt = _DEFAULT_LOGIN_HEURISTICS_PROMPT
+        # Browser-in-Docker container (set when mode resolves to docker).
+        self._container: BrowserContainer | None = None
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
@@ -174,26 +179,84 @@ class BrowserService(Service):
         try:
             self._pw = await self._pw_cm.start()
         except Exception:
-            logger.exception(
-                "Playwright failed to start. Did you run "
-                "`uv run playwright install chromium`?"
-            )
+            logger.exception("Failed to start Playwright.")
             self._pw_cm = None
             self._pw = None
             return
+
+        # Resolve browser mode: docker | host.
+        ws_endpoint = await self._maybe_start_container()
+
         self._pool = ContextPool(
             data_dir=self._data_dir,
             playwright=self._pw,
-            idle_timeout_seconds=600,
+            idle_timeout_seconds=self._idle_timeout,
+            ws_endpoint=ws_endpoint,
         )
         try:
             await self._pool.start()
         except Exception:
             logger.exception(
-                "Failed to launch headless Chromium. Did you run "
-                "`uv run playwright install chromium`?"
+                "Failed to %s the browser. Run `./gilbert.sh doctor "
+                "--plugin browser` for troubleshooting.",
+                "connect to" if ws_endpoint else "launch",
             )
             self._pool = None
+            # Tear down the container if we started one — there's no
+            # point keeping it running with no clients.
+            if self._container is not None:
+                await self._container.stop()
+                self._container = None
+
+    async def _maybe_start_container(self) -> str | None:
+        """Resolve browser mode and, if running in Docker, start the
+        container. Returns the WS endpoint to pass to ContextPool, or
+        ``None`` to launch chromium on the host.
+
+        Modes:
+
+        - ``auto`` (default): use Docker when available, fall back to
+          host-native Playwright.
+        - ``docker``: require Docker. Falls back to host on container
+          startup error (with a warning).
+        - ``host``: skip Docker entirely, use host-native Playwright.
+        """
+        mode = self._mode
+        if mode == "host":
+            return None
+        if mode == "auto":
+            if not BrowserContainer.is_available():
+                logger.info(
+                    "Docker unavailable; using host-native Playwright. "
+                    "Install Docker for a self-contained, deps-free browser."
+                )
+                return None
+        elif mode == "docker" and not BrowserContainer.is_available():
+            logger.warning(
+                "Browser mode=docker but Docker isn't available; falling "
+                "back to host. Install Docker or set mode=host."
+            )
+            return None
+
+        kwargs: dict[str, Any] = {}
+        if self._docker_image:
+            kwargs["image"] = self._docker_image
+        self._container = BrowserContainer(**kwargs)
+        try:
+            ws_endpoint = await self._container.start()
+            logger.info(
+                "Browser running in Docker (image=%s, endpoint=%s)",
+                self._container.image,
+                ws_endpoint,
+            )
+            return ws_endpoint
+        except Exception:
+            logger.exception(
+                "Failed to start the browser container; falling back to host"
+            )
+            await self._container.stop()
+            self._container = None
+            return None
 
     async def stop(self) -> None:
         # Close any per-user Page handles before tearing down contexts.
@@ -220,6 +283,12 @@ class BrowserService(Service):
                 logger.exception("playwright stop failed")
             self._pw_cm = None
             self._pw = None
+        if self._container is not None:
+            try:
+                await self._container.stop()
+            except Exception:
+                logger.exception("container stop failed")
+            self._container = None
 
     # ------------------------------------------------------------------
     # ToolProvider
@@ -712,6 +781,31 @@ class BrowserService(Service):
     def config_params(self) -> list[ConfigParam]:
         return [
             ConfigParam(
+                key="mode",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Where to run Chromium: 'auto' (default — prefer "
+                    "Docker, fall back to host-native), 'docker' "
+                    "(require Docker), or 'host' (host-native only). "
+                    "Docker mode bundles all OS deps so the host just "
+                    "needs Docker installed."
+                ),
+                default="auto",
+                choices=("auto", "docker", "host"),
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="docker_image",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Docker image for the browser container. Blank → "
+                    "auto-derived from the installed playwright "
+                    "version (mcr.microsoft.com/playwright:vX.Y.Z-jammy)."
+                ),
+                default="",
+                restart_required=True,
+            ),
+            ConfigParam(
                 key="idle_timeout_seconds",
                 type=ToolParameterType.INTEGER,
                 description=(
@@ -772,6 +866,8 @@ class BrowserService(Service):
         ]
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
+        self._mode = str(config.get("mode") or "auto")
+        self._docker_image = str(config.get("docker_image") or "")
         self._idle_timeout = int(config.get("idle_timeout_seconds", 600) or 600)
         self._max_users = int(config.get("max_concurrent_users", 8) or 8)
         self._vnc_idle_timeout = int(
