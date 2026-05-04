@@ -7,6 +7,7 @@ from gilbert.interfaces.plugin import (
     PluginContext,
     PluginMeta,
     RuntimeDependency,
+    UIPanel,
 )
 
 # Actually launch a headless browser. Catches missing OS shared libs
@@ -96,6 +97,21 @@ class BrowserPlugin(Plugin):
                 description="TCP→WebSocket bridge fronting x11vnc for the in-browser noVNC client",
                 check_cmd="command -v websockify",
                 install_hint="apt-get install websockify (Linux) — only needed for VNC live login",
+            ),
+        ]
+
+    def ui_panels(self) -> list[UIPanel]:
+        return [
+            UIPanel(
+                panel_id="browser.credentials",
+                slot="account.extensions",
+                label="Browser logins",
+                description=(
+                    "Manage saved logins the browser plugin uses to "
+                    "sign you into sites without the agent ever seeing "
+                    "your password."
+                ),
+                required_role="user",
             ),
         ]
 
