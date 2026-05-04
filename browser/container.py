@@ -80,6 +80,46 @@ class BrowserContainer:
         self._ws_endpoint: str | None = None
 
     @classmethod
+    async def prune_stale(cls) -> None:
+        """Remove any leftover ``gilbert.browser=1`` containers.
+
+        Best-effort one-shot cleanup for containers a previous Gilbert
+        run leaked (e.g. a crash between docker run and docker rm).
+        Failures are logged at debug level — pruning is purely a tidy-up,
+        never required for correctness.
+        """
+        try:
+            ls = await asyncio.create_subprocess_exec(
+                "docker",
+                "ps",
+                "-a",
+                "-q",
+                "--filter",
+                "label=gilbert.browser=1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(ls.communicate(), timeout=5)
+        except (TimeoutError, FileNotFoundError, Exception):
+            return
+        ids = [line.strip() for line in stdout.decode().splitlines() if line.strip()]
+        if not ids:
+            return
+        logger.info("Pruning %d stale gilbert.browser container(s)", len(ids))
+        try:
+            rm = await asyncio.create_subprocess_exec(
+                "docker",
+                "rm",
+                "-f",
+                *ids,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(rm.wait(), timeout=10)
+        except Exception:
+            logger.debug("prune docker rm failed", exc_info=True)
+
+    @classmethod
     def is_available(cls) -> bool:
         """True when the ``docker`` CLI exists and the daemon answers.
 
@@ -138,9 +178,17 @@ class BrowserContainer:
             "docker",
             "run",
             "-d",
-            "--rm",
+            # Deliberately NO ``--rm`` — when the container's command
+            # crashes (which is what 'connection refused for the full
+            # readiness timeout' means), --rm wipes the container
+            # before we can read its logs, hiding the actual error.
+            # ``stop()`` does the cleanup manually with docker rm.
             "--name",
             name,
+            # Tag every gilbert-launched container so a startup-time
+            # sweep can prune leftovers from a previous crashed run.
+            "--label",
+            "gilbert.browser=1",
             "-p",
             f"127.0.0.1:{port}:{port}",
             "--init",
@@ -214,25 +262,32 @@ class BrowserContainer:
             return ""
 
     async def stop(self) -> None:
-        """Stop and remove the container. Idempotent."""
+        """Stop and remove the container. Idempotent.
+
+        Two phases: ``docker stop`` (graceful, then SIGKILL after
+        Docker's default 10s) and ``docker rm`` (cleanup, since we
+        skipped ``--rm`` so logs survive a crash).
+        """
         if not self._container_id:
             return
         cid = self._container_id
         self._container_id = None
         self._ws_endpoint = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker",
-                "kill",
-                cid,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=10)
-        except (TimeoutError, FileNotFoundError):
-            logger.warning("docker kill %s timed out / unavailable", cid)
-        except Exception:
-            logger.exception("docker kill %s failed", cid)
+        for verb in ("stop", "rm"):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "docker",
+                    verb,
+                    "-f" if verb == "rm" else "--time=5",
+                    cid,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=15)
+            except (TimeoutError, FileNotFoundError):
+                logger.warning("docker %s %s timed out / unavailable", verb, cid)
+            except Exception:
+                logger.exception("docker %s %s failed", verb, cid)
 
     async def _wait_for_ready(self, port: int, timeout: float = 60.0) -> None:
         """Poll until the in-container Playwright server accepts a WS upgrade.
