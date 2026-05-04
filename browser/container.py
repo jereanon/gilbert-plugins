@@ -192,14 +192,21 @@ class BrowserContainer:
             "-p",
             f"127.0.0.1:{port}:{port}",
             "--init",
-            # The Microsoft Playwright image installs the JS playwright
-            # package globally; Node doesn't search global modules
-            # without NODE_PATH set. Cover both common install
-            # locations (/usr/lib for system packages, /usr/local/lib
-            # for npm-prefix=/usr/local installs) so ``require('playwright')``
-            # resolves regardless of which one the image chose.
+            # Microsoft's Playwright image installs the JS package at
+            # /ms-playwright-agent/node_modules/playwright. Setting the
+            # working directory there makes ``require('playwright')``
+            # walk up and find it. NODE_PATH covers older image layouts
+            # and any /usr/lib or /usr/local/lib npm-global installs.
+            "-w",
+            "/ms-playwright-agent",
             "-e",
-            "NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules",
+            (
+                "NODE_PATH="
+                "/ms-playwright-agent/node_modules:"
+                "/home/pwuser/node_modules:"
+                "/usr/lib/node_modules:"
+                "/usr/local/lib/node_modules"
+            ),
             self._image,
             "node",
             "-e",
