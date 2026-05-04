@@ -26,6 +26,7 @@ from .context_pool import ContextPool
 from .credentials import BrowserCredential, CredentialStore
 from .login_runner import LoginRunner
 from .tools import INTERACTION_TOOLS, READ_ONLY_TOOLS
+from .vnc import VncSessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,8 @@ class BrowserService(Service):
         self._workspace: WorkspaceProvider | None = None
         # Credential store, initialized in start().
         self._creds: CredentialStore | None = None
+        # VNC session manager, initialized in start().
+        self._vnc: VncSessionManager | None = None
         # Cached config values; refreshed by on_config_changed().
         self._idle_timeout = 600
         self._max_users = 8
@@ -120,6 +123,20 @@ class BrowserService(Service):
                 key_path=self._data_dir / "fernet.key",
             )
             await self._creds.start()
+
+        # VNC session manager.
+        self._vnc = VncSessionManager(
+            data_dir=self._data_dir / "vnc",
+            idle_timeout_seconds=self._vnc_idle_timeout,
+            max_per_user=self._vnc_max_per_user,
+            max_total=self._vnc_max_total,
+        )
+        try:
+            (self._data_dir / "vnc").mkdir(parents=True, exist_ok=True)
+            await self._vnc.start()
+        except Exception:
+            logger.exception("VNC session manager failed to start")
+            self._vnc = None
 
         self._pw_cm = async_playwright()
         try:
@@ -155,6 +172,12 @@ class BrowserService(Service):
                 logger.exception("page close failed for %s", user_id)
         self._pages.clear()
         self._page_locks.clear()
+        if self._vnc is not None:
+            try:
+                await self._vnc.stop()
+            except Exception:
+                logger.exception("VNC manager stop failed")
+            self._vnc = None
         if self._pool is not None:
             await self._pool.stop()
             self._pool = None
@@ -373,7 +396,29 @@ class BrowserService(Service):
             "browser.credentials.list": self._ws_credentials_list,
             "browser.credentials.save": self._ws_credentials_save,
             "browser.credentials.delete": self._ws_credentials_delete,
+            "browser.vnc.start": self._ws_vnc_start,
+            "browser.vnc.stop": self._ws_vnc_stop,
+            "browser.vnc.list": self._ws_vnc_list,
         }
+
+    # ------------------------------------------------------------------
+    # VNC accessors used by the web layer
+    # ------------------------------------------------------------------
+
+    def get_vnc_websockify_port(self, session_id: str, user_id: str) -> int | None:
+        """Resolve a session_id + caller user_id to the websockify port.
+
+        The web-layer proxy route calls this to authorize the WS upgrade
+        and find the localhost TCP port to bridge to. Returns ``None``
+        if the session doesn't exist or doesn't belong to ``user_id``.
+        """
+        if self._vnc is None:
+            return None
+        s = self._vnc.get_session(session_id, user_id)
+        if s is None:
+            return None
+        self._vnc.touch(session_id)
+        return s.websockify_port
 
     @staticmethod
     def _conn_user_id(conn: Any) -> str:
@@ -459,6 +504,99 @@ class BrowserService(Service):
             "ref": frame.get("id"),
             "id": saved.id,
             "ok": True,
+        }
+
+    async def _ws_vnc_start(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._vnc is None:
+            return self._err(frame, "VNC manager unavailable", 503)
+        target_url = str(frame.get("target_url", "")).strip()
+        cred_id = str(frame.get("credential_id", "")).strip()
+        if cred_id and not target_url and self._creds is not None:
+            try:
+                cred = await self._creds.get(cred_id, user_id)
+                target_url = cred.login_url
+            except (KeyError, PermissionError):
+                pass
+        try:
+            session = await self._vnc.start_session(user_id, target_url=target_url)
+        except RuntimeError as exc:
+            return self._err(frame, str(exc), 429)
+        return {
+            "type": "browser.vnc.start.result",
+            "ref": frame.get("id"),
+            "ok": True,
+            "session": {
+                "id": session.session_id,
+                "vnc_url": f"/api/browser/vnc/{session.session_id}/ws",
+                "expires_at": "",
+            },
+        }
+
+    async def _ws_vnc_stop(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._vnc is None:
+            return self._err(frame, "VNC manager unavailable", 503)
+        session_id = str(frame.get("session_id", "")).strip()
+        if not session_id:
+            return self._err(frame, "session_id required")
+        owned = self._vnc.get_session(session_id, user_id)
+        if owned is None:
+            # Idempotent — already gone or never owned.
+            return {
+                "type": "browser.vnc.stop.result",
+                "ref": frame.get("id"),
+                "ok": True,
+            }
+        # Best-effort: try to ask the headed Chromium to export
+        # storage_state via Playwright's CDP support before tearing
+        # down. For now we rely on the user-data-dir cookies surviving
+        # in-place; future work can hook this up via puppeteer/CDP to
+        # extract a clean storage_state.json.
+        exported = await self._vnc.stop_session(session_id)
+        if exported is not None and self._pool is not None:
+            try:
+                await self._pool.merge_storage_state(user_id, exported)
+            except Exception:
+                logger.exception("merge_storage_state failed for user %s", user_id)
+        return {
+            "type": "browser.vnc.stop.result",
+            "ref": frame.get("id"),
+            "ok": True,
+        }
+
+    async def _ws_vnc_list(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        user_id = self._conn_user_id(conn)
+        if not user_id:
+            return self._err(frame, "not authenticated", 401)
+        if self._vnc is None:
+            return {
+                "type": "browser.vnc.list.result",
+                "ref": frame.get("id"),
+                "sessions": [],
+            }
+        sessions = self._vnc.list_sessions(user_id)
+        return {
+            "type": "browser.vnc.list.result",
+            "ref": frame.get("id"),
+            "sessions": [
+                {
+                    "id": s.session_id,
+                    "vnc_url": f"/api/browser/vnc/{s.session_id}/ws",
+                    "expires_at": "",
+                }
+                for s in sessions
+            ],
         }
 
     async def _ws_credentials_delete(

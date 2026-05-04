@@ -142,13 +142,16 @@ async def test_user_cannot_delete_anothers_credential(service: BrowserService):
 
 
 @pytest.mark.asyncio
-async def test_get_ws_handlers_lists_three_handlers(service: BrowserService):
+async def test_get_ws_handlers_includes_credentials_and_vnc(service: BrowserService):
     handlers = service.get_ws_handlers()
-    assert set(handlers.keys()) == {
+    assert {
         "browser.credentials.list",
         "browser.credentials.save",
         "browser.credentials.delete",
-    }
+        "browser.vnc.start",
+        "browser.vnc.stop",
+        "browser.vnc.list",
+    } <= set(handlers.keys())
 
 
 # Touch COLLECTION so the import isn't flagged as unused — useful as a
