@@ -50,7 +50,10 @@ class _Session:
     session_id: str
     user_id: str
     display: int
-    websockify_port: int
+    vnc_port: int
+    """TCP port x11vnc is listening on. The web-layer WS proxy
+    connects to this port directly and tunnels VNC RFB protocol
+    frames between the browser's WebSocket and x11vnc."""
     procs: list[Any]
     user_data_dir: Path
     state_export_path: Path
@@ -160,7 +163,6 @@ class VncSessionManager:
             session_id = secrets.token_urlsafe(12)
             display = self._next_display
             self._next_display += 1
-            websockify_port = _free_tcp_port()
             x11vnc_port = _free_tcp_port()
 
             user_data_dir = Path(
@@ -202,13 +204,11 @@ class VncSessionManager:
             )
             procs.append(x11vnc)
 
-            # websockify bridging the TCP VNC server to a websocket port.
-            websockify = await asyncio.create_subprocess_exec(
-                "websockify",
-                str(websockify_port),
-                f"127.0.0.1:{x11vnc_port}",
-            )
-            procs.append(websockify)
+            # No websockify needed — the web-layer WS proxy at
+            # /api/browser/vnc/<session_id>/ws terminates the noVNC
+            # client's WebSocket and pipes raw RFB bytes directly to
+            # x11vnc on x11vnc_port. websockify would just be redundant
+            # framing.
 
             # Headed Chromium pointed at Xvfb DISPLAY.
             # Discover a usable binary at runtime — the Linux package
@@ -252,7 +252,7 @@ class VncSessionManager:
                 session_id=session_id,
                 user_id=user_id,
                 display=display,
-                websockify_port=websockify_port,
+                vnc_port=x11vnc_port,
                 procs=procs,
                 user_data_dir=user_data_dir,
                 state_export_path=state_export,

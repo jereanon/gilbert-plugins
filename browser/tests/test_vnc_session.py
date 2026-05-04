@@ -1,6 +1,6 @@
 """Tests for VncSessionManager — process spawning is faked.
 
-Real Xvfb/x11vnc/websockify aren't available in CI; we patch
+Real Xvfb / x11vnc aren't available in CI; we patch
 ``asyncio.create_subprocess_exec`` and assert on the commands the
 manager would have spawned.
 """
@@ -43,15 +43,17 @@ async def test_start_session_spawns_four_procs(tmp_path: Path, fake_subprocess):
     try:
         assert session.session_id
         assert session.user_id == "u1"
-        assert session.websockify_port > 0
+        assert session.vnc_port > 0
         assert session.display >= 90
 
         # First arg of each command is the executable.
         cmds = [s[0].split("/")[-1] for s in fake_subprocess]
         assert "Xvfb" in cmds
         assert "x11vnc" in cmds
-        assert "websockify" in cmds
         assert "chromium" in cmds
+        # websockify is intentionally NOT spawned anymore — the
+        # web-layer proxy talks raw TCP to x11vnc.
+        assert "websockify" not in cmds
     finally:
         await mgr.stop_session(session.session_id)
 

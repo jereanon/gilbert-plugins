@@ -756,12 +756,13 @@ class BrowserService(Service):
     # VNC accessors used by the web layer
     # ------------------------------------------------------------------
 
-    def get_vnc_websockify_port(self, session_id: str, user_id: str) -> int | None:
-        """Resolve a session_id + caller user_id to the websockify port.
+    def get_vnc_target_port(self, session_id: str, user_id: str) -> int | None:
+        """Resolve a session_id + caller user_id to the x11vnc port.
 
         The web-layer proxy route calls this to authorize the WS upgrade
-        and find the localhost TCP port to bridge to. Returns ``None``
-        if the session doesn't exist or doesn't belong to ``user_id``.
+        and find the localhost TCP port to forward raw VNC RFB bytes
+        to. Returns ``None`` if the session doesn't exist or doesn't
+        belong to ``user_id``.
         """
         if self._vnc is None:
             return None
@@ -769,7 +770,14 @@ class BrowserService(Service):
         if s is None:
             return None
         self._vnc.touch(session_id)
-        return s.websockify_port
+        return s.vnc_port
+
+    # Backwards-compatible alias — the route that calls this hasn't
+    # been updated yet. Will be removed in a follow-up.
+    def get_vnc_websockify_port(
+        self, session_id: str, user_id: str
+    ) -> int | None:
+        return self.get_vnc_target_port(session_id, user_id)
 
     @staticmethod
     def _conn_user_id(conn: Any) -> str:

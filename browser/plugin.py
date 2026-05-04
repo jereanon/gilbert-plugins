@@ -88,15 +88,13 @@ class BrowserPlugin(Plugin):
             ),
             RuntimeDependency(
                 name="x11vnc",
-                description="VNC server attached to the headed Chromium's Xvfb display",
+                description=(
+                    "VNC server attached to the headed Chromium's Xvfb "
+                    "display. Gilbert's WS-to-TCP proxy connects to it "
+                    "directly — no websockify needed."
+                ),
                 check_cmd="command -v x11vnc",
                 install_hint="apt-get install x11vnc (Linux) — only needed for VNC live login",
-            ),
-            RuntimeDependency(
-                name="websockify",
-                description="TCP→WebSocket bridge fronting x11vnc for the in-browser noVNC client",
-                check_cmd="command -v websockify",
-                install_hint="apt-get install websockify (Linux) — only needed for VNC live login",
             ),
         ]
 

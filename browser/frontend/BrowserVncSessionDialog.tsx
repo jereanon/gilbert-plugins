@@ -100,7 +100,7 @@ export function BrowserVncSessionDialog({
             <iframe
               title="VNC session"
               src={`/api/browser/novnc/vnc.html?path=${encodeURIComponent(
-                session.vnc_url,
+                (session.vnc_url || "").replace(/^\//, ""),
               )}&autoconnect=1&resize=scale`}
               className="w-full h-full border-0"
             />
