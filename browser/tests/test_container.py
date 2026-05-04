@@ -36,10 +36,21 @@ def fake_subprocess(monkeypatch):
 
 @pytest.fixture
 def fake_open_connection(monkeypatch):
-    """Make the readiness probe succeed immediately."""
+    """Make the readiness probe succeed immediately.
+
+    The probe sends a WS upgrade request and looks for ``101`` in the
+    response's first line. Fake reader returns a synthetic
+    ``HTTP/1.1 101 Switching Protocols`` line so the probe passes
+    without an actual WS server.
+    """
     async def fake_open(host, port):
         reader = MagicMock()
+        reader.readline = AsyncMock(
+            return_value=b"HTTP/1.1 101 Switching Protocols\r\n"
+        )
         writer = MagicMock()
+        writer.write = MagicMock()
+        writer.drain = AsyncMock()
         writer.close = MagicMock()
         writer.wait_closed = AsyncMock()
         return reader, writer
@@ -48,7 +59,7 @@ def fake_open_connection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_runs_docker_run_with_run_server(
+async def test_start_runs_docker_run_with_launch_server(
     fake_subprocess, fake_open_connection
 ):
     container = BrowserContainer(image="myorg/playwright:test")
@@ -61,10 +72,12 @@ async def test_start_runs_docker_run_with_run_server(
     assert args[0] == "docker"
     assert args[1] == "run"
     assert "myorg/playwright:test" in args
-    # Last segment is the in-container shell command running run-server.
+    # The command runs node with an inline launchServer expression.
+    assert args[-3] == "node"
+    assert args[-2] == "-e"
     cmd = args[-1]
-    assert "run-server" in cmd
-    assert "--port" in cmd
+    assert "launchServer" in cmd
+    assert "wsPath" in cmd
 
     await container.stop()
 
@@ -149,5 +162,5 @@ async def test_readiness_probe_times_out(monkeypatch, fake_subprocess):
     monkeypatch.setattr(asyncio, "open_connection", fake_open)
     # Use a tiny timeout so the test doesn't sit on the default 60s.
     container = BrowserContainer(ready_timeout=0.5)
-    with pytest.raises(RuntimeError, match="did not start within"):
+    with pytest.raises(RuntimeError, match="did not become ready within"):
         await container.start()

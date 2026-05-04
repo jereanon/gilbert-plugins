@@ -13,6 +13,9 @@ from gilbert_plugin_browser.browser_service import BrowserService
 async def test_service_starts_and_stops(tmp_path: Path):
     storage = MagicMock()
     svc = BrowserService(data_dir=tmp_path, storage=storage)
+    # Force host-native mode so the test doesn't try to spin up a real
+    # Docker container on machines that have Docker installed.
+    svc._mode = "host"
 
     fake_pw = MagicMock()
     fake_pw.chromium.launch = AsyncMock()

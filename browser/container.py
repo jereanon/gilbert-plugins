@@ -108,23 +108,31 @@ class BrowserContainer:
     async def start(self) -> str:
         """Start the container and return the Playwright WS endpoint.
 
-        Blocks until the run-server is accepting connections, or raises
+        Blocks until the server is accepting WS connections, or raises
         ``RuntimeError`` after a 60s health-check timeout.
+
+        We run ``chromium.launchServer({port, host, wsPath})`` via an
+        inline Node expression rather than ``playwright run-server``.
+        The CLI's ``run-server`` exposes a Selenium-grid-style endpoint
+        that's incompatible with ``BrowserType.connect(ws://...)``;
+        ``launchServer`` is the API match. ``wsPath: "/"`` gives us a
+        fixed endpoint URL so we don't have to scrape the random
+        token the JS server would otherwise generate.
         """
         port = self._host_port or _free_tcp_port()
         name = f"gilbert-browser-{secrets.token_hex(4)}"
 
-        # ``run-server`` is a Node CLI inside the JS Playwright package.
-        # We let the image's bundled npx invoke it; pinning ``--package``
-        # ensures the in-container Playwright matches the image tag's
-        # version (npx may otherwise re-resolve a newer one).
-        version_str = self._image.rsplit(":", 1)[-1].lstrip("v").split("-")[0]
-        run_server_cmd = (
-            f"npx -y --package=playwright@{version_str} "
-            f"playwright run-server --host 0.0.0.0 --port {port}"
+        # The Microsoft playwright image pins a Playwright version
+        # matching the image tag, so the bundled require('playwright')
+        # is the right one — no npx re-resolution needed.
+        launcher_js = (
+            "const { chromium } = require('playwright'); "
+            f"chromium.launchServer({{ port: {port}, host: '0.0.0.0', wsPath: '/' }}).then("
+            "s => process.stderr.write('READY ' + s.wsEndpoint() + '\\n')"
+            ").catch("
+            "e => { process.stderr.write('FAIL ' + (e && e.stack || e) + '\\n'); process.exit(1); }"
+            ");"
         )
-        if self._extra_args:
-            run_server_cmd += " " + " ".join(self._extra_args)
 
         cmd = [
             "docker",
@@ -137,9 +145,9 @@ class BrowserContainer:
             f"127.0.0.1:{port}:{port}",
             "--init",
             self._image,
-            "/bin/sh",
-            "-c",
-            run_server_cmd,
+            "node",
+            "-e",
+            launcher_js,
         ]
         logger.info("Starting browser container: %s", " ".join(cmd))
         proc = await asyncio.create_subprocess_exec(
@@ -184,28 +192,58 @@ class BrowserContainer:
             logger.exception("docker kill %s failed", cid)
 
     async def _wait_for_ready(self, port: int, timeout: float = 60.0) -> None:
-        """Poll the host port until something accepts a TCP connection.
+        """Poll until the in-container Playwright server accepts a WS upgrade.
 
-        The Microsoft image takes ~5-15 seconds to fetch / extract / boot
-        the JS Playwright server on first run; later launches reuse the
-        cached image and come up in <2 seconds.
+        TCP-open is necessary but not sufficient — the Node process
+        binds the port a moment before launchServer finishes spinning
+        up Chromium and starts answering WS upgrades. We send a real
+        WS handshake and wait for the ``HTTP/1.1 101`` response so the
+        Python client's first ``connect()`` is guaranteed to succeed.
+
+        First-run image pull adds ~5-15s; subsequent starts are <2s.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         last_err: Exception | None = None
+        # Static handshake fields — Sec-WebSocket-Key is a placeholder
+        # since we never use the upgraded socket.
+        ws_request = (
+            b"GET / HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"\r\n"
+        )
         while loop.time() < deadline:
             try:
                 reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            except (OSError, ConnectionError) as exc:
+                last_err = exc
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                writer.write(ws_request)
+                await writer.drain()
+                response_line = await asyncio.wait_for(
+                    reader.readline(), timeout=2.0
+                )
+                if b"101" in response_line:
+                    return
+                last_err = RuntimeError(
+                    f"unexpected response: {response_line.decode(errors='replace').strip()}"
+                )
+            except (OSError, ConnectionError, TimeoutError) as exc:
+                last_err = exc
+            finally:
                 writer.close()
                 try:
                     await writer.wait_closed()
                 except Exception:
                     pass
-                return
-            except (OSError, ConnectionError) as exc:
-                last_err = exc
-                await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
         raise RuntimeError(
-            f"browser container did not start within {timeout:.0f}s "
+            f"browser container did not become ready within {timeout:.0f}s "
             f"(last error: {last_err})"
         )
