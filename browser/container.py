@@ -162,16 +162,41 @@ class BrowserContainer:
         port = self._host_port or _free_tcp_port()
         name = f"gilbert-browser-{secrets.token_hex(4)}"
 
-        # The Microsoft playwright image pins a Playwright version
-        # matching the image tag, so the bundled require('playwright')
-        # is the right one — no npx re-resolution needed.
+        # Find Playwright at runtime instead of hard-coding the install
+        # path. The Microsoft image's location has shifted across
+        # versions (/ms-playwright-agent/, /home/pwuser/,
+        # /usr/lib/node_modules/, …) so we just walk a list of likely
+        # roots and accept the first hit. Falls back to walking up from
+        # cwd if none of the known roots match.
         launcher_js = (
-            "const { chromium } = require('playwright'); "
-            f"chromium.launchServer({{ port: {port}, host: '0.0.0.0', wsPath: '/' }}).then("
-            "s => process.stderr.write('READY ' + s.wsEndpoint() + '\\n')"
-            ").catch("
-            "e => { process.stderr.write('FAIL ' + (e && e.stack || e) + '\\n'); process.exit(1); }"
-            ");"
+            "const fs=require('fs'),path=require('path');"
+            "function find(){"
+            "const roots=["
+            "'/ms-playwright-agent','/home/pwuser','/usr/lib',"
+            "'/usr/local/lib','/playwright','/'"
+            "];"
+            "for(const r of roots){"
+            "const p=path.join(r,'node_modules','playwright');"
+            "if(fs.existsSync(path.join(p,'package.json')))return p;"
+            "}"
+            "let c=process.cwd();"
+            "while(c&&c!=='/'){"
+            "const p=path.join(c,'node_modules','playwright');"
+            "if(fs.existsSync(path.join(p,'package.json')))return p;"
+            "c=path.dirname(c);"
+            "}"
+            "return null;"
+            "}"
+            "const found=find();"
+            "if(!found){"
+            "process.stderr.write('FAIL playwright module not found in container\\n');"
+            "process.exit(2);"
+            "}"
+            "process.stderr.write('FOUND playwright at ' + found + '\\n');"
+            "const {chromium}=require(found);"
+            f"chromium.launchServer({{port:{port},host:'0.0.0.0',wsPath:'/'}})"
+            ".then(s=>process.stderr.write('READY '+s.wsEndpoint()+'\\n'))"
+            ".catch(e=>{process.stderr.write('FAIL '+(e&&e.stack||e)+'\\n');process.exit(1);});"
         )
 
         cmd = [
