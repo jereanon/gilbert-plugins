@@ -144,6 +144,14 @@ class BrowserContainer:
             "-p",
             f"127.0.0.1:{port}:{port}",
             "--init",
+            # The Microsoft Playwright image installs the JS playwright
+            # package globally; Node doesn't search global modules
+            # without NODE_PATH set. Cover both common install
+            # locations (/usr/lib for system packages, /usr/local/lib
+            # for npm-prefix=/usr/local installs) so ``require('playwright')``
+            # resolves regardless of which one the image chose.
+            "-e",
+            "NODE_PATH=/usr/lib/node_modules:/usr/local/lib/node_modules",
             self._image,
             "node",
             "-e",
@@ -165,10 +173,45 @@ class BrowserContainer:
 
         try:
             await self._wait_for_ready(port, timeout=self._ready_timeout)
-        except Exception:
+        except Exception as exc:
+            # The container is up but never started accepting WS — most
+            # commonly a bad ``node -e`` invocation that crashed before
+            # binding the port. Pull the container's logs so the operator
+            # gets the real error in the traceback instead of just
+            # "connection refused".
+            logs = await self._container_logs()
             await self.stop()
+            if logs:
+                raise RuntimeError(
+                    f"{exc}\n\n--- container logs ---\n{logs}"
+                ) from exc
             raise
         return self._ws_endpoint
+
+    async def _container_logs(self) -> str:
+        """Best-effort fetch of the container's stdout+stderr.
+
+        Used by ``start()`` when the readiness probe fails so the
+        operator can see what the in-container process actually said
+        before / instead of binding the port. Returns an empty string
+        on any failure; this is purely diagnostic, never blocking.
+        """
+        if not self._container_id:
+            return ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker",
+                "logs",
+                "--tail",
+                "200",
+                self._container_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            return out.decode(errors="replace").strip()
+        except Exception:
+            return ""
 
     async def stop(self) -> None:
         """Stop and remove the container. Idempotent."""
