@@ -29,6 +29,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
+| [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
@@ -145,6 +146,43 @@ AWS Bedrock chat backend — unlike every other AI plugin this one doesn't speak
 **Config action** — `test_connection`: issues a one-word completion to verify credentials and region.
 
 **Third-party deps**: `boto3` (for AWS SigV4 signing, credential resolution, and the Converse / ConverseStream APIs).
+
+---
+
+### browser
+
+Per-user headless Chrome browser access for AI tools — agents can navigate, scrape text/HTML, click, fill forms, take screenshots that render inline in chat, and (optionally) extract structured JSON via an internal AI sampling call. Includes an encrypted-at-rest credential manager so the agent can log into sites without the password ever touching the AI prompt, plus a VNC live-login flow for sites whose login flow doesn't fit a CSS-selector form fill.
+
+**Provides**: a single `browser` service with `ToolProvider` + `WsHandlerProvider` + `Configurable`. No backend registration — it's a service-only plugin.
+
+**Tools** (visible to the AI under the active profile):
+
+- Read-only: `browser_navigate`, `browser_get_text`, `browser_get_html`, `browser_screenshot` — `browser_screenshot` returns a workspace-reference `FileAttachment(kind="image")` so the PNG renders inline in the agent's reply.
+- Interaction: `browser_click`, `browser_fill`, `browser_press`, `browser_select` — all share the same per-user `Page`, so they serialize automatically.
+- Login: `browser_login(credential_id)` — resolves a saved credential server-side and runs the form-fill heuristic. The username/password never appear in the tool arguments.
+- AI-assisted: `browser_extract(instruction, json_schema?)` — only advertised when the `ai_chat` capability is wired in.
+
+**Credentials UI**: Settings → Browser → Credentials. Add/edit/delete via plain inputs (label, site, login URL, username, password). Passwords are sealed with a Fernet key generated on first start at `.gilbert/plugin-data/browser/fernet.key` (mode 0600). The `list` endpoint never returns passwords; only the per-id resolution path inside `browser_login` decrypts them.
+
+**VNC live login**: Per-row "Log in interactively" button opens a modal that hosts a noVNC iframe pointed at a server-side headed Chromium (under Xvfb + x11vnc + websockify). The user signs in interactively; on close, the headed `storage_state` is merged into their persistent headless context. Requires `xvfb`, `x11vnc`, and `websockify` on PATH (apt: `apt-get install xvfb x11vnc websockify`).
+
+**Configure** (Settings → Browser → Configuration):
+
+| Key | Default | Notes |
+|---|---|---|
+| `idle_timeout_seconds` | 600 | Close per-user contexts after this many idle seconds. |
+| `max_concurrent_users` | 8 | Server-wide cap on simultaneous BrowserContexts. ~100-150 MB each. |
+| `vnc_idle_timeout_seconds` | 900 | Close idle VNC sessions. |
+| `vnc_max_concurrent_per_user` | 2 | Per-user cap on simultaneous VNC sessions. |
+| `vnc_max_concurrent_total` | 5 | Server-wide cap. |
+| `extraction_prompt` | (built-in) | System prompt for `browser_extract`. AI-prompt field. |
+| `login_heuristics_prompt` | (built-in) | System prompt for AI-assisted login form detection. AI-prompt field. |
+
+**Third-party deps**: `playwright>=1.45`, `cryptography>=42`.
+
+**Post-`uv sync` step (required)**: `uv run playwright install chromium` — downloads the Chromium binary into Playwright's per-user cache. On Linux you may also need `uv run playwright install-deps chromium` (sudo) to pull in `libnss3`, `libatk1.0-0`, `libcups2`, etc.
+
+**RBAC**: All `browser_*` tools default to user level. WS RPCs (`browser.credentials.*`, `browser.vnc.*`) are at user level with per-user ownership enforced inside the handlers — a user can only see / mutate their own credentials and VNC sessions. The `/api/browser/vnc/{session_id}/ws` proxy validates session ownership against the calling `UserContext` before bridging to localhost websockify.
 
 ---
 
