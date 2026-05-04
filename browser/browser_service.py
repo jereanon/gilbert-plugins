@@ -86,7 +86,13 @@ class BrowserService(Service):
         # don't race on the same Page (Playwright is not thread-safe at
         # the page level).
         self._page_locks: dict[str, asyncio.Lock] = {}
-        # Resolved capabilities, set in start().
+        # Service resolver kept around so we can lazily look up
+        # optional capabilities (workspace, ai_chat) at tool-call
+        # time. We can't rely on resolving them at start() — Gilbert's
+        # service manager only respects ``requires`` for ordering, so
+        # an optional dependency that starts AFTER browser would be
+        # invisible at start time.
+        self._resolver: ServiceResolver | None = None
         self._workspace: WorkspaceProvider | None = None
         self._ai_sampling: Any | None = None
         # Credential store, initialized in start().
@@ -151,19 +157,16 @@ class BrowserService(Service):
                     return
         self._enabled = True
 
-        ws = resolver.get_capability("workspace")
-        if ws is not None and not isinstance(ws, WorkspaceProvider):
-            logger.warning("workspace service does not implement WorkspaceProvider")
-            ws = None
-        self._workspace = ws
-
-        # AI sampling capability for browser_extract. Optional — the
-        # tool returns an explicit error when unavailable.
-        ai_chat = resolver.get_capability("ai_chat")
-        # Only require complete_one_shot duck-typed; the AI service
-        # implements AISamplingProvider in interfaces/ai.py.
-        if ai_chat is not None and hasattr(ai_chat, "complete_one_shot"):
-            self._ai_sampling = ai_chat
+        # Stash the resolver — we'll lazily look up workspace and
+        # ai_chat on demand (see _resolve_workspace / _resolve_ai_chat).
+        # An eager resolution here would miss any optional service
+        # that starts AFTER browser.
+        self._resolver = resolver
+        # Best-effort eager pass: if those services happen to have
+        # started already, cache them now. Lazy lookup picks up the
+        # late-startup case.
+        self._resolve_workspace()
+        self._resolve_ai_chat()
 
         # Credential store — opens / generates the per-installation
         # Fernet key under <data_dir>/fernet.key (mode 0600).
@@ -209,6 +212,35 @@ class BrowserService(Service):
             )
         # on_demand: nothing happens until execute_tool calls
         # _ensure_pool_ready inline.
+
+    def _resolve_workspace(self) -> WorkspaceProvider | None:
+        """Look up the workspace capability, caching the first hit.
+
+        Called both eagerly during start() (catches workspace-already-
+        running) and lazily during each tool call that needs it
+        (catches workspace-started-after-browser).
+        """
+        if self._workspace is not None:
+            return self._workspace
+        if self._resolver is None:
+            return None
+        ws = self._resolver.get_capability("workspace")
+        if ws is not None and isinstance(ws, WorkspaceProvider):
+            self._workspace = ws
+            return ws
+        return None
+
+    def _resolve_ai_chat(self) -> Any | None:
+        """Look up the ai_chat capability, caching the first hit."""
+        if self._ai_sampling is not None:
+            return self._ai_sampling
+        if self._resolver is None:
+            return None
+        ai_chat = self._resolver.get_capability("ai_chat")
+        if ai_chat is not None and hasattr(ai_chat, "complete_one_shot"):
+            self._ai_sampling = ai_chat
+            return ai_chat
+        return None
 
     async def _ensure_pool_ready_silent(self) -> None:
         """Background-task wrapper that swallows exceptions so an early
@@ -393,8 +425,10 @@ class BrowserService(Service):
     def get_tools(self, user_ctx: Any | None = None) -> list[ToolDefinition]:
         tools: list[ToolDefinition] = list(READ_ONLY_TOOLS) + list(INTERACTION_TOOLS)
         # Only advertise the AI-assisted extract tool when an AI
-        # sampling service is actually wired in.
-        if self._ai_sampling is not None:
+        # sampling service is actually wired in. Lazy-resolve so a
+        # late-starting AI service still gets advertised on the
+        # next AI tool-discovery pass.
+        if self._resolve_ai_chat() is not None:
             tools.extend(SMART_TOOLS)
         return tools
 
@@ -502,7 +536,8 @@ class BrowserService(Service):
     async def _tool_screenshot(
         self, user_id: str, args: dict[str, Any]
     ) -> ToolResult | str:
-        if self._workspace is None:
+        ws = self._resolve_workspace()
+        if ws is None:
             return ToolResult(
                 tool_call_id="",
                 content="error: workspace service unavailable; cannot persist screenshot",
@@ -520,13 +555,13 @@ class BrowserService(Service):
         page = await self._get_or_create_page(user_id)
         png = await page.screenshot(full_page=full_page, type="png")
 
-        out_dir: Path = self._workspace.get_output_dir(user_id, conv_id)
+        out_dir: Path = ws.get_output_dir(user_id, conv_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         name = self._unique_name(out_dir, f"browser-{int(time.time())}.png")
         dest = out_dir / name
         dest.write_bytes(png)
 
-        entity = await self._workspace.register_file(
+        entity = await ws.register_file(
             conversation_id=conv_id,
             user_id=user_id,
             category="output",
@@ -591,7 +626,8 @@ class BrowserService(Service):
         return f"Selected {value} in {selector}"
 
     async def _tool_extract(self, user_id: str, args: dict[str, Any]) -> str:
-        if self._ai_sampling is None:
+        ai = self._resolve_ai_chat()
+        if ai is None:
             return "error: AI sampling service unavailable"
         instruction = str(args.get("instruction", "")).strip()
         if not instruction:
@@ -612,7 +648,7 @@ class BrowserService(Service):
         )
 
         try:
-            response = await self._ai_sampling.complete_one_shot(
+            response = await ai.complete_one_shot(
                 messages=[Message(role=MessageRole.USER, content=user_message)],
                 system_prompt=self._extraction_prompt,
             )
