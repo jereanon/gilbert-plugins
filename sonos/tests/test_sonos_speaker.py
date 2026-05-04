@@ -24,7 +24,6 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from gilbert_plugin_sonos.sonos_speaker import (
     SonosSpeaker,
     _extract_spotify_ref,
@@ -32,7 +31,6 @@ from gilbert_plugin_sonos.sonos_speaker import (
 )
 
 from gilbert.interfaces.speaker import PlayRequest
-
 
 # ── Spotify URI parsing ──────────────────────────────────────────────
 

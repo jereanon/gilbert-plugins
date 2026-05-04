@@ -101,7 +101,7 @@ For **multi-module plugins with intra-plugin relative imports** (like `unifi`, w
 
 Plugins extend Gilbert by implementing these interfaces from the main repo's `gilbert.interfaces.*`:
 
-- **`Plugin`** (`gilbert.interfaces.plugin`) — `metadata()`, `setup(context)`, `teardown()`.
+- **`Plugin`** (`gilbert.interfaces.plugin`) — `metadata()`, `setup(context)`, `teardown()`. Optional hooks: `runtime_dependencies()` (declare non-pip OS deps for `gilbert doctor`) and `ui_panels()` (contribute SPA components into named slots without core knowing about the plugin).
 - **`Service`** (`gilbert.interfaces.service`) — `service_info()`, `start(resolver)`, `stop()`. Implement this when your plugin adds a discoverable service (radio, slack bot, game, etc.).
 - **Backend ABCs** — `AIBackend`, `TTSBackend`, `SpeakerBackend`, `MusicBackend`, `AuthBackend`, `EmailBackend`, `DocumentBackend`, `VisionBackend`, `OCRBackend`, `TunnelBackend`, `WebSearchBackend`, `PresenceBackend`, `DoorbellBackend`, `UserProviderBackend`. Set `backend_name = "…"` on the subclass and the ABC's `__init_subclass__` registers it automatically.
 - **`ToolProvider`** protocol (`gilbert.interfaces.tools`) — `tool_provider_name`, `get_tools()`, `execute_tool()`. Implement alongside `Service` to expose AI tools and slash commands.
@@ -116,6 +116,79 @@ In `setup()`, plugins receive a `PluginContext` with:
 - `context.config` — Initial resolved plugin config (`plugin.yaml` defaults merged with user overrides at load time). **Do not read this for runtime config** — use the `ConfigurationReader` capability instead, which reflects live changes made via the Settings UI.
 - `context.data_dir` — Persistent data directory for the plugin, auto-created under `.gilbert/plugin-data/<plugin-name>/`.
 - `context.storage` — Optional namespaced `StorageBackend` already scoped to `gilbert.plugin.<plugin-name>` — entity collections you create through it are automatically namespaced and won't collide with other plugins or core.
+
+## Plugin frontend (TypeScript / React)
+
+Plugins that ship SPA components keep them inside their own directory:
+
+```
+my-plugin/
+    plugin.py
+    plugin.yaml
+    pyproject.toml
+    frontend/                 # everything UI lives here
+        types.ts              # plugin-local TS types
+        api.ts                # plugin-local hooks (e.g. useFooApi)
+        FooPanel.tsx          # the React component(s)
+        panels.ts             # side-effect: registerPanel('foo.bar', FooPanel)
+        styles.css            # plugin-scoped styles, if any
+```
+
+Core's Vite build picks every `<plugin>/frontend/panels.ts` (and `.tsx`) up automatically via an `import.meta.glob` in `frontend/src/plugins/index.ts` — adding a plugin's UI is purely additive, no edits to core. Plugin TypeScript can import core helpers via the `@/` alias (`@/components/ui/button`, `@/hooks/useWebSocket`, etc.); core never imports from the plugin.
+
+To surface a panel:
+
+1. In Python: declare a `UIPanel` from `Plugin.ui_panels()`:
+
+   ```python
+   from gilbert.interfaces.plugin import UIPanel
+
+   def ui_panels(self) -> list[UIPanel]:
+       return [
+           UIPanel(
+               panel_id="myplugin.thing",
+               slot="account.extensions",   # or "settings.<category>"
+               label="My thing",
+               required_role="user",         # or "admin"
+           ),
+       ]
+   ```
+
+2. In TypeScript: register the React component under the same `panel_id`:
+
+   ```ts
+   // <plugin>/frontend/panels.ts
+   import { registerPanel } from "@/lib/plugin-panels";
+   import { ThingPanel } from "./ThingPanel";
+   registerPanel("myplugin.thing", ThingPanel);
+   ```
+
+The frontend's `<PluginPanelSlot slot="…">` mounts every registered panel for that slot, filtered by `required_role`. Panels with no registered React component are silently skipped (e.g. when the plugin is loaded backend-only without its frontend bundle).
+
+WS RPCs unique to the plugin should live in a per-plugin hook (`<plugin>/frontend/api.ts` exporting `useFooApi`) using the underlying `rpc()` from `useWebSocket`. Don't bolt them onto core's `useWsApi`.
+
+## Runtime dependencies (non-pip)
+
+Plugins that need binaries or system libraries beyond what `pyproject.toml` can install (Chromium, tesseract, ffmpeg, system fonts, …) declare them via `Plugin.runtime_dependencies()`:
+
+```python
+from gilbert.interfaces.plugin import RuntimeDependency
+
+def runtime_dependencies(self) -> list[RuntimeDependency]:
+    return [
+        RuntimeDependency(
+            name="ffmpeg",
+            description="Required for the audio-mux feature.",
+            check_cmd="ffmpeg -version",
+            install_hint="apt: 'sudo apt-get install ffmpeg'; brew: 'brew install ffmpeg'",
+            auto_install_cmd="",   # leave blank for sudo-required installs
+        ),
+    ]
+```
+
+Users run `./gilbert.sh doctor` (or `./gilbert.sh doctor --plugin <name>`) which iterates every plugin's deps, runs each `check_cmd` via `/bin/sh -c`, and prints PASS/FAIL with the install hint on failure. `--install` runs each failing check's `auto_install_cmd` for plugins that opted in (reserve auto-install for unattended-safe paths like Playwright's per-user browser cache; sudo apt-get installs should stay manual).
+
+The check should ideally exercise the dep, not just probe its file path — Playwright's previous `executable_path` probe passed even when launching headless failed because the headless-shell binary or OS libs were missing. Doing a real `chromium.launch(headless=True)` catches both.
 
 ## Configuration
 

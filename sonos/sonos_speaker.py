@@ -389,7 +389,7 @@ class SonosSpeaker(SpeakerBackend):
         client = SonosLocalApiClient(ip, self._http_session)
         try:
             await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT)
-        except (asyncio.TimeoutError, CannotConnect, ConnectionFailed) as exc:
+        except (TimeoutError, CannotConnect, ConnectionFailed) as exc:
             logger.warning(
                 "Failed to connect to Sonos speaker %s (%s): %s",
                 metadata.name,
@@ -472,7 +472,7 @@ class SonosSpeaker(SpeakerBackend):
         # won't be usable until it catches up.
         try:
             await asyncio.wait_for(init_ready.wait(), timeout=_CONNECT_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Sonos speaker '%s' (%s) didn't complete initial setup in "
                 "%.1fs — marking as degraded",
@@ -1495,7 +1495,7 @@ async def _wait_for_group(
     try:
         try:
             await asyncio.wait_for(settled.wait(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             # One final check — an event or poll tick might have
             # landed in the gap between the last callback and the
             # timeout firing.

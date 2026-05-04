@@ -13,7 +13,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from gilbert_plugin_sonos.sonos_music import (
     SonosMusic,
     _extract_auth_code,
@@ -28,7 +27,6 @@ from gilbert.interfaces.music import (
     MusicItemKind,
     MusicSearchUnavailableError,
 )
-
 
 # ── _extract_auth_code ──────────────────────────────────────────────
 

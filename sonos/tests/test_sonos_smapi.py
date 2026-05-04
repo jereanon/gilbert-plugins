@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import pytest
-from httpx import MockTransport, Request, Response, AsyncClient
-
 from gilbert_plugin_sonos.sonos_smapi import (
     SmapiError,
     SonosSmapiClient,
     build_spotify_enqueue,
 )
-
+from httpx import AsyncClient, MockTransport, Request, Response
 
 # ── DIDL builder ─────────────────────────────────────────────────────
 

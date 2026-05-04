@@ -788,7 +788,7 @@ class BedrockAI(AIBackend):
             code,
             message,
         )
-        prefix = f"Bedrock rejected request"
+        prefix = "Bedrock rejected request"
         if status:
             prefix += f" ({status})"
         if code:
