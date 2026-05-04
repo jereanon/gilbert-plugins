@@ -9,13 +9,16 @@ from gilbert.interfaces.plugin import (
     RuntimeDependency,
 )
 
-# Probe Playwright's per-user cache for an installed Chromium binary.
-# We can't shell out to ``playwright`` directly because it isn't on PATH
-# inside the venv from /bin/sh; running it through the python entry
-# point is the portable form.
+# Actually launch a headless Chromium and close it. This catches both
+# missing-binary AND missing-os-deps failures, which a path-only probe
+# would miss — Playwright 1.49+ uses a separate ``chromium-headless-shell``
+# binary for headless mode, so ``executable_path`` (which resolves to the
+# full Chromium) can pass while ``launch(headless=True)`` still fails.
 _CHROMIUM_CHECK_PY = (
     "from playwright.sync_api import sync_playwright; "
-    "sync_playwright().__enter__().chromium.executable_path"
+    "p = sync_playwright().start(); "
+    "b = p.chromium.launch(headless=True); "
+    "b.close(); p.stop()"
 )
 
 
@@ -33,10 +36,29 @@ class BrowserPlugin(Plugin):
         return [
             RuntimeDependency(
                 name="chromium",
-                description="Headless Chrome binary used by Playwright (~170 MB)",
+                description=(
+                    "Headless Chrome binaries used by Playwright "
+                    "(~170 MB full chromium + ~80 MB headless shell). "
+                    "Check actually launches a headless browser to catch "
+                    "missing OS shared libs as well as missing binaries."
+                ),
                 check_cmd=f"uv run python -c '{_CHROMIUM_CHECK_PY}'",
-                install_hint="uv run playwright install chromium",
-                auto_install_cmd="uv run playwright install chromium",
+                # Playwright >= 1.49 uses a separate ``chromium-headless-shell``
+                # binary for headless mode. Install both so launch(headless=True)
+                # works, and full-chromium launches (e.g. the VNC live-login
+                # flow's headed Chromium fallback) keep working too. On Linux,
+                # the operator additionally needs the OS shared libs
+                # (libatk-1.0.so.0, libnss3, libcups2, …) — those go in via
+                # ``playwright install-deps`` which needs sudo, so we don't
+                # auto-install them.
+                install_hint=(
+                    "uv run playwright install chromium chromium-headless-shell"
+                    "  AND  sudo uv run playwright install-deps chromium"
+                    " (Linux only — installs libatk1.0-0, libnss3, libcups2, …)"
+                ),
+                auto_install_cmd=(
+                    "uv run playwright install chromium chromium-headless-shell"
+                ),
             ),
             RuntimeDependency(
                 name="Xvfb",
