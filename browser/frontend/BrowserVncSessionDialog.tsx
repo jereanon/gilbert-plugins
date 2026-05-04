@@ -76,7 +76,7 @@ export function BrowserVncSessionDialog({
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="max-w-3xl">
+      <DialogContent className="flex flex-col sm:max-w-none w-[calc(100vw-3rem)] h-[calc(100vh-3rem)]">
         <DialogHeader>
           <DialogTitle>Live login session</DialogTitle>
         </DialogHeader>
@@ -87,7 +87,7 @@ export function BrowserVncSessionDialog({
           you click <strong>Done</strong>.
         </div>
 
-        <div className="rounded border bg-black/90 aspect-[4/3] overflow-hidden">
+        <div className="rounded border bg-black/90 flex-1 min-h-0 overflow-hidden">
           {busy ? (
             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
               Starting browser session…
