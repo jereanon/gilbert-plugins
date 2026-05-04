@@ -101,10 +101,23 @@ class BrowserService(Service):
         self._vnc_max_total = 5
         self._mode = "auto"  # "auto" | "docker" | "host"
         self._docker_image = ""  # blank → derived from playwright version
+        # Lifecycle: when to bring the headless engine up:
+        # - eager: block service start() until ready (slow start, fast first tool).
+        # - async: kick off startup in the background; first tool call
+        #   awaits the in-flight future if it's still booting.
+        # - on_demand: nothing happens until the first tool call.
+        self._lifecycle_mode = "async"
         self._extraction_prompt = _DEFAULT_EXTRACTION_PROMPT
         self._login_heuristics_prompt = _DEFAULT_LOGIN_HEURISTICS_PROMPT
         # Browser-in-Docker container (set when mode resolves to docker).
         self._container: BrowserContainer | None = None
+        # In-flight pool-startup future for async / on_demand modes —
+        # multiple concurrent tool calls during startup all await the
+        # same future instead of racing to start the container.
+        self._pool_ready_future: asyncio.Future[None] | None = None
+        # Background task created by ``async`` lifecycle so ``stop()``
+        # can cancel it cleanly.
+        self._pool_ready_task: asyncio.Task[None] | None = None
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
@@ -161,7 +174,8 @@ class BrowserService(Service):
             )
             await self._creds.start()
 
-        # VNC session manager.
+        # VNC session manager — cheap to start (no Docker, no Chromium),
+        # always eager.
         self._vnc = VncSessionManager(
             data_dir=self._data_dir / "vnc",
             idle_timeout_seconds=self._vnc_idle_timeout,
@@ -175,6 +189,66 @@ class BrowserService(Service):
             logger.exception("VNC session manager failed to start")
             self._vnc = None
 
+        # Headless engine (Playwright + container + ContextPool) is
+        # gated on the lifecycle mode. The actual work is in
+        # ``_actually_start_pool``; ``_ensure_pool_ready`` dedupes
+        # concurrent callers via a shared future.
+        if self._lifecycle_mode == "eager":
+            try:
+                await self._ensure_pool_ready()
+            except Exception:
+                # Already logged inside _actually_start_pool.
+                pass
+        elif self._lifecycle_mode == "async":
+            # Fire-and-forget — first tool call awaits the future if
+            # the task is still in flight. Catch + log any exception
+            # so an early failure doesn't crash the asyncio task
+            # garbage collector.
+            self._pool_ready_task = asyncio.create_task(
+                self._ensure_pool_ready_silent()
+            )
+        # on_demand: nothing happens until execute_tool calls
+        # _ensure_pool_ready inline.
+
+    async def _ensure_pool_ready_silent(self) -> None:
+        """Background-task wrapper that swallows exceptions so an early
+        failure doesn't surface as 'Task exception was never retrieved'."""
+        try:
+            await self._ensure_pool_ready()
+        except Exception:
+            pass  # already logged by _actually_start_pool
+
+    async def _ensure_pool_ready(self) -> None:
+        """Bring the pool up if it isn't already, dedupe concurrent callers.
+
+        First call creates a future and runs ``_actually_start_pool``;
+        every other concurrent call awaits the same future. After
+        completion, the future is left in place if the pool came up
+        successfully — ``self._pool is not None`` is the cheap fast
+        path on subsequent calls. If startup fails, the future is
+        cleared so the next call retries from scratch (handy when the
+        operator just installed Docker / fixed the network and wants
+        a tool call to retry without restarting the service).
+        """
+        if self._pool is not None:
+            return
+        if self._pool_ready_future is not None:
+            await self._pool_ready_future
+            return
+        loop = asyncio.get_running_loop()
+        self._pool_ready_future = loop.create_future()
+        try:
+            await self._actually_start_pool()
+            self._pool_ready_future.set_result(None)
+        except Exception as exc:
+            self._pool_ready_future.set_exception(exc)
+            self._pool_ready_future = None  # let the next caller retry
+            raise
+
+    async def _actually_start_pool(self) -> None:
+        """Boot Playwright, optionally start the Docker container, and
+        connect the ``ContextPool``. Idempotent only when wrapped by
+        ``_ensure_pool_ready``."""
         self._pw_cm = async_playwright()
         try:
             self._pw = await self._pw_cm.start()
@@ -182,7 +256,7 @@ class BrowserService(Service):
             logger.exception("Failed to start Playwright.")
             self._pw_cm = None
             self._pw = None
-            return
+            raise
 
         # Resolve browser mode: docker | host.
         ws_endpoint = await self._maybe_start_container()
@@ -202,6 +276,7 @@ class BrowserService(Service):
                 "connect to" if ws_endpoint else "launch",
             )
             self._pool = None
+            raise
             # Tear down the container if we started one — there's no
             # point keeping it running with no clients.
             if self._container is not None:
@@ -259,6 +334,17 @@ class BrowserService(Service):
             return None
 
     async def stop(self) -> None:
+        # If async lifecycle kicked off a startup task that's still in
+        # flight, cancel it cleanly before tearing anything else down.
+        if self._pool_ready_task is not None:
+            self._pool_ready_task.cancel()
+            try:
+                await self._pool_ready_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._pool_ready_task = None
+        self._pool_ready_future = None
+
         # Close any per-user Page handles before tearing down contexts.
         for user_id, page in list(self._pages.items()):
             try:
@@ -309,10 +395,25 @@ class BrowserService(Service):
         if not user_id:
             return "error: missing user context (browser tools require a user_id)"
 
+        # Ensure the pool is up. With the eager / async lifecycles
+        # this is usually already true; with on_demand or with
+        # async-still-booting, this awaits the in-flight startup
+        # future. If startup fails, surface the error to the agent
+        # instead of crashing the tool dispatch.
+        if self._pool is None:
+            try:
+                await self._ensure_pool_ready()
+            except Exception as exc:
+                return (
+                    f"error: browser engine failed to start: {exc}. "
+                    "Run `./gilbert.sh doctor --plugin browser` for "
+                    "troubleshooting."
+                )
         if self._pool is None:
             return (
-                "error: browser service not initialized — Chromium may not "
-                "be installed. Run `uv run playwright install chromium`."
+                "error: browser engine unavailable — see logs. "
+                "Run `./gilbert.sh doctor --plugin browser` for "
+                "troubleshooting."
             )
 
         lock = self._page_locks.setdefault(user_id, asyncio.Lock())
@@ -806,6 +907,23 @@ class BrowserService(Service):
                 restart_required=True,
             ),
             ConfigParam(
+                key="lifecycle",
+                type=ToolParameterType.STRING,
+                description=(
+                    "When to bring the headless engine up. 'eager': "
+                    "block service start until ready (slow start, fast "
+                    "first tool call). 'async' (default): kick off "
+                    "startup in the background; first tool call awaits "
+                    "the in-flight task if it's still booting. "
+                    "'on_demand': nothing happens until the first tool "
+                    "call. Use 'on_demand' if you have the plugin "
+                    "enabled but rarely use it — zero idle cost."
+                ),
+                default="async",
+                choices=("eager", "async", "on_demand"),
+                restart_required=True,
+            ),
+            ConfigParam(
                 key="idle_timeout_seconds",
                 type=ToolParameterType.INTEGER,
                 description=(
@@ -868,6 +986,9 @@ class BrowserService(Service):
     async def on_config_changed(self, config: dict[str, Any]) -> None:
         self._mode = str(config.get("mode") or "auto")
         self._docker_image = str(config.get("docker_image") or "")
+        self._lifecycle_mode = str(config.get("lifecycle") or "async")
+        if self._lifecycle_mode not in ("eager", "async", "on_demand"):
+            self._lifecycle_mode = "async"
         self._idle_timeout = int(config.get("idle_timeout_seconds", 600) or 600)
         self._max_users = int(config.get("max_concurrent_users", 8) or 8)
         self._vnc_idle_timeout = int(
