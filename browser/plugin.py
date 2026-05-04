@@ -113,6 +113,17 @@ class BrowserPlugin(Plugin):
                 ),
                 required_role="user",
             ),
+            # Invisible always-mounted host for the VNC modal so the
+            # 'browser.vnc' agent-action handler can pop it from any
+            # page. Renders nothing visible; just listens for the
+            # custom event the action handler dispatches.
+            UIPanel(
+                panel_id="browser.vnc-mounter",
+                slot="app.background",
+                label="",
+                description="",
+                required_role="user",
+            ),
         ]
 
     async def setup(self, context: PluginContext) -> None:

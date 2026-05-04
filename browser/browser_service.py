@@ -41,7 +41,19 @@ _WHITESPACE_RUN = re.compile(r"\s+")
 
 
 _DEFAULT_AGENT_PROMPT_CONTRIBUTION = """\
-BROWSER ACCESS — when you use the browser plugin and a site blocks you (Cloudflare challenge, 403, captcha, 'unusual traffic' interstitial, sites that detect headless Chromium), the answer is the VNC live-login flow. Call ``request_user_input`` and ask the user to: (1) open their Account page (avatar menu → Account settings, or visit /account); (2) find the 'Browser logins' panel; (3) click 'Start interactive session'; (4) paste the URL of the blocked site and click Open. A real Chromium window appears over noVNC — they complete the challenge / sign in there. When they close the window their session cookies merge into your persistent context. After they confirm, retry the original navigation — the browser plugin's per-user BrowserContext now has the cookies and the site no longer trips its bot defenses on you. (If the user has already saved a credential for that site, the per-row 'Log in interactively' button does the same thing.)\
+BROWSER ACCESS — when you use the browser plugin and a site blocks you (Cloudflare challenge, 403, captcha, 'unusual traffic' interstitial, sites that detect headless Chromium), the answer is the VNC live-login flow. Call ``request_user_input`` with an ``actions`` list containing a single button the user can click directly in the chat:
+
+    request_user_input(
+      question="Site X is blocking automated access. Click 'Open VNC' below, complete the challenge, then close the window and tell me 'done'.",
+      actions=[{
+        "id": "vnc-1",
+        "kind": "browser.vnc",
+        "label": "Open VNC for <site>",
+        "payload": {"url": "https://<site>"}
+      }]
+    )
+
+Clicking the button opens a real Chromium window over noVNC pointed at the URL. When the user closes the window their session cookies merge into your persistent context — retry the original navigation and the site no longer trips its bot defenses on you. The action mechanism saves the user from manually navigating to Account → Browser logins themselves.\
 """
 
 
