@@ -40,6 +40,11 @@ _INTERACT_TIMEOUT_MS = 15_000
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 
+_DEFAULT_AGENT_PROMPT_CONTRIBUTION = """\
+BROWSER ACCESS — when you use the browser plugin and a site blocks you (Cloudflare challenge, 403, captcha, 'unusual traffic' interstitial, sites that detect headless Chromium), the answer is the VNC live-login flow. Call ``request_user_input`` and ask the user to open Settings → Browser → Credentials → 'Log in interactively' for that site. They get a real browser window over noVNC, complete the challenge themselves, and on close their session cookies merge into your persistent context. After they confirm, retry the original navigation — the browser plugin's per-user BrowserContext now has the cookies and the site no longer trips its bot defenses on you.\
+"""
+
+
 _DEFAULT_EXTRACTION_PROMPT = """\
 You are a web data extractor. The user is browsing a page in an
 automated session and needs you to pull structured data out of the
@@ -114,6 +119,9 @@ class BrowserService(Service):
         # - on_demand: nothing happens until the first tool call.
         self._lifecycle_mode = "async"
         self._extraction_prompt = _DEFAULT_EXTRACTION_PROMPT
+        # Per-fragment state for the agent system prompt contribution.
+        self._agent_prompt_contribution = _DEFAULT_AGENT_PROMPT_CONTRIBUTION
+        self._agent_prompt_contribution_enabled = True
         self._login_heuristics_prompt = _DEFAULT_LOGIN_HEURISTICS_PROMPT
         # Browser-in-Docker container (set when mode resolves to docker).
         self._container: BrowserContainer | None = None
@@ -128,7 +136,14 @@ class BrowserService(Service):
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="browser",
-            capabilities=frozenset({"browser", "ai_tools", "ws_handlers"}),
+            capabilities=frozenset(
+                {
+                    "browser",
+                    "ai_tools",
+                    "ws_handlers",
+                    "system_prompt_contributor",
+                }
+            ),
             requires=frozenset(),
             optional=frozenset({"workspace", "configuration", "ai_chat"}),
             ai_calls=frozenset(),
@@ -431,6 +446,32 @@ class BrowserService(Service):
         if self._resolve_ai_chat() is not None:
             tools.extend(SMART_TOOLS)
         return tools
+
+    # ------------------------------------------------------------------
+    # SystemPromptContributor
+    # ------------------------------------------------------------------
+
+    def get_prompt_fragments(self) -> list[Any]:
+        """Tell the autonomous-agent system prompt how to recover from
+        bot blocks by directing the user to the VNC live-login flow.
+        Body and enabled state are both ConfigParams above so operators
+        can rephrase or disable without touching source."""
+        from gilbert.interfaces.prompts import PromptFragment
+
+        return [
+            PromptFragment(
+                fragment_id="browser.agent.bot-blocks",
+                target="agent.system_prompt",
+                label="Browser bot-block recovery via VNC",
+                description=(
+                    "Tells the agent how to ask the user to log in "
+                    "interactively when a site's anti-bot defenses "
+                    "block headless Chromium."
+                ),
+                body=self._agent_prompt_contribution,
+                enabled=self._agent_prompt_contribution_enabled,
+            ),
+        ]
 
     async def execute_tool(
         self, name: str, arguments: dict[str, Any]
@@ -1027,6 +1068,31 @@ class BrowserService(Service):
                 multiline=True,
                 ai_prompt=True,
             ),
+            ConfigParam(
+                key="agent_prompt_contribution_enabled",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "When enabled, this plugin appends a paragraph to "
+                    "the autonomous-agent system prompt explaining how "
+                    "to recover from headless-browser bot blocks via the "
+                    "VNC live-login flow. Disable if you don't want the "
+                    "agent to suggest VNC fallback."
+                ),
+                default=True,
+            ),
+            ConfigParam(
+                key="agent_prompt_contribution",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Paragraph appended to the autonomous-agent system "
+                    "prompt when the toggle above is enabled. Edit to "
+                    "rephrase how the agent should handle bot-blocked "
+                    "sites."
+                ),
+                default=_DEFAULT_AGENT_PROMPT_CONTRIBUTION,
+                multiline=True,
+                ai_prompt=True,
+            ),
         ]
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
@@ -1051,6 +1117,13 @@ class BrowserService(Service):
         )
         self._login_heuristics_prompt = (
             config.get("login_heuristics_prompt") or _DEFAULT_LOGIN_HEURISTICS_PROMPT
+        )
+        self._agent_prompt_contribution_enabled = bool(
+            config.get("agent_prompt_contribution_enabled", True)
+        )
+        self._agent_prompt_contribution = (
+            config.get("agent_prompt_contribution")
+            or _DEFAULT_AGENT_PROMPT_CONTRIBUTION
         )
         # Live-tunable: propagate the idle timeout to the running pool
         # so a config change takes effect without a service restart.
