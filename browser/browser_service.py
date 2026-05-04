@@ -108,9 +108,31 @@ class BrowserService(Service):
             requires=frozenset(),
             optional=frozenset({"workspace", "configuration", "ai_chat"}),
             ai_calls=frozenset(),
+            toggleable=True,
+            toggle_description=(
+                "Browser plugin — gives the AI a headless Chrome it can "
+                "drive (navigate, click, screenshot, login). Holds a "
+                "Chromium process per active user, so leave off if you "
+                "don't need it."
+            ),
         )
 
     async def start(self, resolver: ServiceResolver) -> None:
+        # Toggleable service — only start if explicitly enabled in
+        # Settings → Services. Off by default because we hold a
+        # Chromium process per active user.
+        config_svc = resolver.get_capability("configuration")
+        if config_svc is not None:
+            from gilbert.interfaces.configuration import ConfigurationReader
+
+            if isinstance(config_svc, ConfigurationReader):
+                section = config_svc.get_section_safe(self.config_namespace)
+                if not section.get("enabled", False):
+                    logger.info("Browser service disabled (toggle off)")
+                    self._enabled = False
+                    return
+        self._enabled = True
+
         ws = resolver.get_capability("workspace")
         if ws is not None and not isinstance(ws, WorkspaceProvider):
             logger.warning("workspace service does not implement WorkspaceProvider")
