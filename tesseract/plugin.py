@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from gilbert.interfaces.plugin import Plugin, PluginContext, PluginMeta
+from gilbert.interfaces.plugin import (
+    Plugin,
+    PluginContext,
+    PluginMeta,
+    RuntimeDependency,
+)
 
 
 class TesseractPlugin(Plugin):
@@ -16,6 +21,24 @@ class TesseractPlugin(Plugin):
             provides=["tesseract_ocr"],
             requires=[],
         )
+
+    def runtime_dependencies(self) -> list[RuntimeDependency]:
+        return [
+            RuntimeDependency(
+                name="tesseract-ocr binary",
+                description=(
+                    "Native tesseract binary that pytesseract shells "
+                    "out to. Without it OCR calls fail at first use."
+                ),
+                check_cmd="tesseract --version",
+                install_hint=(
+                    "Linux: 'sudo apt-get install tesseract-ocr' "
+                    "(Debian/Ubuntu) or 'sudo dnf install tesseract' "
+                    "(Fedora). macOS: 'brew install tesseract'. "
+                    "Windows: see https://github.com/UB-Mannheim/tesseract/wiki"
+                ),
+            ),
+        ]
 
     async def setup(self, context: PluginContext) -> None:
         # Importing the module triggers OCRBackend.__init_subclass__,
