@@ -93,7 +93,9 @@ async def test_start_failure_raises_and_clears_state(
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
-    container = BrowserContainer()
+    # Pin a manual image tag so _ensure_image_built skips the build
+    # path — the test exercises 'docker run failed', not the build.
+    container = BrowserContainer(image="myorg/playwright:test")
     with pytest.raises(RuntimeError, match="docker run failed"):
         await container.start()
     assert container.ws_endpoint is None
@@ -113,8 +115,84 @@ async def test_image_default_is_pinned_to_playwright_version(
     fake_subprocess, fake_open_connection
 ):
     container = BrowserContainer()
-    assert container.image.startswith("mcr.microsoft.com/playwright:v")
-    assert container.image.endswith("-jammy")
+    # Default is the gilbert-built image, tagged with the installed
+    # playwright version. Microsoft's base image is the FROM in the
+    # Dockerfile but isn't what containers run as.
+    assert container.image.startswith("gilbert-browser:v")
+    assert container._pw_version
+
+
+@pytest.mark.asyncio
+async def test_image_build_runs_when_not_cached(monkeypatch, fake_open_connection, tmp_path):
+    """``docker image inspect`` non-zero → build runs before docker run."""
+    sequence: list[str] = []
+
+    async def fake_create(*args, **kwargs):
+        cmd = " ".join(str(a) for a in args)
+        sequence.append(cmd)
+        proc = MagicMock()
+        # First call is ``docker image inspect`` — make it fail so the
+        # build path runs. Build call is communicate(); make that
+        # succeed. Subsequent docker run / kill use returncode=0.
+        if "image inspect" in cmd:
+            proc.wait = AsyncMock(return_value=1)
+            proc.returncode = 1
+        else:
+            proc.communicate = AsyncMock(return_value=(b"abc123\n", b""))
+            proc.wait = AsyncMock(return_value=0)
+            proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    # Provide a fake build context so _ensure_image_built doesn't
+    # bail on missing Dockerfile dir.
+    ctx = tmp_path / "docker"
+    ctx.mkdir()
+    (ctx / "Dockerfile").write_text("FROM scratch\n")
+
+    container = BrowserContainer(build_context=ctx)
+    await container.start()
+    try:
+        # Build ran before docker run.
+        assert any("image inspect" in c for c in sequence)
+        assert any("docker build" in c for c in sequence)
+        assert any("docker run" in c for c in sequence)
+        # Order: inspect → build → run.
+        ins = next(i for i, c in enumerate(sequence) if "image inspect" in c)
+        bld = next(i for i, c in enumerate(sequence) if "docker build" in c)
+        run = next(i for i, c in enumerate(sequence) if "docker run" in c)
+        assert ins < bld < run
+    finally:
+        await container.stop()
+
+
+@pytest.mark.asyncio
+async def test_image_build_skipped_when_cached(monkeypatch, fake_open_connection):
+    """``docker image inspect`` exit-0 → build does NOT run."""
+    sequence: list[str] = []
+
+    async def fake_create(*args, **kwargs):
+        cmd = " ".join(str(a) for a in args)
+        sequence.append(cmd)
+        proc = MagicMock()
+        if "image inspect" in cmd:
+            proc.wait = AsyncMock(return_value=0)
+            proc.returncode = 0
+        else:
+            proc.communicate = AsyncMock(return_value=(b"abc123\n", b""))
+            proc.wait = AsyncMock(return_value=0)
+            proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    container = BrowserContainer()
+    await container.start()
+    try:
+        assert any("image inspect" in c for c in sequence)
+        assert not any("docker build" in c for c in sequence)
+    finally:
+        await container.stop()
 
 
 def test_is_available_false_when_docker_missing(monkeypatch):

@@ -36,6 +36,7 @@ import socket
 import subprocess
 from contextlib import closing
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +70,28 @@ class BrowserContainer:
         host_port: int = 0,
         run_server_args: tuple[str, ...] = (),
         ready_timeout: float = 60.0,
+        build_context: Path | None = None,
     ) -> None:
+        # ``image`` blank → use the local Gilbert-built image
+        # ``gilbert-browser:v<X.Y.Z>`` and build it from the bundled
+        # Dockerfile if it isn't cached yet. The Microsoft base image
+        # ships Node + browsers but NOT the JS Playwright package, so
+        # we add a single ``RUN npm install playwright@<X.Y.Z>`` layer
+        # on top — built once, reused forever. Override ``image`` only
+        # if you've manually built one with a different tag.
+        version = _detect_playwright_version()
+        self._pw_version = version
         if image is None:
-            image = f"mcr.microsoft.com/playwright:v{_detect_playwright_version()}-jammy"
+            image = f"gilbert-browser:v{version}"
         self._image = image
         self._host_port = host_port  # 0 → auto-allocate
         self._extra_args = run_server_args
         self._ready_timeout = ready_timeout
         self._container_id: str | None = None
         self._ws_endpoint: str | None = None
+        # Path to the bundled Dockerfile dir; defaults to the
+        # plugin-local ``docker/`` folder. Tests can override.
+        self._build_context = build_context or (Path(__file__).parent / "docker")
 
     @classmethod
     async def prune_stale(cls) -> None:
@@ -145,6 +159,64 @@ class BrowserContainer:
     def image(self) -> str:
         return self._image
 
+    async def _ensure_image_built(self) -> None:
+        """Build ``gilbert-browser:v<PW_VERSION>`` if it isn't cached.
+
+        The Microsoft base image lacks the JS Playwright package; our
+        bundled Dockerfile adds a single ``RUN npm install`` layer on
+        top. Build is one-time per host per Playwright version.
+        """
+        # Skip when caller pinned an image that doesn't match our
+        # auto-built tag — they're using their own image, on them.
+        expected_tag = f"gilbert-browser:v{self._pw_version}"
+        if self._image != expected_tag:
+            return
+        try:
+            check = await asyncio.create_subprocess_exec(
+                "docker",
+                "image",
+                "inspect",
+                self._image,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            rc = await asyncio.wait_for(check.wait(), timeout=10)
+        except (TimeoutError, FileNotFoundError, Exception):
+            rc = 1
+        if rc == 0:
+            return  # image already cached locally
+
+        if not self._build_context.is_dir():
+            raise RuntimeError(
+                f"browser plugin Dockerfile dir missing: {self._build_context}"
+            )
+        logger.info(
+            "Building %s from %s (one-time, ~30-60s)",
+            self._image,
+            self._build_context,
+        )
+        build = await asyncio.create_subprocess_exec(
+            "docker",
+            "build",
+            "-t",
+            self._image,
+            "--build-arg",
+            f"PW_VERSION={self._pw_version}",
+            str(self._build_context),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(build.communicate(), timeout=600)
+        except asyncio.TimeoutError:
+            build.kill()
+            raise RuntimeError("docker build timed out after 10 minutes") from None
+        if build.returncode != 0:
+            tail = stdout.decode(errors="replace").splitlines()[-40:]
+            raise RuntimeError(
+                "docker build failed:\n" + "\n".join(tail)
+            )
+
     async def start(self) -> str:
         """Start the container and return the Playwright WS endpoint.
 
@@ -159,44 +231,21 @@ class BrowserContainer:
         fixed endpoint URL so we don't have to scrape the random
         token the JS server would otherwise generate.
         """
+        await self._ensure_image_built()
+
         port = self._host_port or _free_tcp_port()
         name = f"gilbert-browser-{secrets.token_hex(4)}"
 
-        # Find Playwright at runtime instead of hard-coding the install
-        # path. The Microsoft image's location has shifted across
-        # versions (/ms-playwright-agent/, /home/pwuser/,
-        # /usr/lib/node_modules/, …) so we just walk a list of likely
-        # roots and accept the first hit. Falls back to walking up from
-        # cwd if none of the known roots match.
+        # The Dockerfile's WORKDIR=/app has playwright installed
+        # locally, so a plain ``require('playwright')`` resolves from
+        # there. No NODE_PATH or runtime discovery needed.
         launcher_js = (
-            "const fs=require('fs'),path=require('path');"
-            "function find(){"
-            "const roots=["
-            "'/ms-playwright-agent','/home/pwuser','/usr/lib',"
-            "'/usr/local/lib','/playwright','/'"
-            "];"
-            "for(const r of roots){"
-            "const p=path.join(r,'node_modules','playwright');"
-            "if(fs.existsSync(path.join(p,'package.json')))return p;"
-            "}"
-            "let c=process.cwd();"
-            "while(c&&c!=='/'){"
-            "const p=path.join(c,'node_modules','playwright');"
-            "if(fs.existsSync(path.join(p,'package.json')))return p;"
-            "c=path.dirname(c);"
-            "}"
-            "return null;"
-            "}"
-            "const found=find();"
-            "if(!found){"
-            "process.stderr.write('FAIL playwright module not found in container\\n');"
-            "process.exit(2);"
-            "}"
-            "process.stderr.write('FOUND playwright at ' + found + '\\n');"
-            "const {chromium}=require(found);"
-            f"chromium.launchServer({{port:{port},host:'0.0.0.0',wsPath:'/'}})"
-            ".then(s=>process.stderr.write('READY '+s.wsEndpoint()+'\\n'))"
-            ".catch(e=>{process.stderr.write('FAIL '+(e&&e.stack||e)+'\\n');process.exit(1);});"
+            "const { chromium } = require('playwright'); "
+            f"chromium.launchServer({{ port: {port}, host: '0.0.0.0', wsPath: '/' }}).then("
+            "s => process.stderr.write('READY ' + s.wsEndpoint() + '\\n')"
+            ").catch("
+            "e => { process.stderr.write('FAIL ' + (e && e.stack || e) + '\\n'); process.exit(1); }"
+            ");"
         )
 
         cmd = [
@@ -217,21 +266,6 @@ class BrowserContainer:
             "-p",
             f"127.0.0.1:{port}:{port}",
             "--init",
-            # Microsoft's Playwright image installs the JS package at
-            # /ms-playwright-agent/node_modules/playwright. Setting the
-            # working directory there makes ``require('playwright')``
-            # walk up and find it. NODE_PATH covers older image layouts
-            # and any /usr/lib or /usr/local/lib npm-global installs.
-            "-w",
-            "/ms-playwright-agent",
-            "-e",
-            (
-                "NODE_PATH="
-                "/ms-playwright-agent/node_modules:"
-                "/home/pwuser/node_modules:"
-                "/usr/lib/node_modules:"
-                "/usr/local/lib/node_modules"
-            ),
             self._image,
             "node",
             "-e",
