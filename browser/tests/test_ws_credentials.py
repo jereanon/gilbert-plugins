@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
 from gilbert_plugin_browser.browser_service import BrowserService
 from gilbert_plugin_browser.credentials import (
     COLLECTION,

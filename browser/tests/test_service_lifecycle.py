@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from gilbert_plugin_browser.browser_service import BrowserService
 
 

@@ -10,10 +10,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from gilbert_plugin_browser.browser_service import BrowserService
 
 from gilbert.interfaces.attachments import FileAttachment
 from gilbert.interfaces.tools import ToolResult
-from gilbert_plugin_browser.browser_service import BrowserService
 
 
 def _service_with_page(tmp_path: Path) -> tuple[BrowserService, AsyncMock]:

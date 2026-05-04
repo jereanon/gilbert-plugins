@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from gilbert.interfaces.tools import ToolDefinition, ToolParameter, ToolParameterType
 
-
 _NAVIGATE_TOOL = ToolDefinition(
     name="browser_navigate",
     description=(

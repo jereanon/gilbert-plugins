@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
-from gilbert.interfaces.storage import FilterOp
 from gilbert_plugin_browser.credentials import (
     COLLECTION,
     BrowserCredential,
     CredentialStore,
 )
+
+from gilbert.interfaces.storage import FilterOp
 
 
 class FakeStorage:

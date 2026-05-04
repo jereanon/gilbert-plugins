@@ -5,7 +5,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from gilbert_plugin_browser.credentials import BrowserCredential
 from gilbert_plugin_browser.login_runner import LoginRunner
 

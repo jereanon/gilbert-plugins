@@ -229,7 +229,7 @@ class VncSessionManager:
         for proc in reversed(session.procs):
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
-            except (asyncio.TimeoutError, Exception):
+            except (TimeoutError, Exception):
                 try:
                     proc.kill()
                 except Exception:
