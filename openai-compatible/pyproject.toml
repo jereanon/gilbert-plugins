@@ -1,0 +1,14 @@
+[project]
+name = "gilbert-plugin-openai-compatible"
+version = "1.0.0"
+description = "Vendor-neutral OpenAI-Chat-Completions AI backend for Gilbert"
+requires-python = ">=3.12"
+# No third-party deps — the backend speaks the OpenAI Chat Completions
+# wire format directly via ``httpx`` (already a core Gilbert dep).
+# That way the plugin works against Groq, Together, Fireworks,
+# OpenRouter, vLLM, LM Studio, Ollama, etc. without pulling in the
+# vendor ``openai`` SDK.
+dependencies = []
+
+[tool.uv]
+package = false

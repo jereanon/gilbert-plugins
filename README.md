@@ -41,6 +41,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
+| [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
@@ -441,6 +442,31 @@ OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.op
 **Attachments.** Image attachments are rendered as `image_url` content parts with `data:<mime>;base64,…` URLs, which the vision-capable models (`gpt-4o`, `gpt-4-turbo`) understand natively. Document (PDF) attachments become text stubs pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`) — Chat Completions doesn't accept PDFs directly. Text attachments are inlined as `## <name>\n\n<body>`.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### openai-compatible
+
+Vendor-neutral Chat Completions backend for endpoints that don't have a dedicated Gilbert plugin yet: self-hosted vLLM or LM Studio, corporate OpenAI proxies with custom auth, managed providers that ship an OpenAI-compat endpoint but aren't covered by `groq` / `ollama` / `openrouter` / `xai`. For the providers that *are* covered, prefer those — they ship curated model catalogs and provider-specific defaults. This plugin's job is the long tail.
+
+**Backend registered** — `AIBackend.backend_name = "openai_compatible"`: tool-use capable (when the endpoint supports it), streaming (when the endpoint supports it), image-input capable on vision-aware models, per-call model override.
+
+**Configure** (Settings → Intelligence → AI, with the `openai_compatible` backend selected)
+- `enabled` — Initialize this backend at startup (default `true`).
+- `base_url` *(required, no default)* — Base URL of the endpoint. Examples: `http://vllm.internal/v1`, `http://localhost:1234/v1` (LM Studio), `https://corp-gateway.example/openai/v1`. Init fails with a clear message if blank — the plugin has no meaningful default.
+- `api_key` *(sensitive, optional)* — Bearer token sent as `Authorization: Bearer <key>`. Leave blank for local proxies that don't require auth — the header is omitted entirely.
+- `model` — Default model ID. **Free-form** — type whatever the endpoint supports. There is no dropdown because there is no shared catalog. Use the "Refresh models" action below to populate one from the endpoint.
+- `max_tokens` — Per-response cap (default `4096` — conservative for local models with small context windows). Sent as plain `max_tokens`.
+- `temperature` — Sampling temperature (default `0.7`). Always sent — no o-series special casing.
+- `request_headers` *(multiline)* — Extra headers to merge into every request, one per line as `key: value`. Useful for proxies with bespoke auth (`x-api-key`, workspace headers, non-standard bearer prefixes). Blank lines and lines starting with `#` are ignored.
+- `supports_tools` *(bool, default `true`)* — Turn off for endpoints (vanilla llama.cpp, some older proxies) that reject requests carrying `tools`. With this off, requests carrying tools raise a clear error instead of silently 4xx'ing.
+- `supports_streaming` *(bool, default `true`)* — Turn off for endpoints that choke on `stream: true`. With this off, the stream path routes through a single non-streaming request per round and emits one `MESSAGE_COMPLETE`.
+
+**Config actions**
+- `test_connection` — Issues a one-word completion to verify the endpoint and credentials.
+- `refresh_models` — `GET /models` and populate the in-memory model list (picked up by `available_models()` — the UI dropdown updates without a restart). On 404, the action reports that `/models` isn't implemented and suggests using the free-form `model` field. The list is in-memory only — re-run after a restart if you want fresh data.
+
+**Attachments.** Image attachments ride as `image_url` content parts with `data:<mime>;base64,…` URLs. Whether the target endpoint actually handles them depends on the model — vision-capable endpoints pick them up, text-only ones ignore them. Document (PDF) attachments become text stubs pointing at the workspace tools; text attachments inline as `## <name>\n\n<body>`.
 
 ---
 

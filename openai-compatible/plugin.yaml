@@ -1,0 +1,10 @@
+name: openai-compatible
+version: "1.0.0"
+description: "Vendor-neutral OpenAI-Chat-Completions backend (Groq, Together, vLLM, Ollama, ...)"
+
+provides:
+  - openai_compatible_ai
+
+requires: []
+
+depends_on: []
