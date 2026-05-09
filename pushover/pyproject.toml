@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-pushover"
+version = "1.0.0"
+description = "Pushover push-notification backend for Gilbert"
+requires-python = ">=3.12"
+# Uses ``httpx`` which is already a Gilbert core dep — no extra packages needed.
+dependencies = []
+
+[tool.uv]
+package = false
+
