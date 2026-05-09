@@ -1,0 +1,10 @@
+name: discord-webhook
+version: "1.0.0"
+description: "Discord channel webhook backend for push notifications."
+
+provides:
+  - discord_webhook_push
+
+requires: []
+depends_on: []
+

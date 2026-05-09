@@ -1,0 +1,10 @@
+name: pushover
+version: "1.0.0"
+description: "Pushover backend (one-time paid app token + per-user user_key)."
+
+provides:
+  - pushover_push
+
+requires: []
+depends_on: []
+

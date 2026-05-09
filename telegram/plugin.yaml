@@ -1,0 +1,10 @@
+name: telegram
+version: "1.0.0"
+description: "Telegram bot push backend (polling-mode bots only)."
+
+provides:
+  - telegram_push
+
+requires: []
+depends_on: []
+
