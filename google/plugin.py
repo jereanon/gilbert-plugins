@@ -1,4 +1,4 @@
-"""Google plugin — registers Google OAuth, Workspace directory, Gmail, and Drive backends."""
+"""Google plugin — registers Google OAuth, Workspace directory, Gmail, Drive, and Calendar backends."""
 
 from __future__ import annotations
 
@@ -13,14 +13,21 @@ class GooglePlugin(Plugin):
     - ``google_directory`` — UserProviderBackend (Google Workspace directory)
     - ``gmail`` — EmailBackend
     - ``gdrive_documents`` — DocumentBackend (Google Drive)
+    - ``google_calendar`` — CalendarBackend (Google Calendar v3)
     """
 
     def metadata(self) -> PluginMeta:
         return PluginMeta(
             name="google",
             version="1.0.0",
-            description="Google integration suite (auth, directory, Gmail, Drive)",
-            provides=["google_auth", "google_directory", "gmail", "google_drive"],
+            description="Google integration suite (auth, directory, Gmail, Drive, Calendar)",
+            provides=[
+                "google_auth",
+                "google_directory",
+                "gmail",
+                "google_drive",
+                "google_calendar",
+            ],
             requires=[],
         )
 
@@ -29,6 +36,7 @@ class GooglePlugin(Plugin):
             gdrive_documents,
             gmail,
             google_auth,
+            google_calendar,
             google_directory,
         )
 

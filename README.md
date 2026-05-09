@@ -33,7 +33,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
-| [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"` | `google-auth`, `google-api-python-client` | Identity / Communication / Knowledge |
+| [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
@@ -268,13 +268,14 @@ Google Gemini chat backend, speaking the [OpenAI-compatible Gemini endpoint](htt
 
 ### google
 
-Bundled Google Workspace integration suite. One plugin, four backends — they share credential plumbing (OAuth, service account, delegated access), so splitting them would just duplicate boilerplate.
+Bundled Google Workspace integration suite. One plugin, five backends — they share credential plumbing (OAuth, service account, delegated access), so splitting them would just duplicate boilerplate.
 
 **Backends registered**
 - `AuthBackend.backend_name = "google"` — OAuth ID token verification for the login system.
 - `UserProviderBackend.backend_name = "google_directory"` — syncs Google Workspace users into Gilbert's user store.
 - `EmailBackend.backend_name = "gmail"` — used by the Inbox service for polling, threads, drafts, and sending.
 - `DocumentBackend.backend_name = "google_drive"` — Google Drive document sync into the Knowledge service.
+- `CalendarBackend.backend_name = "google_calendar"` — Google Calendar v3 events, free/busy, and mutations for the Calendar service.
 
 **Configure**
 
@@ -284,10 +285,24 @@ Bundled Google Workspace integration suite. One plugin, four backends — they s
 | User provider (Workspace directory) | `sa_json` *(sensitive, service-account JSON)*, `delegated_user`, `domain` |
 | Inbox (Gmail) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
 | Knowledge (Drive) | `service_account_json` *(sensitive)*, `delegated_user`, `folder_id` |
+| Calendar (Google Calendar) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
 
 Each backend exposes a `test_connection` config action that verifies credentials by making a one-off read call.
 
-**Third-party deps**: `google-auth`, `google-api-python-client`.
+**OAuth scopes required for the Calendar backend** (added to the existing service-account's domain-wide delegation in the Google Workspace admin console):
+
+- `https://www.googleapis.com/auth/calendar`
+- `https://www.googleapis.com/auth/calendar.events`
+
+The same service account configured for Gmail can host Calendar — just add the two scopes to its delegated grant. If your service account is locked-scope, create a dedicated one with only the calendar scopes.
+
+**At-rest plaintext caveat (Gmail, Calendar, Drive — same gap).** Service-account JSON pasted into `backend_config` is `sensitive=True`, which masks it in WS responses and the SPA, but `sensitive` is **not** encryption — the JSON sits in plaintext SQLite at `.gilbert/gilbert.db`. This is a project-wide gap inherited by every backend that holds long-lived secrets. Mitigations:
+
+- Set `.gilbert/gilbert.db` to mode `0600`, owned by the running user (file-permission hardening).
+- Scope service-account keys to the minimum users / scopes needed and rotate periodically.
+- Track encryption-at-rest as a future cross-cutting feature (open question on the project roadmap).
+
+**Third-party deps**: `google-auth`, `google-api-python-client`, `tzdata` (cross-platform IANA zone data — required for Calendar's `ZoneInfo(...)` lookups; bundled because Alpine/musl ships without `/usr/share/zoneinfo`).
 
 ---
 
