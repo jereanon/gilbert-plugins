@@ -1,0 +1,33 @@
+{
+  "results": [
+    {
+      "id": 5150529,
+      "name": "Cleveland",
+      "latitude": 41.4993,
+      "longitude": -81.6944,
+      "elevation": 199.0,
+      "feature_code": "PPLA2",
+      "country_code": "US",
+      "admin1_id": 5165418,
+      "timezone": "America/New_York",
+      "country_id": 6252001,
+      "country": "United States",
+      "admin1": "Ohio"
+    },
+    {
+      "id": 4685907,
+      "name": "Cleveland",
+      "latitude": 35.1595,
+      "longitude": -84.8766,
+      "elevation": 256.0,
+      "feature_code": "PPLA2",
+      "country_code": "US",
+      "admin1_id": 4662168,
+      "timezone": "America/New_York",
+      "country_id": 6252001,
+      "country": "United States",
+      "admin1": "Tennessee"
+    }
+  ],
+  "generationtime_ms": 0.7
+}
