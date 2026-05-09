@@ -1,0 +1,16 @@
+name: open-meteo
+version: "1.0.0"
+description: "Open-Meteo weather backend — current, hourly, and daily forecasts (no API key required)"
+
+provides:
+  - open-meteo-weather
+
+requires: []
+depends_on: []
+
+config:
+  weather:
+    settings:
+      timeout_seconds: 15
+      user_agent: "Gilbert/1.0 (https://github.com/briandilley/gilbert)"
+
