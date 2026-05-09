@@ -40,6 +40,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
+| [open-meteo](#open-meteo) | `WeatherBackend "open-meteo"` | — (uses `httpx`) | Intelligence |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
@@ -433,6 +434,24 @@ Local Ollama AI backend — chat against any open-weight model you've `ollama pu
 **Attachments.** Multimodal Ollama models accept `image_url` content parts with base64 data URLs. Text-only models ignore vision parts, so the same payload is safe regardless of which tag is selected.
 
 **Config action** — `test_connection`: issues a one-word completion to verify the server is reachable and the default model tag is installed.
+
+---
+
+### open-meteo
+
+Weather backend powered by [Open-Meteo](https://open-meteo.com/) — a free, no-API-key HTTPS service covering global current conditions, hourly, and daily forecasts. The default backend for the core Weather service. Geocoding for place-name lookups uses Open-Meteo's free Geocoding API. Open-Meteo doesn't issue severe-weather alerts (`capabilities().alerts = False`); the Weather service surfaces `supported=false` from `weather_alerts` so the AI can clearly say "no data" rather than "no alerts." For US severe-weather warnings, install a future `nws` plugin alongside.
+
+**Backend registered** — `WeatherBackend.backend_name = "open-meteo"`: `current=True, hourly=True, daily=True, alerts=False`.
+
+**Configure** (Settings → Intelligence → Weather, with the `open-meteo` backend selected)
+- `timeout_seconds` — HTTP timeout in seconds (default `15`). Granular per-phase timeouts inside the client cap connect / read / write / pool independently so a hung handshake doesn't burn the whole budget on connect alone.
+- `user_agent` — HTTP `User-Agent` header sent with every request (default `Gilbert/1.0 (https://github.com/briandilley/gilbert)`). Open-Meteo's free-tier docs ask for a useful identifier; keep the contact URL so an operator can reach the project.
+
+**Config action** — `test_connection`: hits the Open-Meteo forecast endpoint for a known coordinate and reports success / failure.
+
+**Powered by Open-Meteo** — please keep the contact-URL `User-Agent` so the upstream operator can reach us. **Commercial use requires a paid Open-Meteo plan / API key**; the free tier permits up to 600 requests/min, 5,000/hour, 10,000/day. Gilbert's per-method cache TTLs (10 min current, 30 min hourly, 1 h daily, 5 min alerts) keep typical home-assistant usage well under these limits.
+
+**No third-party Python dependencies** — talks directly to the REST API via `httpx`.
 
 ---
 
