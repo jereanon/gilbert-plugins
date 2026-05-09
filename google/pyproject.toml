@@ -1,11 +1,17 @@
 [project]
 name = "gilbert-plugin-google"
 version = "1.0.0"
-description = "Google integration suite (auth, directory, Gmail, Drive) for Gilbert"
+description = "Google integration suite (auth, directory, Gmail, Drive, Calendar) for Gilbert"
 requires-python = ">=3.12"
 dependencies = [
     "google-auth>=2.49.1",
     "google-api-python-client>=2.193.0",
+    # Cross-platform IANA tz data for the Calendar backend's
+    # ``ZoneInfo(...)`` lookups. Linux distros bundle /usr/share/zoneinfo
+    # via the ``tzdata`` system package, but Alpine / musl ship without
+    # it; depending on the PyPI ``tzdata`` package keeps the plugin
+    # self-contained on every distro.
+    "tzdata>=2024.1",
 ]
 
 [tool.uv]
