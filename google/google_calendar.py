@@ -525,11 +525,19 @@ class GoogleCalendarBackend(CalendarBackend):
                 sendUpdates="all" if request.send_invites else "none",
             )
             if if_match_etag:
-                # Set If-Match on the underlying HTTP request.
+                # Set If-Match on the underlying HTTP request. If the
+                # google-api-python-client request shape ever changes,
+                # log loudly so an OCC silently-broken regression is
+                # visible during smoke tests instead of producing
+                # silent last-write-wins behaviour.
                 try:
                     patch.headers["If-Match"] = if_match_etag  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "google_calendar: failed to set If-Match header — "
+                        "OCC may not be enforced for this update (cause: %s)",
+                        exc,
+                    )
             return patch.execute()
 
         data = await self._exec_with_mapping(_go)

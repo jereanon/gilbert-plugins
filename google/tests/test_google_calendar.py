@@ -37,14 +37,16 @@ def _make_backend() -> tuple[GoogleCalendarBackend, MagicMock]:
     return backend, fake_service
 
 
-def _http_error(status: int, reason: str = "") -> Exception:
+def _http_error(
+    status: int, reason: str = "", *, headers: dict[str, str] | None = None
+) -> Exception:
     """Build a googleapiclient.errors.HttpError-like instance."""
     from googleapiclient.errors import HttpError
 
     resp = MagicMock()
     resp.status = status
     resp.reason = reason
-    resp.headers = {}
+    resp.headers = dict(headers or {})
     content_obj = {"error": {"errors": [{"reason": reason}]}}
     return HttpError(resp, json.dumps(content_obj).encode("utf-8"))
 
@@ -243,6 +245,20 @@ class TestErrorMapping:
         assert isinstance(mapped, CalendarBackendError)
         assert not isinstance(mapped, CalendarBackendAuthError)
         assert not isinstance(mapped, CalendarBackendTransientError)
+
+    def test_429_parses_retry_after_header(self) -> None:
+        """A 429 with a ``Retry-After`` header must surface
+        ``retry_after_sec`` so the service can defer the next poll."""
+        mapped = GoogleCalendarBackend._map_http_error(
+            _http_error(429, "rateLimitExceeded", headers={"Retry-After": "30"})
+        )
+        assert isinstance(mapped, CalendarBackendRateLimitError)
+        assert mapped.retry_after_sec == 30.0
+
+    def test_429_without_retry_after_leaves_field_none(self) -> None:
+        mapped = GoogleCalendarBackend._map_http_error(_http_error(429, ""))
+        assert isinstance(mapped, CalendarBackendRateLimitError)
+        assert mapped.retry_after_sec is None
 
 
 # ── Live API surface (mocked) ────────────────────────────────────────
