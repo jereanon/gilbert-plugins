@@ -31,6 +31,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
+| [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge |
@@ -39,15 +40,18 @@ The table below is an index — jump to each plugin's detail section for configu
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
+| [ntfy](#ntfy) | `PushNotificationBackend "ntfy"` | — (uses `httpx`) | Notifications |
 | [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
 | [open-meteo](#open-meteo) | `WeatherBackend "open-meteo"` | — (uses `httpx`) | Intelligence |
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
+| [pushover](#pushover) | `PushNotificationBackend "pushover"` | — (uses `httpx`) | Notifications |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `aiosonos`, `zeroconf` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
+| [telegram](#telegram) | `PushNotificationBackend "telegram"` | — (uses `httpx`) | Notifications |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
@@ -222,6 +226,41 @@ DeepSeek chat backend, speaking the [OpenAI-compatible DeepSeek API](https://api
 **Attachments.** DeepSeek's current chat models don't accept native image attachments, so every attachment becomes a text stub pointing the model at the workspace tools (`read_workspace_file`, `run_workspace_script`). Text attachments are inlined as `## <name>\n\n<body>`.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### discord-webhook
+
+Discord channel-webhook delivery for the push-notification fan-out
+service. No shared admin secret is required — the secret is each user's
+per-route webhook URL (created from the channel's *Edit channel →
+Integrations → Create webhook* menu).
+
+**Backend registered** — `PushNotificationBackend.backend_name = "discord-webhook"`.
+
+**Per-user destination fields** (set on `/account/notifications`)
+- `webhook_url` *(sensitive)* — full Discord webhook URL. Validated on
+  send and on the `test_connection` action against the official
+  `discord.com` / `discordapp.com` prefixes — anything else is rejected
+  before any HTTP call to prevent SSRF probes.
+- `mention` — optional mention prefix (e.g. `@here`, `<@USER_ID>`)
+  prepended on URGENT messages only.
+
+**Admin config** (Settings → Notifications → Backend: discord-webhook)
+- `timeout` — HTTP timeout in seconds (default 10).
+- `username_override` — webhook display name (default `"Gilbert"`).
+
+**Config action** — `test_connection`: pings an arbitrary
+`webhook_url` from the action payload with `flags=4096`
+(SUPPRESS_NOTIFICATIONS) so members aren't pinged. The same flag is
+applied to per-route "Send test" deliveries triggered from the SPA.
+
+**Rate-limit handling** — 429s parse `X-RateLimit-Reset-After` into
+`PushDeliveryResult.retry_after_s`; the service uses that value
+(capped at 60s) instead of the configured backoff for the next
+attempt.
+
+**No third-party Python dependencies** — uses core's `httpx`.
 
 ---
 
@@ -412,6 +451,45 @@ Tunnel backend that gives Gilbert a public HTTPS URL via [ngrok](https://ngrok.c
 
 ---
 
+### ntfy
+
+Free, simple HTTP-based push delivery via [ntfy.sh](https://ntfy.sh)
+(or any self-hosted ntfy server). The recommended starter for the
+push-notification fan-out service — no API key, no app-store payment,
+just pick an obscure topic and subscribe from the ntfy mobile/desktop
+app. The empty-state hero on `/account/notifications` walks new users
+through "scan QR → tap test" in well under a minute.
+
+**Backend registered** — `PushNotificationBackend.backend_name = "ntfy"`.
+
+**Per-user destination fields** (set on `/account/notifications`)
+- `topic` — ntfy topic (path component). Pick something obscure —
+  anyone subscribed to your topic can read your notifications.
+- `server` — ntfy server URL. Leave empty to use the admin default.
+
+**Admin config** (Settings → Notifications → Backend: ntfy)
+- `default_server` — Default server URL. Defaults to
+  `https://ntfy.sh`. Leave at this for the free public server; change
+  it only if you self-host.
+- `auth_token` *(sensitive)* — Optional Bearer token for protected
+  ntfy servers. Empty for the public ntfy.sh.
+- `timeout` — HTTP timeout in seconds (default 10).
+
+**Config action** — `test_connection`: sends "Gilbert ntfy
+connectivity test" to the topic provided in the action payload.
+Refuses to default to a global topic name (no broadcasting to
+strangers on ntfy.sh).
+
+**Urgency mapping** — INFO=2, NORMAL=3, URGENT=5 in the `Priority`
+header. Source tags map to ntfy emoji (`agent`→robot,
+`scheduler`→alarm_clock, etc.). Click-through deep links land in the
+`Click` header so a single tap on the notification opens the right
+Gilbert page.
+
+**No third-party Python dependencies** — uses core's `httpx`.
+
+---
+
 ### ollama
 
 Local Ollama AI backend — chat against any open-weight model you've `ollama pull`ed, running inference on your own machine. Speaks [Ollama's OpenAI-compatible endpoint](https://github.com/ollama/ollama/blob/main/docs/openai.md) at `http://localhost:11434/v1` directly over `httpx`. No API key required for local usage; proxied/remote instances can set one and it flows through as a Bearer token.
@@ -531,6 +609,40 @@ OpenRouter chat backend — a meta-provider that fronts ~200 models from Anthrop
 
 ---
 
+### pushover
+
+[Pushover](https://pushover.net/) push delivery — one-time-payment
+mobile apps on iOS / Android. Reliable, no shared topic to leak, but
+admins must register a Pushover application once and share its
+**app token** across all Gilbert users; each user enters their personal
+30-character **user_key** on their route.
+
+**Backend registered** — `PushNotificationBackend.backend_name = "pushover"`.
+
+**Per-user destination fields** (set on `/account/notifications`)
+- `user_key` *(sensitive)* — your Pushover user key from
+  pushover.net.
+- `device` — optional device name to target a single device. Empty
+  delivers to every device on the account.
+
+**Admin config** (Settings → Notifications → Backend: pushover)
+- `api_token` *(sensitive)* — Pushover application API token.
+- `timeout` — HTTP timeout in seconds (default 10).
+
+**Config action** — `test_connection`: calls Pushover's
+`/users/validate.json` endpoint with the configured token and a
+`user_key` from the action payload, reporting how many devices it
+saw.
+
+**Urgency mapping** — INFO→`-1`, NORMAL→`0`, URGENT→`1` (sounds even
+on quiet hours; Pushover's emergency priority `2` is reserved for
+v1.1 with the outbox so retries are bounded). Click-through deep
+links flow as Pushover's `url` + `url_title` fields.
+
+**No third-party Python dependencies** — uses core's `httpx`.
+
+---
+
 ### qwen
 
 Alibaba Qwen chat backend, speaking DashScope's [OpenAI-compatible Chat Completions endpoint](https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope) directly over `httpx` (no `dashscope` SDK dependency). Because DashScope accepts OpenAI's request shape, streaming protocol, and tool-calling format verbatim, the backend runs alongside `openai` and `anthropic` with the same capabilities — configure one or several, then pick per-profile in the AI profile editor.
@@ -616,6 +728,59 @@ Web search backend. Used by the Web Search service's `web_search` and `image_sea
 **Config action** — `test_connection`: runs a one-result search to verify the API key.
 
 **No third-party Python dependencies** — talks directly to the REST API via `httpx`.
+
+---
+
+### telegram
+
+[Telegram bot](https://core.telegram.org/bots) push delivery for the
+push-notification fan-out service. The admin registers a bot with
+[@BotFather](https://t.me/BotFather) once and configures the **bot
+token**; each user discovers their personal **chat id** through the
+backend's `discover_chat_id` action (the SPA renders it as a
+clickable-chip wizard).
+
+**Backend registered** — `PushNotificationBackend.backend_name = "telegram"`.
+
+**Per-user destination fields** (set on `/account/notifications`)
+- `chat_id` — Telegram chat id (numeric for private chats, prefixed
+  `-100…` for channels). Use the *Discover chat id* button on the
+  Routes form to look it up automatically.
+
+**Admin config** (Settings → Notifications → Backend: telegram)
+- `bot_token` *(sensitive)* — bot token from BotFather.
+- `timeout` — HTTP timeout in seconds (default 15).
+
+**Config actions**
+- `test_connection` — calls `/getMe` to verify the token, returns the
+  bot username.
+- `discover_chat_id` — calls `/getUpdates` and returns the recent
+  `(chat_id, name, last_text)` triples for the SPA to render as
+  pickable chips. The SPA's `ChatIdWizard` component triggers it
+  through the standard `config.action.invoke` RPC.
+
+**Webhook-mode rejection.** On `initialize` the backend calls
+`/getWebhookInfo`; if a webhook URL is set it logs an ERROR and stays
+DISABLED — `getUpdates` and webhooks are mutually exclusive at the
+Telegram API level, so a webhook-mode bot would silently fail every
+send. Run `/deleteWebhook` on the bot to flip it back to polling
+mode.
+
+**Urgency mapping** — INFO sets `disable_notification=true` (silent
+notification); NORMAL and URGENT both ping the device. Click-through
+deep links render as a single-row inline-keyboard "Open in Gilbert"
+button below the message.
+
+**Rate-limit handling** — 429 responses parse `parameters.retry_after`
+into `PushDeliveryResult.retry_after_s`; the service uses that value
+(capped at 60s) instead of the configured backoff.
+
+**Bot username caching.** After `getMe` succeeds the username is
+exposed via `runtime_data["bot_username"]` so the chat-id wizard's
+`https://t.me/<bot_username>` deep link renders without a second
+roundtrip. The bot **token** is never present in `runtime_data`.
+
+**No third-party Python dependencies** — uses core's `httpx`.
 
 ---
 
