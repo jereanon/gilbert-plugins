@@ -1,0 +1,10 @@
+name: ntfy
+version: "1.0.0"
+description: "ntfy push-notification backend (ntfy.sh or self-hosted)."
+
+provides:
+  - ntfy_push
+
+requires: []
+depends_on: []
+

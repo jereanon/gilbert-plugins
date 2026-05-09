@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-telegram"
+version = "1.0.0"
+description = "Telegram bot push-notification backend for Gilbert"
+requires-python = ">=3.12"
+# Hits the Telegram Bot API directly via httpx — no SDK needed for sending.
+dependencies = []
+
+[tool.uv]
+package = false
+
