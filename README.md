@@ -323,6 +323,12 @@ High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.an
 
 **Third-party deps** — `aiomqtt>=2.3.0,<3.0.0` (asyncio-native; v2-only because v1→v2 was a breaking API change and v3 hasn't shipped). HTTP via `httpx` (already a Gilbert core dep).
 
+**SPA contributions** — the plugin owns its UI under `frigate/frontend/`:
+- `frigate.cameras_page` — full `/cameras` SPA route declared via `Plugin.ui_routes()`. Per-camera grid, recent-events feed, mute editor.
+- `frigate.recent_events` — dashboard card mounted into the `dashboard.bottom` slot via `Plugin.ui_panels()`. Subscribes to `camera.event.detected` for live updates.
+
+Core never imports from `frigate/frontend/`; the `<PluginPanelSlot>` / `<PluginRoutes>` extension points + the per-plugin `panels.ts` side-effect file wire the components in via `panel_id`.
+
 ---
 
 ### gemini
