@@ -1,0 +1,15 @@
+{
+  "name": "@gilbert-plugin/frigate-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Frigate plugin SPA components — registered via panels.ts into the host's plugin slot system.",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@tanstack/react-query": "^5.0.0",
+    "react-router-dom": "^7.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}
+
