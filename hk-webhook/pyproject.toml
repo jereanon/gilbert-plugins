@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-hk-webhook"
+version = "1.0.0"
+description = "Generic health-data webhook backend"
+requires-python = ">=3.12"
+# No third-party deps — payload parsing is stdlib JSON.
+dependencies = []
+
+[tool.uv]
+package = false
+

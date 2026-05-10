@@ -1,0 +1,11 @@
+name: hk-webhook
+version: "1.0.0"
+description: "Generic catch-all health-data webhook backend (any source — iOS Shortcut, Home Assistant, Garmin Connect IQ, custom script)"
+
+provides:
+  - hk_webhook_health
+
+requires: []
+
+depends_on: []
+
