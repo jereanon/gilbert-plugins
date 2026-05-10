@@ -12,6 +12,7 @@ from gilbert.interfaces.plugin import (
     PluginContext,
     PluginMeta,
     UIPanel,
+    UIRoute,
 )
 
 
@@ -44,6 +45,22 @@ class FrigatePlugin(Plugin):
             ),
         ]
 
+    def ui_routes(self) -> list[UIRoute]:
+        return [
+            UIRoute(
+                path="/cameras",
+                panel_id="frigate.cameras_page",
+                label="Cameras",
+                description="Live view of cameras and recent detection events.",
+                icon="monitor",
+                required_role="user",
+                add_to_nav=True,
+                nav_parent_group="system",
+                show_in_dashboard=True,
+            ),
+        ]
+
 
 def create_plugin() -> Plugin:
     return FrigatePlugin()
+

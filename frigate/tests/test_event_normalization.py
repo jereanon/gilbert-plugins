@@ -174,3 +174,69 @@ def test_audio_event_no_snapshot() -> None:
     assert ev is not None
     assert ev.has_snapshot is False
     assert ev.label == "bark"
+
+
+def test_update_event_yields_active_when_zones_change_with_unchanged_score() -> None:
+    """The dedup check is: small-score-change AND same-zones AND same-snapshot.
+    A zone change alone should let the update through even if score
+    didn't move."""
+    c = _client()
+    base_after = {
+        "id": "evt-zones",
+        "camera": "porch",
+        "label": "person",
+        "score": 0.5,
+        "start_time": 1730851234.0,
+        "current_zones": ["porch"],
+    }
+    c._payload_to_event(_new_event(base_after, type_="new"))
+    # Score unchanged, snapshot frame_time unchanged (both absent),
+    # but a new zone appeared. Should yield, not dedup.
+    new_zones = dict(base_after, current_zones=["porch", "doorway"])
+    out = c._payload_to_event({"type": "update", "after": new_zones})
+    assert out is not None
+    assert out.zones == ("porch", "doorway")
+
+
+def test_update_event_yields_active_when_snapshot_advances_with_unchanged_score() -> None:
+    """A fresh snapshot frame (different ``snapshot.frame_time``) should
+    let the update through even with the same score and zones."""
+    c = _client()
+    base_after = {
+        "id": "evt-snap",
+        "camera": "porch",
+        "label": "person",
+        "score": 0.5,
+        "start_time": 1730851234.0,
+        "current_zones": ["porch"],
+        "snapshot": {"frame_time": 1730851234.5},
+    }
+    c._payload_to_event(_new_event(base_after, type_="new"))
+    advanced = dict(base_after, snapshot={"frame_time": 1730851235.0})
+    out = c._payload_to_event({"type": "update", "after": advanced})
+    assert out is not None
+
+
+def test_update_event_dropped_when_zones_match_and_snapshot_unchanged_and_small_score_delta() -> None:
+    """All three conditions met → dedup. This is the AND of the three
+    OR-branches above; a regression that drops any of the OR conditions
+    would either over-yield or over-dedup."""
+    c = _client()
+    base_after = {
+        "id": "evt-andset",
+        "camera": "porch",
+        "label": "person",
+        "score": 0.5,
+        "start_time": 1730851234.0,
+        "current_zones": ["porch"],
+        "snapshot": {"frame_time": 1730851234.5},
+    }
+    c._payload_to_event(_new_event(base_after, type_="new"))
+    # Score moves by less than threshold (0.05), zones unchanged,
+    # snapshot frame_time unchanged.
+    minor_change = dict(
+        base_after,
+        score=0.51,  # delta 0.01 < 0.05 threshold
+    )
+    out = c._payload_to_event({"type": "update", "after": minor_change})
+    assert out is None
