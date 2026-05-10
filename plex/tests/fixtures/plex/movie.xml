@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="1">
+  <Video ratingKey="12345" key="/library/metadata/12345" type="movie"
+         title="Dune: Part Two" titleSort="Dune Part Two"
+         summary="Paul Atreides unites with Chani and the Fremen."
+         year="2024" rating="8.5" contentRating="PG-13"
+         studio="Legendary" duration="9960000"
+         addedAt="1717545600" lastViewedAt="1718000000"
+         viewCount="1" viewOffset="0"
+         librarySectionTitle="Movies"
+         thumb="/library/metadata/12345/thumb/123"
+         art="/library/metadata/12345/art/123">
+    <Genre tag="Sci-Fi"/>
+    <Genre tag="Adventure"/>
+    <Director tag="Denis Villeneuve"/>
+    <Role tag="Timothée Chalamet"/>
+    <Role tag="Zendaya"/>
+  </Video>
+</MediaContainer>

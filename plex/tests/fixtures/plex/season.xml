@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="1">
+  <Directory ratingKey="22346" key="/library/metadata/22346" type="season"
+             title="Season 2" titleSort="Severance Season 2"
+             summary="Macrodata refinement continues."
+             parentRatingKey="22345" parentTitle="Severance"
+             index="2"
+             addedAt="1705000000"
+             librarySectionTitle="TV Shows"/>
+</MediaContainer>

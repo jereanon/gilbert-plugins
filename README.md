@@ -47,6 +47,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
+| [plex](#plex) | `MediaLibraryBackend "plex"` | `plexapi`, `httpx` | Media |
 | [pushover](#pushover) | `PushNotificationBackend "pushover"` | — (uses `httpx`) | Notifications |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
@@ -662,6 +663,54 @@ OpenRouter chat backend — a meta-provider that fronts ~200 models from Anthrop
 **Attachments.** Vision-capable models on OpenRouter (Claude, GPT-4o, Gemini, Pixtral, Grok Vision, …) accept `image_url` content parts with base64 data URLs. Text-only models ignore vision parts, so the same payload is safe regardless of model choice.
 
 **Config action** — `test_connection`: issues a one-word completion to verify credentials.
+
+---
+
+### plex
+
+Plex Media Server backend for the core `MediaLibraryService`. Wraps
+[`plexapi`](https://github.com/pkkid/python-plexapi) for browse / search /
+playback dispatch and uses `httpx` directly for the Plex.tv PIN-link
+flow and a few endpoints plexapi doesn't expose conveniently.
+
+**Backend registered**
+- `MediaLibraryBackend.backend_name = "plex"`. All six capability flags
+  set to `True`: `now_playing`, `resume`, `continue_watching`,
+  `recently_added`, `seek`, `per_user`, `next_episode`.
+
+**Slash commands** — provided by the core `MediaLibraryService`
+(`/media …`), not by this plugin. Tools like `/media search`,
+`/media play`, `/media on-deck`, `/media now`, `/media pause` /
+`/media resume` / `/media stop` / `/media seek`, `/media recommend` are
+registered by the core service when this backend is configured.
+
+**Configure** (Settings → Media → Media library, with the `plex`
+backend enabled)
+- `account_token` *(sensitive)* — Plex.tv X-Plex-Token. Obtained via
+  the Link Account flow.
+- `server_machine_id` — Machine identifier of the chosen server.
+  Filled by the Choose Server step.
+- `server_url` — Override the auto-discovered URL. Empty = let plexapi
+  pick from plex.tv resources.
+- `verify_tls` — Verify TLS for `https://` URLs (default True).
+- `request_timeout_seconds` — Default 15.0.
+- `default_user_token` *(sensitive)* — Optional fallback X-Plex-Token
+  used for no-mapping calls.
+
+**Config actions** — `link_account` / `link_account_complete` (PIN flow
+on plex.tv/link), `choose_server` (lists Plex.tv resources owned by the
+linked account), `test_connection` (calls `/identity`).
+
+**OS-level prerequisites** — none. `runtime_dependencies()` returns
+`[]`.
+
+**Notes** — token at-rest encryption is inherited tech debt across the
+codebase; v1 mandates `0600` on `.gilbert/gilbert.db`. Per-Plex-Home-
+user token caches are keyed by the Plex Home user uuid (NOT by Gilbert
+user id), with per-user `asyncio.Lock` so two concurrent calls for the
+same Home user serialize but two for different Home users do not. A
+re-link (`account_token` change) atomically clears all per-Home-user
+caches before re-pinning the chosen `PlexServer`.
 
 ---
 

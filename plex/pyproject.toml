@@ -1,0 +1,18 @@
+[project]
+name = "gilbert-plugin-plex"
+version = "1.0.0"
+description = "Plex Media Server library + playback backend for Gilbert"
+requires-python = ">=3.12"
+dependencies = [
+    # plexapi is mature, well-maintained, and abstracts both the local
+    # XML API and the plex.tv cloud account. Synchronous — we wrap calls
+    # in asyncio.to_thread to keep the event loop unblocked.
+    "plexapi>=4.15.0",
+    # httpx for direct calls when plexapi doesn't expose what we need
+    # (e.g. /clients/<id>/playMedia for legacy companion clients) and
+    # for the Plex.tv PIN linking flow.
+    "httpx>=0.27.0",
+]
+
+[tool.uv]
+package = false

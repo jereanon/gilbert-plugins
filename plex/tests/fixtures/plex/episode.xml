@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="1">
+  <Video ratingKey="22399" key="/library/metadata/22399" type="episode"
+         title="Cold Harbor" titleSort="Cold Harbor"
+         summary="Mark and his team confront refinement secrets."
+         year="2025" duration="3000000"
+         parentRatingKey="22346" parentTitle="Season 2"
+         grandparentRatingKey="22345" grandparentTitle="Severance"
+         index="3" parentIndex="2"
+         addedAt="1735000000" lastViewedAt="1735100000"
+         viewCount="0" viewOffset="600000"
+         librarySectionTitle="TV Shows">
+    <Genre tag="Drama"/>
+  </Video>
+</MediaContainer>
