@@ -22,6 +22,7 @@ if _pkg_name not in sys.modules:
         "gmail",
         "gdrive_documents",
         "google_calendar",
+        "google_tasks",
         "plugin",
     ):
         _spec = importlib.util.spec_from_file_location(
