@@ -1,0 +1,10 @@
+name: frigate
+version: "1.0.0"
+description: "Frigate NVR object-detection events via MQTT, plus snapshot/clip retrieval over HTTP"
+
+provides:
+  - frigate_camera
+
+requires: []
+
+depends_on: []

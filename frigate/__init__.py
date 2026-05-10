@@ -1,0 +1,1 @@
+# Frigate plugin package.
