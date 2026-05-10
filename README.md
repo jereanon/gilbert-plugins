@@ -34,7 +34,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
-| [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge |
+| [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"`, `TaskBackend "google_tasks"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge / Productivity |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
@@ -308,7 +308,7 @@ Google Gemini chat backend, speaking the [OpenAI-compatible Gemini endpoint](htt
 
 ### google
 
-Bundled Google Workspace integration suite. One plugin, five backends — they share credential plumbing (OAuth, service account, delegated access), so splitting them would just duplicate boilerplate.
+Bundled Google Workspace integration suite. One plugin, six backends — they share credential plumbing (OAuth, service account, delegated access), so splitting them would just duplicate boilerplate.
 
 **Backends registered**
 - `AuthBackend.backend_name = "google"` — OAuth ID token verification for the login system.
@@ -316,6 +316,7 @@ Bundled Google Workspace integration suite. One plugin, five backends — they s
 - `EmailBackend.backend_name = "gmail"` — used by the Inbox service for polling, threads, drafts, and sending.
 - `DocumentBackend.backend_name = "google_drive"` — Google Drive document sync into the Knowledge service.
 - `CalendarBackend.backend_name = "google_calendar"` — Google Calendar v3 events, free/busy, and mutations for the Calendar service.
+- `TaskBackend.backend_name = "google_tasks"` — Google Tasks v1 list / create / update / complete / delete for the Tasks service. One Gilbert task list = one Google `tasklist` (bound by `tasklist_id`); polling uses `updatedMin` for delta semantics. **DWD requires Google Workspace** — personal `gmail.com` accounts cannot use this backend.
 
 **Configure**
 
@@ -326,6 +327,7 @@ Bundled Google Workspace integration suite. One plugin, five backends — they s
 | Inbox (Gmail) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
 | Knowledge (Drive) | `service_account_json` *(sensitive)*, `delegated_user`, `folder_id` |
 | Calendar (Google Calendar) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
+| Tasks (Google Tasks) | `service_account_json` *(sensitive)*, `delegated_user`, `tasklist_id` |
 
 Each backend exposes a `test_connection` config action that verifies credentials by making a one-off read call.
 
@@ -336,7 +338,13 @@ Each backend exposes a `test_connection` config action that verifies credentials
 
 The same service account configured for Gmail can host Calendar — just add the two scopes to its delegated grant. If your service account is locked-scope, create a dedicated one with only the calendar scopes.
 
-**At-rest plaintext caveat (Gmail, Calendar, Drive — same gap).** Service-account JSON pasted into `backend_config` is `sensitive=True`, which masks it in WS responses and the SPA, but `sensitive` is **not** encryption — the JSON sits in plaintext SQLite at `.gilbert/gilbert.db`. This is a project-wide gap inherited by every backend that holds long-lived secrets. Mitigations:
+**OAuth scope required for the Tasks backend** (added the same way):
+
+- `https://www.googleapis.com/auth/tasks`
+
+The same service account configured for Gmail / Calendar can host Tasks — add this scope to the existing delegated grant. The settings UI's `test_connection` action surfaces "insufficient scope" errors clearly. The `list_tasklists` action enumerates available tasklists so you can pick the right `tasklist_id`.
+
+**At-rest plaintext caveat (Gmail, Calendar, Tasks, Drive — same gap).** Service-account JSON pasted into `backend_config` is `sensitive=True`, which masks it in WS responses and the SPA, but `sensitive` is **not** encryption — the JSON sits in plaintext SQLite at `.gilbert/gilbert.db`. This is a project-wide gap inherited by every backend that holds long-lived secrets. Mitigations:
 
 - Set `.gilbert/gilbert.db` to mode `0600`, owned by the running user (file-permission hardening).
 - Scope service-account keys to the minimum users / scopes needed and rotate periodically.
