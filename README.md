@@ -33,6 +33,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
 | [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
+| [frigate](#frigate) | `CameraEventBackend "frigate"` | `aiomqtt` | Monitoring |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"`, `TaskBackend "google_tasks"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge / Productivity |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
@@ -280,6 +281,47 @@ High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.an
 **Config action** — `test_connection`: requests the available voices list to verify the API key.
 
 **No third-party Python dependencies** — talks directly to the REST API via `httpx`.
+
+---
+
+### frigate
+
+[Frigate](https://frigate.video/) NVR object-detection events via MQTT (push), plus snapshot/clip retrieval over HTTP. Subscribes to Frigate's `<prefix>/events` and `<prefix>/available` topics; the camera service consumes the stream, persists rows into the `camera_events` collection (configurable retention), and republishes onto the bus as `camera.event.detected` / `camera.event.ended` / `camera.<label>.detected.<camera>` (glob-friendly, ACTIVE only).
+
+**Backend registered** — `CameraEventBackend.backend_name = "frigate"`. Streaming-style backend (`connect / disconnect / stream_events` on top of the standard `initialize / close`); the camera service owns the reconnect supervisor and re-invokes `connect()` on transport error.
+
+**Slash commands** — provided by the core `cameras` service:
+- `/cameras list`, `/cameras clips`, `/cameras seen`, `/cameras count`
+- `/cameras mute` (on the greeting service — UIBlock confirm before persisting)
+
+**Configure** (Settings → Monitoring → Cameras, with the `frigate` backend selected)
+- `mqtt_host`, `mqtt_port` *(restart)* — Broker hostname / port. Frigate's bundled Mosquitto on `1883` is the most common deploy.
+- `mqtt_topic_prefix` *(restart)* — Frigate's `mqtt.topic_prefix` (default `frigate`).
+- `mqtt_username`, `mqtt_password` *(sensitive)* — Optional broker credentials.
+- `mqtt_client_id` — MQTT client id (default `gilbert-cameras`).
+- `mqtt_tls` — Enable TLS for the broker connection.
+- `mqtt_tls_ca_cert`, `mqtt_tls_client_cert` *(sensitive)*, `mqtt_tls_client_key` *(sensitive)* — PEM material for self-signed brokers and mTLS.
+- `mqtt_tls_insecure` — Skip TLS hostname / cert verification (DISABLES MITM PROTECTION — only for self-signed brokers where you don't want to ship the CA).
+- `mqtt_tls_server_hostname` — SNI / cert-CN override.
+- `http_base_url` *(restart)* — Frigate web base URL (e.g. `http://frigate.local:5000`). Used for snapshot / clip / camera-config probes.
+- `http_auth_mode` — `none` (LAN deploy) or `bearer` (Frigate API keys / proxy).
+- `http_token` *(sensitive)* — Bearer token; ignored when `http_auth_mode=none`.
+- `verify_ssl` — Verify Frigate's TLS cert (default true).
+- `cameras_filter` — Restrict to a subset of cameras the broker reports.
+
+**MQTT broker onboarding hint.** If you don't already have a broker, point this at Frigate's bundled Mosquitto — it's the same broker Frigate publishes its own events to. Frigate's `config.yml` `mqtt:` block configures both ports and credentials; copy them into Gilbert's settings.
+
+**Config action** — `test_connection`: probes Frigate's `/api/version`, attempts a 5-second MQTT connect+subscribe to `<prefix>/+/events`, and warns when the broker reports a Frigate version older than the supported 0.13.0 minimum.
+
+**Single-layer reconnect** — the plugin opens **one** `aiomqtt.Client` per `connect()` call. Any `MqttError` exits the inner client and raises `CameraBackendError`; the camera service catches it, sleeps with exponential backoff (capped at `reconnect_max_seconds`), and calls `connect()` again. The plugin doesn't loop internally so there's only one place backoff semantics live.
+
+**Frigate LWT translation.** When `<prefix>/available` flips to `offline` (Frigate-the-detector down even though the broker is healthy), the plugin signals the consumer which raises `CameraBackendError("frigate offline")`; the service publishes `camera.backend.disconnected` and re-attempts. When the LWT flips back to `online`, the next reconnect succeeds and `camera.backend.connected` fires.
+
+**Defensive payload parsing** — every field read uses `.get()` with a default; `sub_label` accepts string / `[name, score]` list / null / missing forms; missing required fields drop the event with a debug-level log; `false_positive=true` drops the event entirely; invalid JSON payloads are logged at WARNING and dropped (the consumer never crashes on a malformed payload).
+
+**Audio events** flow through transparently — Frigate 0.13+ emits `bark`, `glass_break`, `speech`, etc. on cameras with `audio.enabled=true`. They have `has_snapshot=false` so vision annotation short-circuits naturally; the greeting service announces them when their label is added to `announce_camera_labels`.
+
+**Third-party deps** — `aiomqtt>=2.3.0,<3.0.0` (asyncio-native; v2-only because v1→v2 was a breaking API change and v3 hasn't shipped). HTTP via `httpx` (already a Gilbert core dep).
 
 ---
 
