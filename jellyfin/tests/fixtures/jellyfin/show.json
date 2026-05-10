@@ -1,0 +1,10 @@
+{
+  "Id": "show-id-1",
+  "Type": "Series",
+  "Name": "Severance",
+  "ProductionYear": 2022,
+  "OfficialRating": "TV-MA",
+  "Genres": ["Drama", "Mystery"],
+  "DateCreated": "2024-03-01T12:00:00Z",
+  "ImageTags": {"Primary": "show-primary-tag"}
+}

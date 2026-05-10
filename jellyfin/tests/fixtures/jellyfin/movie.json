@@ -1,0 +1,27 @@
+{
+  "Id": "abc-123-movie",
+  "Type": "Movie",
+  "Name": "Dune (2021)",
+  "SortName": "Dune 2021",
+  "ProductionYear": 2021,
+  "RunTimeTicks": 95400000000,
+  "Overview": "Paul Atreides arrives on Arrakis.",
+  "CommunityRating": 8.0,
+  "OfficialRating": "PG-13",
+  "Studios": [{"Name": "Legendary"}],
+  "Genres": ["Sci-Fi", "Adventure"],
+  "People": [
+    {"Name": "Denis Villeneuve", "Type": "Director"},
+    {"Name": "Timothée Chalamet", "Type": "Actor"}
+  ],
+  "DateCreated": "2024-01-15T10:00:00.0000000Z",
+  "ImageTags": {"Primary": "tag-primary"},
+  "BackdropImageTags": ["tag-backdrop"],
+  "UserData": {
+    "PlayCount": 1,
+    "Played": true,
+    "PlaybackPositionTicks": 0,
+    "LastPlayedDate": "2024-02-01T20:00:00Z"
+  },
+  "LibraryName": "Movies"
+}

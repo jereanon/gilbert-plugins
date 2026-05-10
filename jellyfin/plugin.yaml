@@ -1,0 +1,9 @@
+name: jellyfin
+version: "1.0.0"
+description: "Jellyfin Media Server library + playback backend"
+
+provides:
+  - jellyfin_media_library
+
+requires: []
+depends_on: []

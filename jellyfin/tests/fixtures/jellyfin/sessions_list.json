@@ -1,0 +1,33 @@
+[
+  {
+    "Id": "session-1",
+    "DeviceName": "Living Room TV",
+    "Client": "Jellyfin Roku",
+    "ApplicationVersion": "1.5.0",
+    "RemoteEndPoint": "10.0.0.5",
+    "SupportsRemoteControl": true,
+    "SupportedCommands": ["SeekTo", "Pause"],
+    "UserName": "alice",
+    "NowPlayingItem": {
+      "Id": "abc-123-movie",
+      "Type": "Movie",
+      "Name": "Dune (2021)",
+      "RunTimeTicks": 95400000000,
+      "ImageTags": {"Primary": "tag"},
+      "DateCreated": "2024-01-15T10:00:00Z",
+      "ProductionYear": 2021
+    },
+    "PlayState": {
+      "IsPaused": false,
+      "PositionTicks": 50000000000
+    }
+  },
+  {
+    "Id": "session-2-empty",
+    "DeviceName": "Bedroom TV",
+    "Client": "Jellyfin Web",
+    "SupportsRemoteControl": true,
+    "SupportedCommands": [],
+    "UserName": "bob"
+  }
+]
