@@ -24,6 +24,7 @@ v2." disclosure so the user can make an informed choice.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -83,6 +84,15 @@ class WithingsBackend(HealthBackend):
         self._client_secret: str = ""
         self._storage: StorageBackend | None = None
         self._public_base_url: str = ""
+        # Per-user refresh-lock: two concurrent ``_call`` paths for
+        # the same user MUST NOT both POST ``refresh_token`` to
+        # Withings (the second exchange is rejected because Withings
+        # invalidates the prior refresh token on first use, which
+        # cascades into ``HealthBackendAuthError`` and after 5
+        # consecutive failures auto-disables the user's link). The
+        # lock dict is per-instance: backend instances are singletons
+        # within the service, so the locks fan out by user_id.
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     # ── StorageAwareHealthBackend ────────────────────────────────────
 
@@ -444,12 +454,37 @@ class WithingsBackend(HealthBackend):
         path: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call a Withings endpoint, refreshing the token once on 401."""
+        """Call a Withings endpoint, refreshing the token once on 401.
+
+        The refresh path is serialized per-user via
+        ``self._refresh_locks[user_id]``: two concurrent callers
+        seeing 401 would otherwise both POST refresh_token to
+        Withings, the second exchange fails (refresh token
+        invalidated), and the user's link auto-disables after 5
+        consecutive failures.
+        """
         assert self._client is not None
         body = await self._authed_request(link, path, params)
         if body.get("status") in (401, 100, 101, 102):
             # Withings returns these codes for "token expired".
-            await self._refresh_token(link)
+            user_id = str(link.get("user_id") or "")
+            lock = self._refresh_locks.setdefault(user_id, asyncio.Lock())
+            async with lock:
+                # Re-read the link row inside the locked section.
+                # If a sibling caller already refreshed, the access
+                # token has changed and we should retry the request
+                # WITHOUT calling _refresh_token a second time.
+                stale_token = str(link.get("oauth_access_token") or "")
+                fresh = await self._reload_link(user_id)
+                if fresh is not None:
+                    fresh_token = str(fresh.get("oauth_access_token") or "")
+                    if fresh_token and fresh_token != stale_token:
+                        # Sibling refreshed — adopt the new token.
+                        link.update(fresh)
+                    else:
+                        await self._refresh_token(link)
+                else:
+                    await self._refresh_token(link)
             body = await self._authed_request(link, path, params)
             if body.get("status") not in (0,):
                 raise HealthBackendAuthError(
@@ -465,6 +500,12 @@ class WithingsBackend(HealthBackend):
                 f"withings: status={body.get('status')} error={body.get('error')}"
             )
         return body
+
+    async def _reload_link(self, user_id: str) -> dict[str, Any] | None:
+        if self._storage is None or not user_id:
+            return None
+        link_id = f"{user_id}/{self.backend_name}"
+        return await self._storage.get(_LINKS_COLLECTION, link_id)
 
     async def _authed_request(
         self,

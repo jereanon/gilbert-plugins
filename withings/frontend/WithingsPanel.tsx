@@ -29,6 +29,11 @@ interface ConnectResult {
 export function WithingsPanel(): JSX.Element {
   const [link, setLink] = useState<LinkRow | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
+  // Disable Connect until the operator has set ``gilbert.public_base_url``.
+  // Without it, the OAuth callback URL can't be built and clicking
+  // Connect would land the user on a Withings page that immediately
+  // errors back. Spec §12.2 wants the friction at the button level.
+  const [hasPublicBaseUrl, setHasPublicBaseUrl] = useState<boolean>(true);
 
   useEffect(() => {
     fetch("/api/health/me/links", { credentials: "include" })
@@ -36,6 +41,17 @@ export function WithingsPanel(): JSX.Element {
       .then((data) => {
         const rows = (data?.items ?? []) as LinkRow[];
         setLink(rows.find((r) => r.backend_name === "withings") ?? null);
+      });
+    fetch("/api/health/me/config", { credentials: "include" })
+      .then((r) => r.json())
+      .then((data) => {
+        setHasPublicBaseUrl(!!data?.has_public_base_url);
+      })
+      .catch(() => {
+        // Network error — leave hasPublicBaseUrl truthy so the UX
+        // doesn't dead-lock. The server-side check will catch any
+        // actual misconfiguration.
+        setHasPublicBaseUrl(true);
       });
   }, []);
 
@@ -117,14 +133,25 @@ export function WithingsPanel(): JSX.Element {
         <div className="space-y-2">
           <button
             onClick={handleConnect}
-            disabled={busy}
-            className="px-3 py-2 bg-primary text-primary-foreground rounded"
+            disabled={busy || !hasPublicBaseUrl}
+            className="px-3 py-2 bg-primary text-primary-foreground rounded disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {busy ? "Starting..." : "Connect Withings"}
           </button>
+          {!hasPublicBaseUrl && (
+            <div className="text-xs p-2 bg-orange-50 border border-orange-200 rounded">
+              <strong>Connect disabled.</strong>{" "}
+              <code>gilbert.public_base_url</code> isn't set — an
+              admin needs to configure it in{" "}
+              <a href="/system" className="underline">
+                /system
+              </a>{" "}
+              before Withings can be connected.
+            </div>
+          )}
           <p className="text-xs text-muted-foreground">
-            Admin precondition: ``gilbert.public_base_url`` must be
-            set in /system before users can connect, AND the
+            Admin precondition: <code>gilbert.public_base_url</code>{" "}
+            must be set in /system before users can connect, AND the
             callback URL{" "}
             <code>
               &lt;public_base_url&gt;/api/health/me/oauth/withings/callback
