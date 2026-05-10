@@ -247,10 +247,13 @@ def test_runtime_dependencies_empty() -> None:
 # ── Per-user lock concurrency ─────────────────────────────────────
 
 
-async def test_per_home_user_lock_serializes_same_user_only() -> None:
-    """Two concurrent calls for the same Home user share one token
-    fetch (per-user lock); two concurrent calls for *different* Home
-    users do not serialize.
+async def test_per_home_user_lock_does_not_serialize_across_users() -> None:
+    """Two concurrent calls for *different* Home users must run in
+    parallel (each gets its own per-user lock; the outer dict-guard
+    lock is released as soon as the per-user lock is acquired).
+
+    The same-user-serializes half lives in
+    ``test_per_home_user_lock_serializes_same_user`` below.
     """
     backend = PlexBackend()
     backend._account_token = "fake"
@@ -344,6 +347,85 @@ async def test_per_home_user_lock_serializes_same_user_only() -> None:
         assert {c[1] for c in call_log} == {"uA", "uB"}
         assert backend._user_tokens["uA"] == "token_uA"
         assert backend._user_tokens["uB"] == "token_uB"
+    finally:
+        ps_mod.PlexServer = original_ctor  # type: ignore[assignment]
+
+
+async def test_per_home_user_lock_serializes_same_user() -> None:
+    """Two concurrent ``_get_user_server("uA")`` calls must serialize:
+    the second waits for the first to populate the cache, then returns
+    the cached server. The underlying ``account.user("uA").get_token``
+    must be called *exactly once* — not twice.
+    """
+    backend = PlexBackend()
+    backend._account_token = "fake"
+    backend._machine_id = "srv-mach-id"
+
+    fake_server = MagicMock()
+    fake_server.machineIdentifier = "srv-mach-id"
+    fake_server.url = "http://fake.local"
+    backend._server = fake_server
+
+    fake_account = MagicMock()
+    backend._account = fake_account
+
+    from threading import Event as _ThreadEvent
+
+    # account.user("uA") returns the same mock both times so we can
+    # observe call counts on the SAME object.
+    user_obj = MagicMock()
+    proceed = _ThreadEvent()
+    call_log: list[str] = []
+
+    def _get_token(machine_id: str) -> str:
+        call_log.append("get_token")
+        # Block the first call until the test releases it; the second
+        # call (if the lock serializes correctly) never reaches here
+        # because the cache hit returns first.
+        proceed.wait()
+        return "token_uA"
+
+    user_obj.get_token = _get_token
+    fake_account.user = MagicMock(return_value=user_obj)
+
+    server_ctor_calls: list[str] = []
+
+    def _fake_plex_server_ctor(url: str, token: str = "") -> Any:
+        server_ctor_calls.append(token)
+        s = MagicMock()
+        s.url = url
+        s.machineIdentifier = "srv-mach-id"
+        return s
+
+    import plexapi.server as ps_mod
+
+    original_ctor = ps_mod.PlexServer
+    ps_mod.PlexServer = _fake_plex_server_ctor  # type: ignore[assignment]
+    try:
+        async def _call() -> Any:
+            return await backend._get_user_server("uA")
+
+        task1 = asyncio.create_task(_call())
+        task2 = asyncio.create_task(_call())
+        # Yield a few times so both tasks reach the lock; the first
+        # acquires it and blocks inside the to_thread get_token call.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Only ONE call into get_token should be in flight — the second
+        # task is waiting on the per-user lock.
+        assert call_log == ["get_token"]
+        # Release the first call.
+        proceed.set()
+        result1 = await task1
+        result2 = await task2
+        # Cache hit: the second call returned the cached server; no
+        # extra get_token call.
+        assert call_log == ["get_token"]
+        assert fake_account.user.call_count == 1
+        # Both calls returned the SAME server instance (cached).
+        assert result1 is result2
+        # PlexServer constructor only called once for that token.
+        assert server_ctor_calls == ["token_uA"]
     finally:
         ps_mod.PlexServer = original_ctor  # type: ignore[assignment]
 
