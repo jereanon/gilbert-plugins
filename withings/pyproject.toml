@@ -1,0 +1,14 @@
+[project]
+name = "gilbert-plugin-withings"
+version = "1.0.0"
+description = "Withings OAuth pull backend for Gilbert"
+requires-python = ">=3.12"
+dependencies = [
+    # OAuth + REST client. Already in core; declared explicitly for
+    # plugin-isolation correctness.
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+

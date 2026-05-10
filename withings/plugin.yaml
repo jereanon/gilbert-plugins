@@ -1,0 +1,11 @@
+name: withings
+version: "1.0.0"
+description: "Withings Public Cloud OAuth pull backend (sleep, weight, BP, HR)"
+
+provides:
+  - withings_health
+
+requires: []
+
+depends_on: []
+
