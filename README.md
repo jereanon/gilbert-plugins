@@ -38,6 +38,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"`, `TaskBackend "google_tasks"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge / Productivity |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
+| [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
@@ -439,6 +440,54 @@ Multiplayer music guessing game managed by the AI. The AI picks a track, plays a
 - `hint_threshold` — Seconds remaining before a hint drops (default `10.0`).
 
 **No third-party Python dependencies.**
+
+---
+
+### jellyfin
+
+Jellyfin Media Server backend for the core `MediaLibraryService`.
+Talks to Jellyfin's REST API directly via `httpx` (the official
+`jellyfin-apiclient-python` is partially synchronous and missing some
+endpoints — REST is well documented and stable).
+
+**Backend registered**
+- `MediaLibraryBackend.backend_name = "jellyfin"`. All six capability
+  flags set to `True`: `now_playing`, `resume`, `continue_watching`,
+  `recently_added`, `seek`, `per_user`, `next_episode`.
+
+**Slash commands** — provided by the core `MediaLibraryService`
+(`/media …`), not by this plugin.
+
+**Configure** (Settings → Media → Media library, with the `jellyfin`
+backend enabled)
+- `server_url` — Base URL (e.g. `http://jellyfin.local:8096`).
+- `admin_username` — Admin username (used to bootstrap the device
+  token; required only at link time).
+- `admin_password` *(sensitive)* — Cleared after `link_account`
+  unless `keep_password` is true.
+- `keep_password` — Default False.
+- `device_id` — Auto-generated stable identifier in
+  `X-Emby-Authorization`.
+- `access_token` *(sensitive)* — Auto-populated by `link_account`.
+- `verify_tls` — Default True.
+- `request_timeout_seconds` — Default 15.0.
+
+**Config actions** — `link_account` (POST
+`/Users/AuthenticateByName`, persists token, clears `admin_password`
+unless `keep_password=true`), `test_connection`
+(`GET /System/Info?api_key=…`).
+
+**OS-level prerequisites** — none. `runtime_dependencies()` returns
+`[]`.
+
+**Notes** — v1 uses **admin token + `userId` query/path parameter**
+for per-user data. Each per-user query is logged on the Jellyfin
+server's audit trail as the admin user — accepted v1 limitation
+(per-user-token minting is v2 work). Username → user-id resolution
+caches by the *Jellyfin* username (NOT by Gilbert user id) so two
+Gilbert users mapped to the same Jellyfin username share the
+resolved id by definition. Token at-rest encryption is inherited
+tech debt; v1 mandates `0600` on `.gilbert/gilbert.db`.
 
 ---
 

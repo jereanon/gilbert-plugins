@@ -1,0 +1,10 @@
+{
+  "Id": "track-id-1",
+  "Type": "Audio",
+  "Name": "Easy on Me",
+  "RunTimeTicks": 2250000000,
+  "ParentId": "album-id-1",
+  "SeasonName": "30",
+  "SeriesName": "Adele",
+  "DateCreated": "2021-11-01T00:00:00Z"
+}

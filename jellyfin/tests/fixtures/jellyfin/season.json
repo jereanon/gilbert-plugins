@@ -1,0 +1,10 @@
+{
+  "Id": "season-id-1",
+  "Type": "Season",
+  "Name": "Season 2",
+  "ParentId": "show-id-1",
+  "SeriesId": "show-id-1",
+  "SeriesName": "Severance",
+  "IndexNumber": 2,
+  "DateCreated": "2025-01-15T08:00:00Z"
+}

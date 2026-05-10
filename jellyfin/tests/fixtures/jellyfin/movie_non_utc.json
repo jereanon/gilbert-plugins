@@ -1,0 +1,8 @@
+{
+  "Id": "tz-movie",
+  "Type": "Movie",
+  "Name": "TZ Test",
+  "ProductionYear": 2024,
+  "DateCreated": "2024-06-01T10:00:00-07:00",
+  "ImageTags": {}
+}

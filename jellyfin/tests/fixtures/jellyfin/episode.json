@@ -1,0 +1,22 @@
+{
+  "Id": "episode-id-23",
+  "Type": "Episode",
+  "Name": "Cold Harbor",
+  "RunTimeTicks": 30000000000,
+  "Overview": "Mark and his team confront refinement secrets.",
+  "ParentId": "season-id-1",
+  "SeasonId": "season-id-1",
+  "SeasonName": "Season 2",
+  "SeriesId": "show-id-1",
+  "SeriesName": "Severance",
+  "ParentIndexNumber": 2,
+  "IndexNumber": 3,
+  "DateCreated": "2025-01-23T15:00:00Z",
+  "ImageTags": {"Primary": "ep-primary"},
+  "UserData": {
+    "PlayCount": 0,
+    "Played": false,
+    "PlaybackPositionTicks": 6000000000,
+    "LastPlayedDate": "2025-01-25T19:00:00Z"
+  }
+}
