@@ -1,0 +1,15 @@
+[project]
+name = "gilbert-plugin-frigate"
+version = "1.0.0"
+description = "Frigate camera/object-detection backend for Gilbert"
+requires-python = ">=3.12"
+dependencies = [
+    # asyncio-native MQTT client. v2 has a breaking-change history vs.
+    # v1 (Client kwargs + ``client.messages`` async iterator are v2
+    # shapes), and v3 hasn't shipped yet — pin major to avoid
+    # speculative breakage.
+    "aiomqtt>=2.3.0,<3.0.0",
+]
+
+[tool.uv]
+package = false
