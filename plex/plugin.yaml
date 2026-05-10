@@ -1,0 +1,9 @@
+name: plex
+version: "1.0.0"
+description: "Plex Media Server library + playback backend"
+
+provides:
+  - plex_media_library
+
+requires: []
+depends_on: []

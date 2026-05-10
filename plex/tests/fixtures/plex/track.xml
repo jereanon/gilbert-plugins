@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="1">
+  <Track ratingKey="50003" key="/library/metadata/50003" type="track"
+         title="Easy on Me" titleSort="Easy on Me"
+         duration="225000"
+         parentRatingKey="50002" parentTitle="30"
+         grandparentRatingKey="50001" grandparentTitle="Adele"
+         index="1" parentIndex="1"
+         addedAt="1640000000"
+         librarySectionTitle="Music"/>
+</MediaContainer>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MediaContainer size="1">
+  <Directory ratingKey="50002" key="/library/metadata/50002" type="album"
+             title="30" titleSort="Adele 30"
+             year="2021"
+             parentRatingKey="50001" parentTitle="Adele"
+             addedAt="1640000000"
+             librarySectionTitle="Music">
+    <Genre tag="Pop"/>
+  </Directory>
+</MediaContainer>

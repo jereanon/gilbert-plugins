@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Plex server in a non-UTC TZ — addedAt is UNIX seconds (always UTC), but
+some older fixtures have addedAt expressed as a local string. This
+fixture asserts that ``_plex_to_media_item`` normalizes the result to
+UTC seconds at the mapping boundary. The integer 1700000000 is the same
+moment regardless of server TZ (2023-11-14 22:13:20 UTC).
+-->
+<MediaContainer size="1">
+  <Video ratingKey="99999" key="/library/metadata/99999" type="movie"
+         title="TZ Test"
+         year="2023"
+         addedAt="1700000000"
+         librarySectionTitle="Movies"/>
+</MediaContainer>
