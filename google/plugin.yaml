@@ -1,6 +1,6 @@
 name: google
 version: "1.0.0"
-description: "Google integration suite — OAuth auth, Workspace directory, Gmail, Google Drive documents, and Google Calendar"
+description: "Google integration suite — OAuth auth, Workspace directory, Gmail, Google Drive documents, Google Calendar, and Google Tasks"
 
 provides:
   - google_auth
@@ -8,6 +8,7 @@ provides:
   - gmail
   - google_drive
   - google_calendar
+  - google_tasks
 
 requires: []
 
