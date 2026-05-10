@@ -1,15 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-Plex server in a non-UTC TZ — addedAt is UNIX seconds (always UTC), but
-some older fixtures have addedAt expressed as a local string. This
-fixture asserts that ``_plex_to_media_item`` normalizes the result to
-UTC seconds at the mapping boundary. The integer 1700000000 is the same
-moment regardless of server TZ (2023-11-14 22:13:20 UTC).
+Plex server reports ``addedAt`` as a plexapi-parsed ``datetime`` in some
+response shapes (notably the historic /library/sections/<id>/recentlyAdded
+path on older servers). When that datetime is in a non-UTC offset, the
+mapping helper MUST normalize to UTC unix seconds before handing the
+value off to the service. This fixture exercises that branch — see
+``test_plex_to_media_item_normalizes_non_utc_addedat``.
+
+The ISO-8601 string ``2024-06-01T10:00:00-07:00`` corresponds to
+``2024-06-01T17:00:00+00:00`` (UTC) → unix 1717261200.
 -->
 <MediaContainer size="1">
   <Video ratingKey="99999" key="/library/metadata/99999" type="movie"
          title="TZ Test"
          year="2023"
-         addedAt="1700000000"
+         addedAt="2024-06-01T10:00:00-07:00"
          librarySectionTitle="Movies"/>
 </MediaContainer>

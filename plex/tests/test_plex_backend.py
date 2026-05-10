@@ -74,10 +74,23 @@ def _load_fixture(name: str) -> _AttrObj:
         "parentIndex",
     ):
         if int_field in attrs:
+            raw = attrs[int_field]
             try:
-                setattr(obj, int_field, int(attrs[int_field]))
+                setattr(obj, int_field, int(raw))
             except ValueError:
-                setattr(obj, int_field, attrs[int_field])
+                # Some fixtures encode timestamps as ISO-8601 to
+                # exercise the ``_utc_seconds_from_addedat`` datetime
+                # branch. Parse to a tz-aware ``datetime`` so the
+                # non-UTC normalization path actually runs.
+                if int_field in ("addedAt", "lastViewedAt"):
+                    try:
+                        # ``datetime.fromisoformat`` handles "+HH:MM"
+                        # offsets natively in 3.11+.
+                        setattr(obj, int_field, _dt.datetime.fromisoformat(raw))
+                    except ValueError:
+                        setattr(obj, int_field, raw)
+                else:
+                    setattr(obj, int_field, raw)
             del attrs[int_field]
     for float_field in ("rating",):
         if float_field in attrs:
@@ -212,18 +225,36 @@ def test_plex_to_media_item_track() -> None:
 def test_plex_to_media_item_normalizes_non_utc_addedat() -> None:
     """Server timezone normalization — addedAt is UTC unix seconds at
     the mapping boundary regardless of how the server reports it.
+
+    The fixture's ``addedAt="2024-06-01T10:00:00-07:00"`` is parsed
+    as a tz-aware datetime by the loader, so the mapping helper hits
+    the ``isinstance(value, datetime)`` branch and normalizes the
+    -07:00 offset to UTC.
     """
     obj = _load_fixture("movie_non_utc.xml")
     item = _plex_to_media_item(obj, server_id="srv-1")
-    # 1700000000 unix → 2023-11-14 22:13:20 UTC, regardless of TZ.
-    assert item.added_at == 1700000000.0
+    # 2024-06-01T10:00:00-07:00 → 2024-06-01T17:00:00+00:00 → 1717261200.
+    expected_utc = _dt.datetime(
+        2024, 6, 1, 17, 0, 0, tzinfo=_dt.UTC
+    ).timestamp()
+    assert item.added_at == expected_utc
 
-    # And a datetime-shaped addedAt with non-UTC tz should also
-    # normalize.
-    naive_local = _dt.datetime(2024, 6, 1, 10, 0, 0, tzinfo=_dt.timezone(_dt.timedelta(hours=-7)))
-    seconds = _utc_seconds_from_addedat(naive_local)
-    expected = naive_local.astimezone(_dt.UTC).timestamp()
-    assert seconds == expected
+    # Direct unit test of the helper — naive datetime is treated as
+    # UTC (mirrors the integer ``addedAt`` path).
+    naive = _dt.datetime(2024, 6, 1, 17, 0, 0)
+    assert (
+        _utc_seconds_from_addedat(naive)
+        == naive.replace(tzinfo=_dt.UTC).timestamp()
+    )
+
+    # And a tz-aware datetime in a different offset normalizes.
+    aware_pdt = _dt.datetime(
+        2024, 6, 1, 10, 0, 0, tzinfo=_dt.timezone(_dt.timedelta(hours=-7))
+    )
+    assert (
+        _utc_seconds_from_addedat(aware_pdt)
+        == aware_pdt.astimezone(_dt.UTC).timestamp()
+    )
 
 
 # ── Capability flags ──────────────────────────────────────────────
@@ -493,6 +524,44 @@ async def test_search_translates_filters_and_normalizes() -> None:
     assert kwargs.get("limit") == 5
 
 
+async def test_search_filters_year_range_and_library_section() -> None:
+    """Spec §8.8: ``library_section``, ``year_from``, ``year_to``
+    translate to a post-fetch filter on the plexapi result list. The
+    backend applies the kind / limit kwargs to plexapi and then prunes
+    the returned items by year range and library section.
+    """
+    backend = PlexBackend()
+    # Three returned items: one in-range, one too old, one wrong section.
+    movie = _load_fixture("movie.xml")  # "Dune: Part Two" (2024) Movies
+    # Synthesize two more — same fixture but different year/section.
+    too_old = _load_fixture("movie.xml")
+    too_old.year = 2009
+    wrong_section = _load_fixture("movie.xml")
+    wrong_section.librarySectionTitle = "Documentaries"
+
+    fake_server = MagicMock()
+    fake_server.machineIdentifier = "srv-1"
+    fake_server.search.return_value = [movie, too_old, wrong_section]
+    backend._server = fake_server
+    backend._account_token = "tok"
+
+    from gilbert.interfaces.media_library import MediaSearchFilters
+
+    out = await backend.search(
+        "dune",
+        filters=MediaSearchFilters(
+            kinds=(MediaKind.MOVIE,),
+            library_section="Movies",
+            year_from=2010,
+            year_to=2030,
+            limit=10,
+        ),
+    )
+    assert len(out) == 1
+    assert out[0].year == 2024
+    assert out[0].library_section == "Movies"
+
+
 async def test_unauthorized_flips_health_and_evicts_user() -> None:
     """A 401 (Unauthorized) raised by plexapi must translate to
     ``MediaLibraryUnavailableError`` AND evict the per-Home-user cache.
@@ -602,6 +671,75 @@ async def test_play_companion_path() -> None:
     fake_client_obj.playMedia.assert_called_once_with(
         fake_item, offset=12000
     )
+
+
+async def test_play_remote_path_uses_clients_playmedia_endpoint() -> None:
+    """Spec §8.8: when the companion path (``Client.playMedia``) fails,
+    the backend falls through to ``POST /clients/<id>/playMedia``.
+    """
+    backend = PlexBackend()
+    backend._account_token = "tok"
+    backend._server_url = "http://plex.local:32400"
+
+    fake_item = MagicMock()
+    fake_item.key = "/library/metadata/12345"
+
+    fake_server = MagicMock()
+    # Companion path fails — forces the httpx fallback.
+    from plexapi.exceptions import PlexApiException
+
+    fake_server.client.side_effect = PlexApiException("offline companion")
+    fake_server.fetchItem.return_value = fake_item
+    fake_server.machineIdentifier = "srv-1"
+    fake_server.address = "10.0.0.1"
+    fake_server.port = 32400
+    backend._server = fake_server
+
+    # Capture the httpx POST.
+    posted: dict[str, Any] = {}
+
+    class _FakeResp:
+        def raise_for_status(self) -> None:
+            pass
+
+    class _FakeHttp:
+        async def post(
+            self, url: str, *, params: dict[str, Any], headers: dict[str, Any]
+        ) -> _FakeResp:
+            posted["url"] = url
+            posted["params"] = params
+            posted["headers"] = headers
+            return _FakeResp()
+
+    backend._http = _FakeHttp()  # type: ignore[assignment]
+
+    item = MediaItem(
+        id="12345",
+        backend_name="plex",
+        server_id="srv-1",
+        title="Dune",
+        kind=MediaKind.MOVIE,
+    )
+    from gilbert.interfaces.media_library import MediaClient
+
+    client = MediaClient(
+        client_id="dev-1",
+        backend_name="plex",
+        server_id="srv-1",
+        name="TV",
+    )
+    cmd = MediaPlayCommand(item=item, client=client, offset_seconds=12.0)
+    await backend.play(cmd)
+
+    # POST /clients/<id>/playMedia with the expected query params.
+    assert posted["url"] == "http://plex.local:32400/clients/dev-1/playMedia"
+    params = posted["params"]
+    assert params["key"] == "/library/metadata/12345"
+    assert params["machineIdentifier"] == "srv-1"
+    assert params["offset"] == 12000
+    # Token rides in the header (not the URL) so log redaction can
+    # actually find it.
+    assert posted["headers"]["X-Plex-Token"] == "tok"
 
 
 async def test_next_episode_returns_on_deck() -> None:
