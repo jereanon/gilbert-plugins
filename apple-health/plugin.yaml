@@ -1,0 +1,11 @@
+name: apple-health
+version: "1.0.0"
+description: "Apple Health (HealthKit) push backend via iOS Shortcut webhook"
+
+provides:
+  - apple_health
+
+requires: []
+
+depends_on: []
+

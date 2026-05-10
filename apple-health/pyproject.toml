@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-apple-health"
+version = "1.0.0"
+description = "Apple Health webhook backend for Gilbert"
+requires-python = ">=3.12"
+# No third-party deps — payload parsing is stdlib JSON.
+dependencies = []
+
+[tool.uv]
+package = false
+
