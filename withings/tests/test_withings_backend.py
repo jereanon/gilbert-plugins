@@ -7,14 +7,13 @@ fine for manual QA but isn't guaranteed deterministic enough for CI.
 
 from __future__ import annotations
 
-import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import pytest
-
 from gilbert_plugin_withings.withings_backend import WithingsBackend
+
 from gilbert.interfaces.health import (
     HealthBackend,
     HealthBackendAuthError,
@@ -22,12 +21,9 @@ from gilbert.interfaces.health import (
     StorageAwareHealthBackend,
 )
 from gilbert.interfaces.storage import (
-    Filter,
-    FilterOp,
     Query,
     StorageBackend,
 )
-
 
 # ── Fakes ────────────────────────────────────────────────────────────
 
@@ -317,7 +313,7 @@ async def test_sync_refreshes_on_401_and_retries() -> None:
     assert link["oauth_access_token"] == "atk-2"
 
 
-async def test_sync_persistent_auth_failure_raises_HealthBackendAuthError() -> None:
+async def test_sync_persistent_auth_failure_raises_HealthBackendAuthError() -> None:  # noqa: N802
     storage = _DictStorage()
     await storage.put(
         "health_links",

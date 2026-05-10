@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from gilbert_plugin_apple_health.apple_health_backend import (
     AppleHealthBackend,
 )
+
 from gilbert.interfaces.health import HealthBackend, MetricType
 
 

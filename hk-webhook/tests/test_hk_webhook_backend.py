@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from gilbert_plugin_hk_webhook.hk_webhook_backend import HKWebhookBackend
+
 from gilbert.interfaces.health import HealthBackend, MetricType
 
 

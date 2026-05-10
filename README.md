@@ -27,6 +27,7 @@ The table below is an index — jump to each plugin's detail section for configu
 |---|---|---|---|
 | [american-standard](#american-standard) | `ThermostatBackend "american-standard"` | `nexia` | Climate |
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
+| [apple-health](#apple-health) | `HealthBackend "apple-health"` | — (pure stdlib) | Health |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
@@ -38,6 +39,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"`, `TaskBackend "google_tasks"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge / Productivity |
 | [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
+| [hk-webhook](#hk-webhook) | `HealthBackend "hk-webhook"` | — (pure stdlib) | Health |
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
@@ -57,6 +59,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [telegram](#telegram) | `PushNotificationBackend "telegram"` | — (uses `httpx`) | Notifications |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
+| [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
 ---
@@ -109,6 +112,28 @@ Claude-powered AI chat and vision backends, speaking the Anthropic Messages API 
 **Streaming.** The chat backend implements `generate_stream` over SSE — `AIService` forwards each text chunk as a `chat.stream.text_delta` event on the bus, plus `chat.stream.round_complete` after every AI round and `chat.stream.turn_complete` at the end. The WS layer delivers them to the conversation's audience (owner for personal chats, members for shared rooms). The frontend's `TurnBubble` builds a live "thinking card" inside the in-flight turn from those events plus `chat.tool.started` / `chat.tool.completed`, and commits to the authoritative round structure when the `chat.message.send` RPC resolves with the server's `rounds` field. All Anthropic-specific SSE parsing stays inside `anthropic_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
 
 **Config action** — `test_connection`: issues a one-token completion to verify credentials.
+
+---
+
+### apple-health
+
+Push-style ingestion of Apple HealthKit data via an iOS Shortcut. Translates HealthKit identifier names (e.g. `HKQuantityTypeIdentifierStepCount`) to Gilbert's `MetricType` enum via a fixed mapping table; identifiers without a match drop with an INFO log (so adding support for a new metric is a one-line table edit).
+
+**Backend registered**
+- `HealthBackend.backend_name = "apple-health"` — `supports_push = True`, `supports_pull = False`. Per spec §4.5 the `extra` whitelist allows exactly two keys: `device` (HKDevice.name) and `source_app` (HKSource.name). Every other key in the payload's `extra` dict is silently stripped before storage.
+
+**Slash commands** — provided by the core `health` service, not by this plugin directly. See the [`/health` slash family](#health-slash-commands).
+
+**Configure** — none. Apple Health is push-only: per-user state lives entirely on the `health_links` row written by the per-user `Generate / rotate webhook URL` button in the account panel.
+
+**Frontend panel** (`account.extensions` slot)
+- Failure-mode disclosure (iOS Background App Refresh + lock-state realities) above the install button so users know what they're signing up for.
+- "Install our Shortcut" link + SHA-256 hash of the bundled iCloud Shortcut for supply-chain verification (paranoid users compare; the placeholder hash is populated on each Shortcut release).
+- Webhook URL display on rotation — raw token shown ONCE; only its SHA-256 hash is persisted.
+- Last-delivery indicator so a silently-broken automation is visible.
+- Manual setup fallback for users who can't / won't use the prebuilt Shortcut.
+
+**Third-party deps** — none (pure stdlib JSON parsing).
 
 ---
 
@@ -440,6 +465,35 @@ Multiplayer music guessing game managed by the AI. The AI picks a track, plays a
 - `hint_threshold` — Seconds remaining before a hint drops (default `10.0`).
 
 **No third-party Python dependencies.**
+
+---
+
+### hk-webhook
+
+Generic catch-all health-data webhook backend. Use it from any source — iOS Shortcut, Home Assistant automation, Garmin Connect IQ widget, custom Python script, anything that can POST JSON. Same payload shape as `apple-health` but without the HealthKit-identifier translation step (callers send `MetricType` enum values directly).
+
+**Backend registered**
+- `HealthBackend.backend_name = "hk-webhook"` — `supports_push = True`, `supports_pull = False`. Per spec §4.5 the backend declares NO `extra` whitelist; every key in the payload's `extra` dict is silently stripped. The back-channel for caller metadata is `source_event_id`, NOT arbitrary string blobs.
+
+**Payload shape** — accepts three top-level forms (all per-item shapes are identical):
+
+```json
+{"metrics": [{"type": "steps", "value": 8431, "unit": "count", "recorded_at": "2026-05-09T07:00:00+00:00"}]}
+```
+
+Or a top-level array:
+
+```json
+[{"type": "weight", "value": 80.5, "unit": "kg", "recorded_at": "2026-05-09T07:00:00+00:00"}]
+```
+
+Or a single object. Unknown metric types drop with an INFO log line; malformed timestamps / values drop with DEBUG so one bad metric doesn't break the whole batch.
+
+**Frontend panel** (`account.extensions` slot)
+- Generate / rotate webhook URL button (raw token shown ONCE; only its SHA-256 hash is persisted).
+- Copy-paste curl + Python snippets for non-iOS users.
+
+**Third-party deps** — none (pure stdlib JSON parsing).
 
 ---
 
@@ -979,6 +1033,35 @@ The doorbell backend uses a flat config pointing at Protect:
 **Config action** — `test_connection`: pings each configured subsystem and reports status.
 
 **No third-party Python dependencies** — all UniFi APIs are spoken via `httpx`/`aiohttp`.
+
+---
+
+### withings
+
+Withings Public Cloud OAuth pull backend. Syncs sleep, weight, blood pressure, body composition, and heart rate from a connected Withings account every 6 hours by default. Per-user OAuth state lives on the per-user `health_links` row written by the connect flow; global `client_id` / `client_secret` come from the backend's config.
+
+**Backend registered**
+- `HealthBackend.backend_name = "withings"` — `supports_pull = True`, `supports_push = False`. Satisfies the `StorageAwareHealthBackend` protocol so `HealthService` injects raw storage + `gilbert.public_base_url` before `initialize`. Per spec §4.5 the `extra` whitelist allows `device_model_id`, `measure_grpid`, and `attrib`.
+
+**Admin precondition**
+- `gilbert.public_base_url` MUST be set in core settings before users can connect — Withings's developer dashboard requires a fixed `redirect_uri` registered ahead of time. The required callback shape is `<public_base_url>/api/health/me/oauth/withings/callback`. The backend's `begin_link` returns a `LinkStartResult(status="error", ...)` if `public_base_url` is unset, so users never start an OAuth flow that's guaranteed to fail at the redirect step.
+
+**Configure** (Settings → Personal Data → Health, with the `withings` backend section)
+- `client_id` *(sensitive)* — Withings developer-app client ID. Register the app at <https://developer.withings.com/>.
+- `client_secret` *(sensitive)* — Withings developer-app client secret.
+
+Per-user `oauth_*` tokens live on `health_links` rows (NOT in `backend_config_params`), and per spec §6.4 they are stored **plaintext in v1** — the SPA panel surfaces a "Tokens stored unencrypted on this Gilbert instance until v2." disclosure so the user can make an informed choice. Webhook tokens (apple-health / hk-webhook) are already hash-at-rest; OAuth refresh tokens cannot be hashed (we have to send them back to Withings on refresh) so they need a different posture. v2 ships Fernet sealed to the OS keychain.
+
+**Token refresh** — automatic on 401 (Withings access tokens last ~3h, refresh tokens are long-lived). The backend retries the request once after a successful refresh; a 401 on the refresh raises `HealthBackendAuthError` so the service surfaces a "reconnect" prompt and (after 5 consecutive auth failures) auto-disables the link row.
+
+**Disconnect revokes upstream** — `WithingsBackend.disconnect(user_id)` overrides the default and calls `POST https://wbsapi.withings.net/v2/oauth2?action=revoke` with the user's access token BEFORE the local `health_links` row is dropped. Revocation failure logs WARN but does NOT block local cleanup — the user's "I disconnected" intent must succeed locally even when Withings is unreachable. Right-to-delete also calls `disconnect` for every linked OAuth backend before the cascade, so revocation happens automatically.
+
+**Frontend panel** (`account.extensions` slot)
+- Connect / Disconnect / Sync-now buttons.
+- Disabled Connect when `gilbert.public_base_url` is unset, with an explainer pointing the admin at `/system`.
+- The "Tokens stored unencrypted on this Gilbert instance until v2." disclosure.
+
+**Third-party deps** — `httpx>=0.27` (already in core; declared explicitly for plugin-isolation correctness).
 
 ---
 
