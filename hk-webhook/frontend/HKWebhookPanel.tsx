@@ -25,7 +25,7 @@ interface LinkRow {
   supports_webhook: boolean;
 }
 
-export function HKWebhookPanel(): JSX.Element {
+export function HKWebhookPanel() {
   const { rpc } = useWebSocket();
   const [webhookUrl, setWebhookUrl] = useState<string>("");
   const [rotating, setRotating] = useState<boolean>(false);

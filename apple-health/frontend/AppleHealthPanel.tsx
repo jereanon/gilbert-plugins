@@ -50,7 +50,7 @@ function _formatRelative(iso: string): string {
   return `${Math.floor(hours / 24)} day${Math.floor(hours / 24) === 1 ? "" : "s"} ago`;
 }
 
-export function AppleHealthPanel(): JSX.Element {
+export function AppleHealthPanel() {
   const [webhookUrl, setWebhookUrl] = useState<string>("");
   const [link, setLink] = useState<LinkRow | null>(null);
   const [rotating, setRotating] = useState<boolean>(false);

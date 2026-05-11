@@ -26,7 +26,7 @@ interface ConnectResult {
   open_url?: string;
 }
 
-export function WithingsPanel(): JSX.Element {
+export function WithingsPanel() {
   const [link, setLink] = useState<LinkRow | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
   // Disable Connect until the operator has set ``gilbert.public_base_url``.
