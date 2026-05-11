@@ -8,6 +8,7 @@ UserService can automatically sync external users into the local store.
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from gilbert.interfaces.configuration import (
@@ -17,6 +18,8 @@ from gilbert.interfaces.configuration import (
 )
 from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.users import ExternalUser, UserProviderBackend
+
+from ._google_retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +90,8 @@ class GoogleDirectoryBackend(UserProviderBackend):
                 ),
             )
         try:
-            response = await asyncio.to_thread(
-                self._directory.users()
-                .list(
-                    domain=self._domain,
-                    maxResults=1,
-                )
-                .execute,
+            response = await self._call(
+                lambda svc: svc.users().list(domain=self._domain, maxResults=1)
             )
         except Exception as exc:
             return ConfigActionResult(
@@ -112,6 +110,7 @@ class GoogleDirectoryBackend(UserProviderBackend):
     def __init__(self) -> None:
         self._domain: str = ""
         self._directory: Any = None
+        self._creds: Any = None  # cached so we can rebuild after stale-socket errors
         self._cached_users: list[ExternalUser] | None = None
         self._cached_groups: list[dict[str, Any]] | None = None
 
@@ -127,8 +126,6 @@ class GoogleDirectoryBackend(UserProviderBackend):
         try:
             sa_info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
 
-            from googleapiclient.discovery import build
-
             from google.oauth2 import service_account
 
             scopes = [
@@ -141,20 +138,44 @@ class GoogleDirectoryBackend(UserProviderBackend):
             )
             if delegated_user:
                 creds = creds.with_subject(delegated_user)
+            self._creds = creds
 
-            self._directory = await asyncio.to_thread(
-                build,
-                "admin",
-                "directory_v1",
-                credentials=creds,
-            )
+            self._directory = await asyncio.to_thread(self._build_service)
             logger.info("Google Directory backend initialized (domain=%s)", self._domain or "(any)")
         except Exception:
             logger.exception("Failed to initialize Google Directory backend")
 
     async def close(self) -> None:
+        self._directory = None
+        self._creds = None
         self._cached_users = None
         self._cached_groups = None
+
+    def _build_service(self) -> Any:
+        from googleapiclient.discovery import build
+
+        return build("admin", "directory_v1", credentials=self._creds)
+
+    def _ensure_service(self) -> Any:
+        if self._directory is None:
+            raise RuntimeError("Google Directory backend not initialized")
+        return self._directory
+
+    async def _rebuild_service(self) -> None:
+        if self._creds is None:
+            raise RuntimeError(
+                "Google Directory backend has no cached credentials to rebuild the service"
+            )
+        self._directory = await asyncio.to_thread(self._build_service)
+
+    async def _call(self, build_call: Callable[[Any], Any]) -> Any:
+        """Run a Directory API call with one-shot retry on stale connections."""
+        return await call_with_retry(
+            get_service=self._ensure_service,
+            rebuild=self._rebuild_service,
+            build_call=build_call,
+            name="Directory",
+        )
 
     # --- UserProviderBackend ---
 
@@ -214,15 +235,20 @@ class GoogleDirectoryBackend(UserProviderBackend):
             return []
 
         users: list[ExternalUser] = []
-        request = self._directory.users().list(
-            domain=self._domain,
-            maxResults=500,
-            orderBy="email",
-            projection="full",
-        )
+        page_token: str | None = None
 
-        while request is not None:
-            response = await asyncio.to_thread(request.execute)
+        while True:
+            kwargs: dict[str, Any] = {
+                "domain": self._domain,
+                "maxResults": 500,
+                "orderBy": "email",
+                "projection": "full",
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = await self._call(
+                lambda svc, kw=kwargs: svc.users().list(**kw)
+            )
 
             for u in response.get("users", []):
                 if u.get("suspended", False):
@@ -276,10 +302,9 @@ class GoogleDirectoryBackend(UserProviderBackend):
                     )
                 )
 
-            request = self._directory.users().list_next(
-                previous_request=request,
-                previous_response=response,
-            )
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
 
         return users
 
@@ -288,13 +313,15 @@ class GoogleDirectoryBackend(UserProviderBackend):
             return []
 
         groups: list[dict[str, Any]] = []
-        request = self._directory.groups().list(
-            domain=self._domain,
-            maxResults=200,
-        )
+        page_token: str | None = None
 
-        while request is not None:
-            response = await asyncio.to_thread(request.execute)
+        while True:
+            kwargs: dict[str, Any] = {"domain": self._domain, "maxResults": 200}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = await self._call(
+                lambda svc, kw=kwargs: svc.groups().list(**kw)
+            )
 
             for g in response.get("groups", []):
                 group_info: dict[str, Any] = {
@@ -306,27 +333,30 @@ class GoogleDirectoryBackend(UserProviderBackend):
                 }
 
                 try:
-                    mem_req = self._directory.members().list(
-                        groupKey=g.get("email", ""),
-                        maxResults=500,
-                    )
-                    while mem_req is not None:
-                        mem_resp = await asyncio.to_thread(mem_req.execute)
+                    mem_page_token: str | None = None
+                    while True:
+                        mem_kwargs: dict[str, Any] = {
+                            "groupKey": g.get("email", ""),
+                            "maxResults": 500,
+                        }
+                        if mem_page_token:
+                            mem_kwargs["pageToken"] = mem_page_token
+                        mem_resp = await self._call(
+                            lambda svc, kw=mem_kwargs: svc.members().list(**kw)
+                        )
                         for m in mem_resp.get("members", []):
                             group_info["members"].append(m.get("email", ""))
-                        mem_req = self._directory.members().list_next(
-                            previous_request=mem_req,
-                            previous_response=mem_resp,
-                        )
+                        mem_page_token = mem_resp.get("nextPageToken")
+                        if not mem_page_token:
+                            break
                 except Exception:
                     logger.debug("Could not list members for group %s", g.get("email"))
 
                 groups.append(group_info)
 
-            request = self._directory.groups().list_next(
-                previous_request=request,
-                previous_response=response,
-            )
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
 
         return groups
 

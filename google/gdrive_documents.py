@@ -3,7 +3,7 @@
 import asyncio
 import io
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from gilbert.interfaces.configuration import ConfigParam
@@ -14,6 +14,8 @@ from gilbert.interfaces.knowledge import (
     DocumentType,
 )
 from gilbert.interfaces.tools import ToolParameterType
+
+from ._google_retry import call_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +126,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         self._name = name
         self._folder_id: str = ""
         self._drive: Any = None
+        self._creds: Any = None  # cached so we can rebuild after stale-socket errors
         self._file_cache: dict[str, dict[str, Any]] = {}
         # path → folder_id cache for directory navigation
         self._folder_id_cache: dict[str, str] = {}
@@ -150,8 +153,6 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         if sa_json:
             try:
                 sa_info = _json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-                from googleapiclient.discovery import build
-
                 from google.oauth2 import service_account
 
                 scopes = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -161,13 +162,9 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 )
                 if delegated_user:
                     creds = creds.with_subject(delegated_user)
+                self._creds = creds
 
-                self._drive = await asyncio.to_thread(
-                    build,
-                    "drive",
-                    "v3",
-                    credentials=creds,
-                )
+                self._drive = await asyncio.to_thread(self._build_service)
             except Exception:
                 logger.exception("Failed to initialize Google Drive backend '%s'", self._name)
                 return
@@ -183,7 +180,40 @@ class GoogleDriveDocumentBackend(DocumentBackend):
 
     async def close(self) -> None:
         self._drive = None
+        self._creds = None
         self._file_cache.clear()
+
+    def _build_service(self) -> Any:
+        from googleapiclient.discovery import build
+
+        return build("drive", "v3", credentials=self._creds)
+
+    def _ensure_service(self) -> Any:
+        if self._drive is None:
+            raise RuntimeError("Google Drive backend not initialized")
+        return self._drive
+
+    async def _rebuild_service(self) -> None:
+        if self._creds is None:
+            raise RuntimeError(
+                "Google Drive backend has no cached credentials to rebuild the service"
+            )
+        self._drive = await asyncio.to_thread(self._build_service)
+
+    async def _call(self, build_call: Callable[[Any], Any]) -> Any:
+        """Run a Drive API call with one-shot retry on stale connections.
+
+        See ``_google_retry.call_with_retry`` for the retry policy. The
+        Drive call sites already swallow exceptions and continue, so we
+        don't translate transport failures into a domain-specific error
+        here — just let the second attempt's exception (if any) bubble.
+        """
+        return await call_with_retry(
+            get_service=self._ensure_service,
+            rebuild=self._rebuild_service,
+            build_call=build_call,
+            name="Drive",
+        )
 
     def _is_google_native(self, mime: str) -> bool:
         return mime in _EXPORT_MAP
@@ -227,7 +257,9 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 kwargs["pageToken"] = page_token
             try:
                 async with self._api_lock:
-                    result = await asyncio.to_thread(self._drive.files().list(**kwargs).execute)
+                    result = await self._call(
+                        lambda svc, kw=kwargs: svc.files().list(**kw)
+                    )
             except Exception:
                 logger.warning("Drive API error listing folder %s", folder_id, exc_info=True)
                 return
@@ -313,7 +345,9 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 kwargs["pageToken"] = page_token
             try:
                 async with self._api_lock:
-                    result = await asyncio.to_thread(self._drive.files().list(**kwargs).execute)
+                    result = await self._call(
+                        lambda svc, kw=kwargs: svc.files().list(**kw)
+                    )
             except Exception:
                 logger.warning("Drive API error listing children at %s", path, exc_info=True)
                 return []
@@ -383,16 +417,14 @@ class GoogleDriveDocumentBackend(DocumentBackend):
             q = f"'{current_id}' in parents and name = '{part}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             try:
                 async with self._api_lock:
-                    result = await asyncio.to_thread(
-                        self._drive.files()
-                        .list(
+                    result = await self._call(
+                        lambda svc, q=q: svc.files().list(
                             q=q,
                             fields="files(id)",
                             pageSize=1,
                             includeItemsFromAllDrives=True,
                             supportsAllDrives=True,
                         )
-                        .execute
                     )
                 files = result.get("files", [])
                 if not files:
@@ -489,7 +521,9 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         kwargs["supportsAllDrives"] = True
 
         async with self._api_lock:
-            result = await asyncio.to_thread(self._drive.files().create(**kwargs).execute)
+            result = await self._call(
+                lambda svc, kw=kwargs: svc.files().create(**kw)
+            )
         self._file_cache[result["name"]] = result
         logger.info("Uploaded to Drive: %s", path)
         return self._file_to_meta(result)
@@ -506,7 +540,7 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         kwargs["supportsAllDrives"] = True
 
         async with self._api_lock:
-            await asyncio.to_thread(self._drive.files().delete(**kwargs).execute)
+            await self._call(lambda svc, kw=kwargs: svc.files().delete(**kw))
         self._file_cache.pop(path, None)
 
     async def stream_document(self, path: str) -> AsyncIterator[bytes]:

@@ -11,6 +11,7 @@ import base64
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -21,8 +22,20 @@ from gilbert.interfaces.configuration import (
     ConfigActionResult,
     ConfigParam,
 )
-from gilbert.interfaces.email import EmailAddress, EmailAttachment, EmailBackend, EmailMessage
+from gilbert.interfaces.email import (
+    EmailAddress,
+    EmailAttachment,
+    EmailBackend,
+    EmailMessage,
+    TransientEmailError,
+)
 from gilbert.interfaces.tools import ToolParameterType
+
+from ._google_retry import (
+    TRANSIENT_TRANSPORT_EXCS,
+    call_with_retry,
+    is_transient_http_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +106,7 @@ class GmailBackend(EmailBackend):
                 ),
             )
         try:
-            profile = await asyncio.to_thread(
-                self._service.users().getProfile(userId="me").execute,
-            )
+            profile = await self._call(lambda svc: svc.users().getProfile(userId="me"))
         except Exception as exc:
             return ConfigActionResult(
                 status="error",
@@ -111,6 +122,7 @@ class GmailBackend(EmailBackend):
     def __init__(self) -> None:
         self._email_address: str = ""
         self._service: Any = None  # gmail API resource
+        self._creds: Any = None  # cached credentials so we can rebuild _service
 
     async def initialize(self, config: dict[str, Any] | None = None) -> None:
         if config is None:
@@ -131,8 +143,6 @@ class GmailBackend(EmailBackend):
             return
 
         try:
-            from googleapiclient.discovery import build
-
             from google.oauth2 import service_account
 
             scopes = [
@@ -145,29 +155,68 @@ class GmailBackend(EmailBackend):
             )
             if delegated_user:
                 creds = creds.with_subject(delegated_user)
+            self._creds = creds
 
-            self._service = await asyncio.to_thread(
-                build,
-                "gmail",
-                "v1",
-                credentials=creds,
-            )
+            self._service = await asyncio.to_thread(self._build_service)
             logger.info("Gmail backend initialized (email=%s)", self._email_address)
         except Exception:
             logger.exception("Failed to initialize Gmail backend")
 
     async def close(self) -> None:
         self._service = None
+        self._creds = None
 
     def _ensure_service(self) -> Any:
         if self._service is None:
             raise RuntimeError("Gmail backend not initialized — check service_account_json config")
         return self._service
 
+    def _build_service(self) -> Any:
+        """Construct a fresh Gmail API service from cached creds.
+
+        Used both at initialize time and to recover from stale-connection
+        errors. Runs synchronously — call via ``asyncio.to_thread``.
+        """
+        from googleapiclient.discovery import build
+
+        return build("gmail", "v1", credentials=self._creds)
+
+    async def _rebuild_service(self) -> None:
+        """Replace ``self._service`` after a transport error so a follow-up
+        call gets a fresh ``httplib2.Http`` (and therefore a fresh TLS socket).
+        Tests can patch this to install a new fake service.
+        """
+        if self._creds is None:
+            raise RuntimeError(
+                "Gmail backend has no cached credentials to rebuild the service"
+            )
+        self._service = await asyncio.to_thread(self._build_service)
+
+    async def _call(self, build_call: Callable[[Any], Any]) -> Any:
+        """Run a Gmail API call with one-shot retry on stale connections,
+        translating still-failing transport errors and transient HTTP
+        responses (429/5xx) into ``TransientEmailError`` so the outbox
+        flusher can back off and re-queue.
+        """
+        try:
+            return await call_with_retry(
+                get_service=self._ensure_service,
+                rebuild=self._rebuild_service,
+                build_call=build_call,
+                name="Gmail",
+            )
+        except TRANSIENT_TRANSPORT_EXCS as exc:
+            raise TransientEmailError(
+                f"Gmail transport failure after rebuild + retry: {exc}"
+            ) from exc
+        except Exception as exc:
+            if is_transient_http_error(exc):
+                raise TransientEmailError(str(exc)) from exc
+            raise
+
     # --- Fetch ---
 
     async def list_message_ids(self, query: str = "", max_results: int = 100) -> list[str]:
-        svc = self._ensure_service()
         q = query or "in:inbox OR in:sent"
 
         ids: list[str] = []
@@ -182,8 +231,8 @@ class GmailBackend(EmailBackend):
             if page_token:
                 params["pageToken"] = page_token
 
-            result = await asyncio.to_thread(
-                svc.users().messages().list(**params).execute,
+            result = await self._call(
+                lambda svc, params=params: svc.users().messages().list(**params)
             )
             for m in result.get("messages", []):
                 ids.append(m["id"])
@@ -195,12 +244,14 @@ class GmailBackend(EmailBackend):
         return ids
 
     async def get_message(self, message_id: str) -> EmailMessage | None:
-        svc = self._ensure_service()
-
         try:
-            data = await asyncio.to_thread(
-                svc.users().messages().get(userId="me", id=message_id, format="full").execute,
+            data = await self._call(
+                lambda svc: svc.users()
+                .messages()
+                .get(userId="me", id=message_id, format="full")
             )
+        except TransientEmailError:
+            raise
         except Exception:
             logger.warning("Failed to fetch message %s", message_id, exc_info=True)
             return None
@@ -244,7 +295,7 @@ class GmailBackend(EmailBackend):
         reply_to: EmailAddress | None = None,
         from_name: str = "",
     ) -> str:
-        svc = self._ensure_service()
+        self._ensure_service()
 
         if attachments:
             msg = MIMEMultipart("mixed")
@@ -289,20 +340,18 @@ class GmailBackend(EmailBackend):
         if thread_id:
             send_body["threadId"] = thread_id
 
-        result = await asyncio.to_thread(
-            svc.users().messages().send(userId="me", body=send_body).execute,
+        result = await self._call(
+            lambda svc: svc.users().messages().send(userId="me", body=send_body)
         )
         return result.get("id", "")
 
     # --- Mark ---
 
     async def mark_read(self, message_id: str) -> None:
-        svc = self._ensure_service()
-        await asyncio.to_thread(
-            svc.users()
+        await self._call(
+            lambda svc: svc.users()
             .messages()
             .modify(userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]})
-            .execute,
         )
 
 
