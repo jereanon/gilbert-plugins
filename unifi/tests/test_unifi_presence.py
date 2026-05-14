@@ -312,6 +312,12 @@ class TestConfig:
         assert config.presence.poll_interval_seconds == 30
 
     def test_presence_full(self) -> None:
+        """Backend-specific keys (unifi_network, device_person_map, …)
+        are NOT in core's typed PresenceConfig schema — they pass
+        through ``BaseConfig.extra="allow"`` as raw dict values, and
+        each backend reads what it needs from the section dict at
+        initialize() time. The test asserts the round-trip rather
+        than dot-typed access."""
         raw = {
             "presence": {
                 "enabled": True,
@@ -334,11 +340,23 @@ class TestConfig:
         }
         config = GilbertConfig.model_validate(raw)
         assert config.presence.enabled is True
-        assert config.presence.unifi_network.host == "https://192.168.1.1"
-        assert config.presence.unifi_protect.verify_ssl is True
-        assert config.presence.device_person_map["aa:bb:cc:dd:ee:ff"] == "brian"
-        assert config.presence.zone_aliases["shop"] == ["warehouse", "bay"]
-        assert config.presence.face_lookback_minutes == 15
+        assert config.presence.backend == "unifi"
+        assert config.presence.poll_interval_seconds == 15
+
+        # Backend-specific extras flow through pydantic's model_extra.
+        extras = config.presence.model_extra or {}
+        assert extras["unifi_network"]["host"] == "https://192.168.1.1"
+        assert extras["unifi_protect"]["verify_ssl"] is True
+        assert extras["device_person_map"]["aa:bb:cc:dd:ee:ff"] == "brian"
+        assert extras["zone_aliases"]["shop"] == ["warehouse", "bay"]
+        assert extras["face_lookback_minutes"] == 15
+        assert extras["badge_lookback_hours"] == 12
+
+        # And model_dump round-trips everything so the entity-store
+        # write / read path preserves backend-specific keys too.
+        dumped = config.presence.model_dump()
+        assert dumped["unifi_network"]["host"] == "https://192.168.1.1"
+        assert dumped["face_lookback_minutes"] == 15
 
 
 # =============================================================================
