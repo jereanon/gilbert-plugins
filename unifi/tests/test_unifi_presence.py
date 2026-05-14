@@ -101,6 +101,7 @@ def backend() -> UniFiPresenceBackend:
     b._access = AsyncMock(spec=UniFiAccess)
     # Default: empty results
     b._network.get_people_on_network = AsyncMock(return_value={})
+    b._network.get_all_resolved_wireless_clients = AsyncMock(return_value={})
     b._protect.get_face_detections = AsyncMock(return_value=[])
     b._access.get_badge_events = AsyncMock(return_value=[])
     # Pre-populate name resolver with test users so signals resolve
@@ -513,7 +514,9 @@ class TestObservations:
         backend._protect.get_face_detections = AsyncMock(
             return_value=[_face("Ghost-Face")]
         )
-        backend._network.get_people_on_network = AsyncMock(
+        # The mapping path uses get_all_resolved_wireless_clients
+        # (no phone filter) — mock that one for observation tests.
+        backend._network.get_all_resolved_wireless_clients = AsyncMock(
             return_value=_wifi("Some Unknown Person")
         )
 

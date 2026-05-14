@@ -439,14 +439,17 @@ class UniFiPresenceBackend(PresenceBackend):
 
         Used by the presence service's mapping UI to surface every
         identifiable thing the backend has detected, regardless of
-        whether a user mapping exists for it yet. Pulls from the same
-        signal-gathering helpers ``get_all_presence`` uses, so an
-        unmapped face / badge / wifi name shows up here on the next
-        poll after first sighting.
+        whether a user mapping exists for it yet.
+
+        Note: the wifi path here uses ``_get_wifi_observations`` which
+        skips the phone-only filter so admins can map tablets,
+        laptops, watches, etc. The auto-presence path
+        (``get_all_presence``) keeps the phone filter so a random
+        laptop on the network doesn't mark someone present.
         """
         badge_signals, wifi_signals, face_signals = await asyncio.gather(
             self._get_badge_signals(),
-            self._get_wifi_signals(),
+            self._get_wifi_observations(),
             self._get_face_signals(),
             return_exceptions=False,
         )
@@ -573,6 +576,31 @@ class UniFiPresenceBackend(PresenceBackend):
             for person, clients in people.items():
                 if clients:
                     # Use the most recent last_seen
+                    best = max(clients, key=lambda c: c.last_seen)
+                    result[person] = _WifiSignal(
+                        since=best.last_seen,
+                        device_name=best.device_name or best.hostname,
+                    )
+            return result
+        except (UniFiConnectionError, UniFiAuthError, UniFiAPIError) as e:
+            logger.warning("UniFi Network unavailable: %s", e)
+            return {}
+
+    async def _get_wifi_observations(self) -> dict[str, _WifiSignal]:
+        """Wifi signals for the mapping screen — no phone-only filter.
+
+        Pulls every wireless client with a resolved person. The
+        mapping screen wants visibility into tablets, laptops, etc.
+        too so admins can map them; only the auto-presence loop
+        restricts to phones.
+        """
+        if self._network is None:
+            return {}
+        try:
+            people = await self._network.get_all_resolved_wireless_clients()
+            result: dict[str, _WifiSignal] = {}
+            for person, clients in people.items():
+                if clients:
                     best = max(clients, key=lambda c: c.last_seen)
                     result[person] = _WifiSignal(
                         since=best.last_seen,
