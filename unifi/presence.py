@@ -13,6 +13,7 @@ from gilbert.interfaces.configuration import (
 )
 from gilbert.interfaces.presence import (
     PresenceBackend,
+    PresenceObservation,
     PresenceState,
     UserPresence,
 )
@@ -135,6 +136,14 @@ class UniFiPresenceBackend(PresenceBackend):
             ),
         ]
 
+    # Stable backend identifiers reported on PresenceObservation rows.
+    # The presence service composes these with the raw "thing" id when
+    # building the mapping pivot key, so renaming a value here breaks
+    # already-saved mappings — change deliberately.
+    _BACKEND_ACCESS: str = "unifi:access"
+    _BACKEND_PROTECT: str = "unifi:protect"
+    _BACKEND_NETWORK: str = "unifi:network"
+
     def __init__(self) -> None:
         self._clients: dict[str, UniFiClient] = {}
         self._network: UniFiNetwork | None = None
@@ -144,6 +153,17 @@ class UniFiPresenceBackend(PresenceBackend):
         self._face_lookback_minutes: int = 30
         self._badge_lookback_hours: int = 24
         self._name_resolver: NameResolver = NameResolver()
+        # Per-source admin-asserted thing→user mappings. Populated by
+        # the presence service via ``apply_thing_mappings`` whenever
+        # the mapping UI changes. Keys are the per-backend ``thing_id``
+        # (the raw name as observed); values are user_ids. Only
+        # non-empty user_ids are stored — clearing a mapping just
+        # removes the entry so the fuzzy resolver takes over again.
+        self._thing_overrides: dict[str, dict[str, str]] = {
+            self._BACKEND_ACCESS: {},
+            self._BACKEND_PROTECT: {},
+            self._BACKEND_NETWORK: {},
+        }
 
     async def initialize(self, config: dict[str, object]) -> None:
         dpm = config.get("device_person_map", {}) or {}
@@ -341,11 +361,15 @@ class UniFiPresenceBackend(PresenceBackend):
         # Multiple raw names may resolve to the same user (e.g., "Brian" and "Brian Dilley").
         user_signals: dict[str, dict[str, Any]] = {}  # user_id → {badge, face, wifi}
 
-        def _try_resolve(raw_name: str) -> str | None:
-            """Resolve a raw name to a user_id. Returns None if unresolved."""
-            resolved = self._name_resolver.resolve(raw_name)
-            if resolved:
-                uid = resolved.user_id
+        def _try_resolve(source: str, raw_name: str) -> str | None:
+            """Resolve a raw name to a user_id, preferring admin-asserted
+            overrides from the mapping UI before falling back to the
+            fuzzy ``NameResolver``. Returns None if neither succeeds."""
+            uid = self._thing_overrides.get(source, {}).get(raw_name)
+            if not uid:
+                resolved = self._name_resolver.resolve(raw_name)
+                uid = resolved.user_id if resolved else None
+            if uid:
                 if uid not in user_signals:
                     user_signals[uid] = {}
                 return uid
@@ -353,17 +377,17 @@ class UniFiPresenceBackend(PresenceBackend):
             return None
 
         for raw_name, signal in badge_signals.items():
-            uid = _try_resolve(raw_name)
+            uid = _try_resolve(self._BACKEND_ACCESS, raw_name)
             if uid is not None and "badge" not in user_signals[uid]:
                 user_signals[uid]["badge"] = signal
 
         for raw_name, signal in face_signals.items():
-            uid = _try_resolve(raw_name)
+            uid = _try_resolve(self._BACKEND_PROTECT, raw_name)
             if uid is not None and "face" not in user_signals[uid]:
                 user_signals[uid]["face"] = signal
 
         for raw_name, signal in wifi_signals.items():
-            uid = _try_resolve(raw_name)
+            uid = _try_resolve(self._BACKEND_NETWORK, raw_name)
             if uid is not None and "wifi" not in user_signals[uid]:
                 user_signals[uid]["wifi"] = signal
 
@@ -409,6 +433,96 @@ class UniFiPresenceBackend(PresenceBackend):
     async def list_tracked_users(self) -> list[str]:
         all_presence = await self.get_all_presence()
         return [p.user_id for p in all_presence]
+
+    async def get_observations(self) -> list[PresenceObservation]:
+        """Emit one observation per raw name each subsystem has seen.
+
+        Used by the presence service's mapping UI to surface every
+        identifiable thing the backend has detected, regardless of
+        whether a user mapping exists for it yet. Pulls from the same
+        signal-gathering helpers ``get_all_presence`` uses, so an
+        unmapped face / badge / wifi name shows up here on the next
+        poll after first sighting.
+        """
+        badge_signals, wifi_signals, face_signals = await asyncio.gather(
+            self._get_badge_signals(),
+            self._get_wifi_signals(),
+            self._get_face_signals(),
+            return_exceptions=False,
+        )
+
+        observations: list[PresenceObservation] = []
+
+        for raw_name, signal in badge_signals.items():
+            observations.append(
+                PresenceObservation(
+                    backend=self._BACKEND_ACCESS,
+                    thing_id=raw_name,
+                    label=raw_name,
+                    kind="badge",
+                    first_seen=signal.since,
+                    last_seen=signal.since,
+                )
+            )
+
+        for raw_name, signal in face_signals.items():
+            observations.append(
+                PresenceObservation(
+                    backend=self._BACKEND_PROTECT,
+                    thing_id=raw_name,
+                    label=raw_name,
+                    kind="face",
+                    first_seen=signal.since,
+                    last_seen=signal.since,
+                )
+            )
+
+        for raw_name, signal in wifi_signals.items():
+            observations.append(
+                PresenceObservation(
+                    backend=self._BACKEND_NETWORK,
+                    thing_id=raw_name,
+                    label=signal.device_name or raw_name,
+                    kind="wifi",
+                    first_seen=signal.since,
+                    last_seen=signal.since,
+                )
+            )
+
+        return observations
+
+    async def apply_thing_mappings(self, mappings: dict[str, str]) -> None:
+        """Adopt admin-edited mappings from the presence service.
+
+        Keys are ``"{backend}:{thing_id}"`` strings (e.g. ``"unifi:protect:Brian D"``);
+        the colon delimiter inside the backend name means we have to be
+        careful splitting — the first two components are the backend,
+        the rest is the thing_id. Empty user_id removes the override so
+        the fuzzy NameResolver takes over again on the next poll.
+        """
+        new_overrides: dict[str, dict[str, str]] = {
+            self._BACKEND_ACCESS: {},
+            self._BACKEND_PROTECT: {},
+            self._BACKEND_NETWORK: {},
+        }
+        for key, user_id in mappings.items():
+            if not user_id:
+                continue
+            # Backend names have the form "unifi:<subsystem>"; the
+            # thing_id is whatever follows after the second colon.
+            parts = key.split(":", 2)
+            if len(parts) < 3:
+                continue
+            backend = f"{parts[0]}:{parts[1]}"
+            thing_id = parts[2]
+            if backend in new_overrides:
+                new_overrides[backend][thing_id] = user_id
+        self._thing_overrides = new_overrides
+        # Bust the fuzzy-resolver's cache: a thing that used to fall
+        # through to fuzzy may now be authoritatively mapped (or vice
+        # versa), and the cached ResolvedUser would lock in the old
+        # answer until the cache TTL'd naturally.
+        self._name_resolver._cache.clear()
 
     # --- Signal gathering (each isolated for error tolerance) ---
 

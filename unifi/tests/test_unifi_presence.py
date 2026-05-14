@@ -493,3 +493,102 @@ class TestUtils:
 
     def test_epoch_ms_zero(self) -> None:
         assert _epoch_ms_to_iso(0) == ""
+
+
+# =============================================================================
+# Phase B: observation emission + mapping overrides
+# =============================================================================
+
+
+class TestObservations:
+    async def test_get_observations_emits_one_per_subsystem(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """Each raw name from each subsystem becomes a PresenceObservation
+        regardless of whether it resolves to a user — that's the whole
+        point of the mapping screen."""
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[_badge("Brian", "in")]
+        )
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Ghost-Face")]
+        )
+        backend._network.get_people_on_network = AsyncMock(
+            return_value=_wifi("Some Unknown Person")
+        )
+
+        observations = await backend.get_observations()
+        backends_seen = {obs.backend for obs in observations}
+        thing_ids = {(obs.backend, obs.thing_id) for obs in observations}
+
+        assert backends_seen == {
+            backend._BACKEND_ACCESS,
+            backend._BACKEND_PROTECT,
+            backend._BACKEND_NETWORK,
+        }
+        assert (backend._BACKEND_PROTECT, "Ghost-Face") in thing_ids
+        assert (backend._BACKEND_NETWORK, "Some Unknown Person") in thing_ids
+
+    async def test_apply_thing_mappings_routes_signals_to_admin_choice(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """An admin-asserted mapping wins over the fuzzy NameResolver
+        — the next get_all_presence cycle emits a UserPresence with
+        the admin-chosen user_id even when fuzzy resolution would
+        have picked a different one (or nothing at all)."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Mystery Person")]
+        )
+
+        # Default fuzzy resolver doesn't know "Mystery Person" — without
+        # a mapping, the signal is silently dropped.
+        result = await backend.get_all_presence()
+        assert result == []
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Mystery Person": "brian"},
+        )
+
+        result = await backend.get_all_presence()
+        assert len(result) == 1
+        assert result[0].user_id == "brian"
+
+    async def test_apply_thing_mappings_unmap_falls_back_to_fuzzy(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """Unmapping (passing an empty user_id) drops the override so
+        the fuzzy NameResolver gets to try again on the next poll."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Brian")]
+        )
+
+        # Map to the wrong user, then unmap.
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": "dale"},
+        )
+        result = await backend.get_all_presence()
+        assert result[0].user_id == "dale"
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": ""},
+        )
+        result = await backend.get_all_presence()
+        # Fuzzy resolver matches "Brian" → user "brian" again.
+        assert result[0].user_id == "brian"
+
+    async def test_apply_thing_mappings_clears_resolver_cache(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """A cached fuzzy resolution must not lock in stale ownership
+        when the admin pushes a new mapping."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Brian")]
+        )
+        # Prime the resolver cache with the fuzzy "Brian" → "brian" answer.
+        await backend.get_all_presence()
+        assert "brian" in {k.lower() for k in backend._name_resolver._cache}
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": "dale"},
+        )
+        assert backend._name_resolver._cache == {}
