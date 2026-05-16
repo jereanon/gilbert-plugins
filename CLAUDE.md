@@ -281,61 +281,13 @@ Treat README drift the same way you treat stale memories: a regression to be fix
 
 Before committing a change that touches any `plugin.yaml`, `plugin.py`, or `config_params()` method, re-read the corresponding README section and confirm it's still accurate. A commit that changes plugin behavior without updating the README is incomplete.
 
-## Agent Memory System
+## Deep-Dive Plugin Docs
 
-Claude AI agents working in this repo use a file-based memory system at `.claude/memory/` to retain knowledge about plugins, their internals, and their gotchas across conversations — the same system Gilbert's main repo uses.
-
-### How it works
-
-1. **Index file:** `.claude/memory/MEMORIES.md` is a flat index of all memories, one per line, each a markdown link to a detailed memory file. The index is the only file Claude loads by default.
-2. **Memory files:** `.claude/memory/memory-<slug>.md` — detailed notes on a specific plugin, integration gotcha, or design decision.
-3. **Loading on demand:** When working on a task, check the index. If a relevant memory exists, read the full file. Always mention in the terminal when you're loading a memory (e.g., "Loading memory: guess-that-song").
-
-### Keeping memories current
-
-**This is not optional.** Memories are how future Claude sessions understand this repo. Treat them like documentation that matters.
-
-- **Create** a memory after designing a non-trivial new plugin or making a significant architectural decision (e.g. "unifi intra-plugin relative imports broke on `submodule_search_locations=[]`").
-- **Update** a memory when the plugin changes in a way that makes the memory stale — new fields, renamed classes, changed behavior, new gotchas.
-- **Remove** a memory when the plugin is deleted or replaced. Stale memories are worse than no memories.
-- **Before every commit in this repo**, review any memories touched by the change. Update stale memories, delete obsolete ones, create new ones for anything significant.
-- After learning something **non-obvious** about a third-party API, a test harness quirk, or a packaging edge case, capture it.
-
-### Memory file format
-
-```markdown
-# <Title>
-
-## Summary
-One or two sentences describing what this is.
-
-## Details
-Detailed information — interfaces used, configuration, how it connects to the
-rest of the system, design decisions, gotchas, test harness surprises, etc.
-
-## Related
-- Links to related memory files or source paths
-```
-
-### Index format (`.claude/memory/MEMORIES.md`)
-
-```markdown
-# Memories
-
-- [Guess That Song Plugin](memory-guess-that-song.md) — multiplayer music guessing game, UI blocks, AI-mediated
-- [UniFi Relative Import Gotcha](memory-unifi-relative-imports.md) — spec_from_file_location + submodule_search_locations=[] breaks intra-plugin relative imports
-```
-
-### Rules
-
-- Keep the index concise — one line per memory, under 120 characters.
-- Memory file names use `memory-<slug>.md` with kebab-case slugs.
-- Don't dump entire source files into memories. Capture the *knowledge* — what it is, why it exists, how it fits together, what surprised you.
-- Always keep `MEMORIES.md` in sync when creating, renaming, or deleting memory files.
+Non-obvious plugin design rationale and gotchas (e.g. the SMAPI-over-SOAP bridge for Spotify-on-Sonos, browser plugin's Docker fallback model) live in `docs/architecture/`. Read on demand when working on that plugin; `ls docs/architecture/` to browse. When a doc drifts from the code, fix it in the same change that caused the drift.
 
 ## Privacy
 
-**Never put private or personal information in tracked files.** This includes plugin source code, `plugin.yaml` examples, README text, and `.claude/memory/` files. API keys, personal email addresses, voice IDs, device names that identify people — none of that goes into commits. If you need an example in a doc, use obvious placeholders (`sk-ant-…`, `xoxb-…`, `example@example.com`).
+**Never put private or personal information in tracked files.** This includes plugin source code, `plugin.yaml` examples, and README text. API keys, personal email addresses, voice IDs, device names that identify people — none of that goes into commits. If you need an example in a doc, use obvious placeholders (`sk-ant-…`, `xoxb-…`, `example@example.com`).
 
 ## Existing Plugins
 
