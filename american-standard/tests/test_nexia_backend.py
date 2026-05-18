@@ -233,6 +233,11 @@ async def test_initialize_without_credentials_is_noop(fake_nexia: type[_FakeHome
 async def test_initialize_with_credentials_logs_in(fake_nexia: type[_FakeHome]) -> None:
     backend = NexiaThermostatBackend()
     await backend.initialize({"username": "u@x", "password": "p", "brand": "nexia"})
+    # initialize() now backgrounds the connect so Gilbert startup isn't
+    # blocked behind the Nexia cloud login. Await the warmup task
+    # before asserting state.
+    assert backend._warmup_task is not None
+    await backend._warmup_task
     assert backend._home is not None
     assert _FakeHome.login_called == 1
     # update() is called once during initialize() too, to populate state.
@@ -244,6 +249,9 @@ async def test_initialize_with_credentials_logs_in(fake_nexia: type[_FakeHome]) 
 async def test_close_releases_session(fake_nexia: type[_FakeHome]) -> None:
     backend = NexiaThermostatBackend()
     await backend.initialize({"username": "u@x", "password": "p"})
+    # Wait for the backgrounded connect so ``_session`` is populated.
+    assert backend._warmup_task is not None
+    await backend._warmup_task
     session = backend._session
     await backend.close()
     assert backend._home is None

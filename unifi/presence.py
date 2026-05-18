@@ -166,6 +166,8 @@ class UniFiPresenceBackend(PresenceBackend):
         }
 
     async def initialize(self, config: dict[str, object]) -> None:
+        from gilbert.interfaces.service import background_warmup
+
         dpm = config.get("device_person_map", {}) or {}
         self._device_person_map = dict(dpm) if isinstance(dpm, dict) else {}
         self._face_lookback_minutes = int(str(config.get("face_lookback_minutes", 30) or 30))
@@ -173,27 +175,38 @@ class UniFiPresenceBackend(PresenceBackend):
         za = config.get("zone_aliases", {}) or {}
         zone_aliases: dict[str, list[str]] = dict(za) if isinstance(za, dict) else {}
 
-        # Initialize network controller
-        net_cfg = config.get("unifi_network", {})
-        if isinstance(net_cfg, dict) and net_cfg.get("host"):
-            client = await self._get_or_create_client(net_cfg)
-            if client:
-                self._network = UniFiNetwork(client, self._device_person_map)
-                logger.info("UniFi Network initialized (%s)", net_cfg["host"])
-
-        # Initialize protect/access controller (may be same or different host)
-        prot_cfg = config.get("unifi_protect", {})
-        if isinstance(prot_cfg, dict) and prot_cfg.get("host"):
-            client = await self._get_or_create_client(prot_cfg)
-            if client:
-                self._protect = UniFiProtect(client, zone_aliases)
-                self._access = UniFiAccess(client)
-                logger.info("UniFi Protect/Access initialized (%s)", prot_cfg["host"])
-
-        # Load user list for name resolution
+        # Background the UniFi controller logins — each ``client.login()``
+        # is an HTTPS round-trip to the controller (often slow, sometimes
+        # blocked by reverse-proxy auth). Method-level call sites already
+        # guard ``if self._network is not None`` etc., so reads that
+        # arrive before the warmup completes degrade to "not available
+        # yet" instead of blocking startup.
+        net_cfg = config.get("unifi_network", {}) if isinstance(
+            config.get("unifi_network"), dict
+        ) else {}
+        prot_cfg = config.get("unifi_protect", {}) if isinstance(
+            config.get("unifi_protect"), dict
+        ) else {}
         user_service = config.get("_user_service")
-        if user_service is not None:
-            await self._name_resolver.load_users(user_service)
+
+        async def _warmup() -> None:
+            if isinstance(net_cfg, dict) and net_cfg.get("host"):
+                client = await self._get_or_create_client(net_cfg)
+                if client:
+                    self._network = UniFiNetwork(client, self._device_person_map)
+                    logger.info("UniFi Network initialized (%s)", net_cfg["host"])
+            if isinstance(prot_cfg, dict) and prot_cfg.get("host"):
+                client = await self._get_or_create_client(prot_cfg)
+                if client:
+                    self._protect = UniFiProtect(client, zone_aliases)
+                    self._access = UniFiAccess(client)
+                    logger.info(
+                        "UniFi Protect/Access initialized (%s)", prot_cfg["host"]
+                    )
+            if user_service is not None:
+                await self._name_resolver.load_users(user_service)
+
+        background_warmup(_warmup(), name="unifi-presence-warmup", log=logger)
 
         active = []
         if self._network:

@@ -253,17 +253,29 @@ class SonosSpeaker(SpeakerBackend):
             handlers=[self._on_service_state_change],
         )
 
-        # Wait for the initial wave of advertisements so the first
-        # ``list_speakers`` call isn't empty. Callers that need to
-        # ensure discovery is complete can poll or await a longer
-        # timeout — this is just a best-effort settle.
-        await asyncio.sleep(_DISCOVERY_SETTLE_SECONDS)
+        # Discovery has now started; ``_on_service_state_change`` will
+        # populate ``self._player_metadata`` as ads arrive. The original
+        # design awaited a ``_DISCOVERY_SETTLE_SECONDS`` sleep here so
+        # the first ``list_speakers`` wasn't empty, but that pushed
+        # ~3 s onto every Gilbert startup. Background it instead — the
+        # first ``list_speakers`` call within the settle window may
+        # return a partial list, which is the price of a fast startup.
+        from gilbert.interfaces.service import background_warmup
 
-        logger.info(
-            "Sonos backend initialized — %d speaker(s) discovered in %.1fs",
-            len(self._player_metadata),
-            _DISCOVERY_SETTLE_SECONDS,
+        async def _log_initial_discovery() -> None:
+            await asyncio.sleep(_DISCOVERY_SETTLE_SECONDS)
+            logger.info(
+                "Sonos discovery settled — %d speaker(s) in %.1fs",
+                len(self._player_metadata),
+                _DISCOVERY_SETTLE_SECONDS,
+            )
+
+        background_warmup(
+            _log_initial_discovery(),
+            name="sonos-discovery-settle",
+            log=logger,
         )
+        logger.info("Sonos backend initialized — discovery running in background")
 
     async def close(self) -> None:
         """Tear down all connections + discovery."""
