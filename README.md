@@ -527,16 +527,19 @@ Vendor-neutral Chat Completions backend for endpoints that don't have a dedicate
 
 ### openwakeword
 
-Local wake-word detection using [openWakeWord](https://github.com/dscripka/openWakeWord) — ONNX-based pretrained models that ship with the `openwakeword` package. No API key, no internet access required. Audio must be 16-bit PCM at 16 kHz mono; the backend buffers incoming chunks into 80ms windows (1280 samples) for the model.
+Local wake-word detection using [openWakeWord](https://github.com/dscripka/openWakeWord) — ONNX-based models running on CPU. No API key, no internet access required. Audio must be 16-bit PCM at 16 kHz mono; the backend buffers incoming chunks into 80 ms windows (1280 samples) for the model.
 
 **Backend registered** — `WakeWordBackend.backend_name = "openwakeword"`.
+
+**Bundled "hey gilbert" model.** The plugin ships a custom-trained `hey_gilbert.onnx` model at `models/hey_gilbert.onnx`. The default `model_paths` config points at it so the backend works out of the box. Callers receive a `WakeEvent` by including `"hey_gilbert"` in their `WakeWordConfig.keywords`. On first use the openwakeword library downloads the feature-extraction models (`melspectrogram.onnx`, `embedding_model.onnx`, `silero_vad.onnx`) into its own cache directory.
 
 **No account needed** — fully local, no API key required.
 
 **Configure** (Settings → Transcription → Wake Word, with the `openwakeword` backend selected)
-- `model_paths` — Comma-separated paths to custom `.onnx` wake-word model files. Leave empty to use the bundled pretrained models (includes common wake-words like "hey jarvis", "alexa", etc.).
+- `model_paths` — Comma-separated paths to `.onnx` wake-word model files. Defaults to the bundled `hey_gilbert.onnx`. Add additional paths (or replace) to enable other wake-words. Setting this to an empty string falls back to openwakeword's library-bundled pretrained set (`hey_jarvis`, `alexa`, `hey_mycroft`, `hey_rhasspy`, `timer`, `weather`).
+- `inference_framework` — `"onnx"` (default, works on Python 3.12+) or `"tflite"` (faster on some hardware, but `tflite-runtime` has no wheels for Python 3.12+ yet).
 
-**Third-party deps** — `openwakeword>=0.6` (includes pre-built ONNX models).
+**Third-party deps** — `openwakeword>=0.6`. The bundled `hey_gilbert.onnx` weighs ~200 KB and is committed alongside the plugin.
 
 ---
 

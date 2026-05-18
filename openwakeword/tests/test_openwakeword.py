@@ -38,6 +38,37 @@ def backend():
 def test_config_params_include_model_paths(backend):
     keys = {p.key for p in backend.backend_config_params()}
     assert "model_paths" in keys
+    assert "inference_framework" in keys
+
+
+def test_bundled_hey_gilbert_model_ships_with_plugin():
+    """The custom 'hey_gilbert' ONNX model must live alongside the backend."""
+    from gilbert_plugin_openwakeword.oww_backend import _BUNDLED_HEY_GILBERT
+
+    assert _BUNDLED_HEY_GILBERT.exists(), (
+        f"bundled hey_gilbert.onnx is missing at {_BUNDLED_HEY_GILBERT}"
+    )
+    # Sanity check it isn't an empty placeholder.
+    assert _BUNDLED_HEY_GILBERT.stat().st_size > 1024
+
+
+def test_default_model_paths_points_at_bundled_model(backend):
+    """When no model_paths is configured, the bundled model is the default."""
+    from gilbert_plugin_openwakeword.oww_backend import _BUNDLED_HEY_GILBERT
+
+    param = next(p for p in backend.backend_config_params() if p.key == "model_paths")
+    assert str(_BUNDLED_HEY_GILBERT) == param.default
+
+
+@pytest.mark.asyncio
+async def test_initialize_with_default_model_paths_loads_bundled(backend):
+    """Initializing without specifying model_paths should pick up the bundled model."""
+    from gilbert_plugin_openwakeword.oww_backend import _BUNDLED_HEY_GILBERT, _default_model_paths
+
+    # Simulate the framework calling initialize with the param's default value.
+    await backend.initialize({"model_paths": _default_model_paths()})
+
+    assert backend._model_paths == [str(_BUNDLED_HEY_GILBERT)]
 
 
 def _make_fake_model_module(fake_model_instance: MagicMock) -> ModuleType:
