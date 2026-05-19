@@ -522,20 +522,18 @@ function SpeakerPickerDialog({
       }}
     >
       {/*
-        The picker has to stay usable when the user owns a lot of
-        speakers — without an explicit cap the dialog grows tall
-        enough that the Play / Cancel buttons fall off the bottom of
-        the viewport. We cap the dialog at ~50vh, give it a min-h so
-        a 1-2 speaker setup doesn't render in a sliver, and make the
-        speakers list (the only unbounded section) the scroll
-        container so the header + footer always stay visible.
-        ``flex flex-col`` overrides DialogContent's default grid
-        layout so ``flex-1 min-h-0`` works on the body.
+        Cap at 50% of viewport height so the Play / Cancel buttons
+        always sit above the fold, and shrink to content when there
+        are few speakers — no fixed min-height (a 384px min was
+        overflowing on smaller laptop viewports). ``flex flex-col``
+        overrides DialogContent's default grid so ``flex-1 min-h-0``
+        works on the inner body and the speakers list takes whatever
+        space the header + slider + footer leave behind.
       */}
       <DialogContent
         className={cn(
           "sm:max-w-md flex flex-col",
-          "max-h-[50vh] min-h-[24rem]",
+          "max-h-[50vh]",
         )}
       >
         <DialogHeader className="shrink-0">

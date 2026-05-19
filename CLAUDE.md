@@ -149,12 +149,16 @@ class FooPlugin(Plugin):
 
     def ui_routes(self) -> list[UIRoute]:
         """A full SPA page the plugin owns. Optionally synthesizes a
-        nav entry and / or a dashboard card."""
+        nav entry and / or a dashboard card. ``requires_capability``
+        gates the route on a service capability — pair it with your
+        own service's name so a toggled-off plugin's route disappears
+        from both the nav and the SPA's route table."""
         return [UIRoute(path="/foo", panel_id="foo.page",
                         label="Foo", icon="package",
                         add_to_nav=True, nav_parent_group="system",
                         show_in_dashboard=True,
-                        required_role="user")]
+                        required_role="user",
+                        requires_capability="foo")]
 
     def nav_contributions(self) -> list[NavContribution]:
         """Standalone nav items (no associated route)."""

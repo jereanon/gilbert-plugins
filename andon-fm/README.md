@@ -50,11 +50,14 @@ browser tab — the same dispatch every other audio source goes through.
 
 ## Configuration
 
+The plugin is **toggleable** — disabled by default. Enable it under
+**Settings → Services → "Andon FM"** before the `/media/andon-fm`
+nav entry, the slash commands, and the WS RPCs come online.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `true` | Turn the tuner on/off. Restart required. |
-| `default_target_speakers` | array | `["my browser"]` | Speakers used when no target is given. The magic alias `my browser` routes to the caller's own tab. |
-| `default_volume` | int | `60` | Volume 0-100 when none is specified. |
+| `default_target_speakers` | array | `["my browser"]` | Speakers pre-selected in the per-play picker dialog. The magic alias `my browser` routes to the caller's own tab. |
+| `default_volume` | int | `60` | Volume 0-100 used as the picker dialog's initial value (and for slash-command callers that omit a volume). |
 | `scraper_enabled` | bool | `true` | Refresh now-playing metadata. Disable if you only want playback. Restart required. |
 | `scrape_interval_seconds` | int | `90` | How often to poll. Blocks are usually 30-60 minutes long, so low intervals mostly waste requests. Restart required. |
 

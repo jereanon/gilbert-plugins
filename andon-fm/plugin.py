@@ -53,6 +53,10 @@ class AndonFmPlugin(Plugin):
                 ),
                 icon="radio",
                 required_role="user",
+                # Gate the route + nav entry on the service capability
+                # so disabling Andon FM under Settings → Services
+                # hides both the link in the nav and the SPA route.
+                requires_capability="andon_fm",
                 add_to_nav=True,
                 nav_parent_group="media",
             ),

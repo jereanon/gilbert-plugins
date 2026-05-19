@@ -106,8 +106,9 @@ Tune in to the four AI-hosted internet radio stations from [Andon Labs](https://
 - `andon_fm.speakers.list` — every discovered speaker (with backend + model + group), prefixed by the `my browser` virtual entry, for the picker dialog.
 - `andon_fm.play` / `andon_fm.stop` — wrap the speaker service's play / stop with the station's stream URL.
 
-**Configure** (Settings → Media → Andon FM)
-- `enabled` *(restart required)* — turn the tuner on/off. Default `true`.
+The plugin is **toggleable** — disabled by default. Enable it under **Settings → Services → "Andon FM"** before the `/media/andon-fm` nav entry, the slash commands, and the WS RPCs come online.
+
+**Configure** (Settings → Media → Andon FM, once enabled)
 - `default_target_speakers` — speakers pre-selected in the picker dialog. Default `["my browser"]` (the caller's tab). Multi-select dropdown sourced from the active speaker list. Slash-command callers (`/radio.play <station>` with no speaker) also use this list.
 - `default_volume` — default volume in the picker dialog and for slash-command callers. 0-100, default `60`.
 - `scraper_enabled` *(restart required)* — fetch each station's current programming block + listener count from `andonlabs.com/radio`. Default `true`. Disable if you only want playback (no metadata).

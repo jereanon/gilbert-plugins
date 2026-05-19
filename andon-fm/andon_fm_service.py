@@ -92,7 +92,11 @@ class AndonFmService(Service):
         config_svc = resolver.get_capability("configuration")
         if config_svc is not None and isinstance(config_svc, ConfigurationReader):
             section = config_svc.get_section_safe(self.config_namespace)
-            if not section.get("enabled", True):
+            # ``enabled`` is owned by the framework-level service
+            # toggle (Settings → Services) — default OFF to match
+            # the toggle's default. Fresh installs see the row in
+            # the Services list and opt in explicitly.
+            if not section.get("enabled", False):
                 logger.info("Andon FM disabled in settings — skipping start")
                 return
             self._apply_section(section)
@@ -140,14 +144,10 @@ class AndonFmService(Service):
         return "Media"
 
     def config_params(self) -> list[ConfigParam]:
+        # ``enabled`` is supplied automatically by the framework's
+        # service-toggle section because ``service_info().toggleable``
+        # is True; we don't redeclare it here.
         return [
-            ConfigParam(
-                key="enabled",
-                type=ToolParameterType.BOOLEAN,
-                description="Enable the Andon FM tuner.",
-                default=True,
-                restart_required=True,
-            ),
             ConfigParam(
                 key="default_target_speakers",
                 type=ToolParameterType.ARRAY,
