@@ -26,6 +26,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | Plugin | Provides | Third-party deps | Category |
 |---|---|---|---|
 | [american-standard](#american-standard) | `ThermostatBackend "american-standard"` | `nexia` | Climate |
+| [andon-fm](#andon-fm) | `andon_fm` service (AI-hosted internet radio tuner under `/media/andon-fm`) | — (uses `httpx`) | Media |
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
@@ -82,6 +83,39 @@ The plugin persists Nexia's per-account device UUID under `.gilbert/plugin-data/
 **Config action** — `test_connection`: logs in with a fresh, short-lived `aiohttp.ClientSession` and reports the discovered thermostat + zone counts.
 
 **Third-party deps** — `nexia>=2.7.0`.
+
+---
+
+### andon-fm
+
+Tune in to the four AI-hosted internet radio stations from [Andon Labs](https://andonlabs.com/radio): **Thinking Frequencies** (Claude), **OpenAIR** (GPT), **Backlink Broadcast** (Gemini), and **Grok and Roll** (Grok). Each station is a long-running agent autonomously DJing through the day — picking tracks, writing show blocks, posting on X. The plugin hands the Live365 MP3 stream URLs to Gilbert's existing speaker service, so you can listen on Sonos, the host's speakers, or a browser tab. The tuner is a full page under the **Media** nav group; pressing Play opens a dialog that lets you pick which speakers (and the volume) for that play, instead of always falling back to the configured defaults.
+
+**Service registered**
+- `andon_fm` — `Configurable` + `ToolProvider` + `WsHandlerProvider`. Resolves `speaker_control` (required), and optionally `scheduler` (for the now-playing scraper) and `event_bus` (for live UI updates).
+
+**Slash commands** (namespace `/radio.*`)
+- `/radio.list` — list the four stations with current programming block and listener count.
+- `/radio.play <station> [speakers]` — tune in. `<station>` matches name, host (Claude/GPT/Gemini/Grok), substring, or UUID; `[speakers]` defaults to `default_target_speakers` (typically the caller's browser tab).
+- `/radio.stop [speakers]` — stop Andon FM playback.
+- `/radio.now [station]` — show the current programming block for one station or all four.
+
+**Tuner page** — `UIRoute` at `/media/andon-fm`, slotted under the **Media** nav group as `andon_fm.page`. Renders one card per station with cover art, AI host chip, current block, listener count, and a Play button that opens a speaker-picker dialog (checkbox list of every discovered speaker + the `my browser` magic alias + a volume slider). Block changes stream in live via `andon_fm.now_playing.changed` events — no polling.
+
+**WebSocket RPCs**
+- `andon_fm.stations.list` / `andon_fm.now_playing.get` — catalog + cache snapshot.
+- `andon_fm.speakers.list` — every discovered speaker (with backend + model + group), prefixed by the `my browser` virtual entry, for the picker dialog.
+- `andon_fm.play` / `andon_fm.stop` — wrap the speaker service's play / stop with the station's stream URL.
+
+**Configure** (Settings → Media → Andon FM)
+- `enabled` *(restart required)* — turn the tuner on/off. Default `true`.
+- `default_target_speakers` — speakers pre-selected in the picker dialog. Default `["my browser"]` (the caller's tab). Multi-select dropdown sourced from the active speaker list. Slash-command callers (`/radio.play <station>` with no speaker) also use this list.
+- `default_volume` — default volume in the picker dialog and for slash-command callers. 0-100, default `60`.
+- `scraper_enabled` *(restart required)* — fetch each station's current programming block + listener count from `andonlabs.com/radio`. Default `true`. Disable if you only want playback (no metadata).
+- `scrape_interval_seconds` *(restart required)* — refresh interval. Default `90`.
+
+**Stations** — bundled in `stations.py`. The four UUIDs / stream URLs are pulled from the public Andon FM web player; edit that file if Andon Labs renumbers them.
+
+**Third-party deps** — none (uses `httpx` from Gilbert core).
 
 ---
 
