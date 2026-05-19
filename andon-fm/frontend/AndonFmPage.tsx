@@ -521,8 +521,24 @@ function SpeakerPickerDialog({
         if (!next) onClose();
       }}
     >
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
+      {/*
+        The picker has to stay usable when the user owns a lot of
+        speakers — without an explicit cap the dialog grows tall
+        enough that the Play / Cancel buttons fall off the bottom of
+        the viewport. We cap the dialog at ~50vh, give it a min-h so
+        a 1-2 speaker setup doesn't render in a sliver, and make the
+        speakers list (the only unbounded section) the scroll
+        container so the header + footer always stay visible.
+        ``flex flex-col`` overrides DialogContent's default grid
+        layout so ``flex-1 min-h-0`` works on the body.
+      */}
+      <DialogContent
+        className={cn(
+          "sm:max-w-md flex flex-col",
+          "max-h-[50vh] min-h-[24rem]",
+        )}
+      >
+        <DialogHeader className="shrink-0">
           <DialogTitle>
             Play {station ? station.name : "station"}
           </DialogTitle>
@@ -532,8 +548,8 @@ function SpeakerPickerDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
-          <fieldset>
+        <div className="flex-1 min-h-0 flex flex-col gap-4 py-2">
+          <fieldset className="flex-1 min-h-0 flex flex-col">
             <legend className="text-xs font-medium text-foreground/80 mb-2">
               Speakers
             </legend>
@@ -551,7 +567,7 @@ function SpeakerPickerDialog({
                 Settings.
               </p>
             ) : (
-              <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+              <ul className="flex-1 min-h-0 space-y-1.5 overflow-y-auto pr-1">
                 {options.map((opt) => {
                   const checked = selectedSet.has(opt.id.toLowerCase());
                   return (
@@ -595,7 +611,7 @@ function SpeakerPickerDialog({
             )}
           </fieldset>
 
-          <div>
+          <div className="shrink-0">
             <label
               htmlFor="andon-fm-volume"
               className="flex items-center justify-between text-xs font-medium text-foreground/80 mb-1.5"
@@ -618,7 +634,7 @@ function SpeakerPickerDialog({
           </div>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0">
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
