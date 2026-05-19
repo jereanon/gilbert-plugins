@@ -27,7 +27,7 @@ from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
 from gilbert.interfaces.events import Event, EventBus, EventBusProvider
 from gilbert.interfaces.scheduler import Schedule, SchedulerProvider
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
-from gilbert.interfaces.speaker import CachedSpeakerLister
+from gilbert.interfaces.speaker import SpeakerLister
 from gilbert.interfaces.tools import (
     ToolDefinition,
     ToolParameter,
@@ -561,46 +561,54 @@ class AndonFmService(Service):
     async def _ws_speakers_list(
         self, conn: Any, frame: dict[str, Any]
     ) -> dict[str, Any]:
-        """Return cached speakers + the browser-tab magic alias.
+        """Return live speakers for the per-play picker dialog.
 
-        Populates the per-play picker dialog. We read the speaker
-        service's cached list via the ``CachedSpeakerLister`` protocol
-        rather than triggering a fresh discovery (a per-open network
-        fan-out would be wasteful — the service refreshes its cache
-        on backend events). The ``my browser`` virtual entry is
-        prepended unconditionally so users can route to the current
-        tab without picking a physical device.
+        Triggers a fresh ``SpeakerLister.list_speakers()`` rather than
+        reading the service-wide cache — the cache lags Sonos zeroconf
+        discovery (which finishes asynchronously after start) and any
+        recent browser-speaker (de)activation, so a cache read at
+        dialog-open time can show stale or empty results. The fresh
+        path is user-filtered: non-admins see every non-browser
+        speaker plus their own browser-tab entry, admins see all.
 
-        If the resolved speaker service doesn't satisfy the protocol —
-        a misconfigured composition where ``speaker_control`` is
-        provided by something with no cache — the dialog still
-        renders the browser-tab alias, not an empty list.
+        No virtual / synthetic speaker entries — the user picks from
+        whatever real speakers are currently registered. The caller's
+        own browser entry is relabeled "My browser tab" with id
+        ``"my browser"`` so the picker reads naturally and the play
+        request uses the magic alias the speaker service already
+        knows how to resolve (rather than depending on the speaker's
+        display name being globally unique).
         """
-        speakers_payload: list[dict[str, Any]] = [
-            {
-                "id": "my browser",
-                "name": "This browser tab",
-                "model": "",
-                "backend": "browser_tab",
-                "group_name": "",
-                "is_virtual": True,
-            }
-        ]
-        if isinstance(self._speaker_svc, CachedSpeakerLister):
+        speakers_payload: list[dict[str, Any]] = []
+        if isinstance(self._speaker_svc, SpeakerLister):
             try:
-                cached = list(self._speaker_svc.cached_speakers)
+                live = await self._speaker_svc.list_speakers()
             except Exception:  # noqa: BLE001
-                logger.exception("Andon FM ws speakers.list cache read failed")
-                cached = []
-            for s in cached:
+                logger.exception("Andon FM ws speakers.list live fetch failed")
+                live = []
+            from gilbert.interfaces.context import get_current_user
+
+            user = get_current_user()
+            self_browser_id = f"browser:{user.user_id}" if user.user_id else ""
+            for s in live:
+                is_self_browser = (
+                    self_browser_id != ""
+                    and getattr(s, "speaker_id", "") == self_browser_id
+                )
                 speakers_payload.append(
                     {
-                        "id": s.name,
-                        "name": s.name,
+                        # ``id`` is what gets sent back on play. Use
+                        # the ``my browser`` magic alias for the
+                        # caller's own tab so play resolves through
+                        # the speaker service's caller-aware alias
+                        # handling rather than relying on the
+                        # backend-stamped display name being
+                        # collision-free.
+                        "id": "my browser" if is_self_browser else s.name,
+                        "name": "My browser tab" if is_self_browser else s.name,
                         "model": getattr(s, "model", "") or "",
                         "backend": getattr(s, "backend_name", "") or "",
                         "group_name": getattr(s, "group_name", "") or "",
-                        "is_virtual": False,
                     }
                 )
         return {

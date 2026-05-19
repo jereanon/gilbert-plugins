@@ -55,21 +55,19 @@ export interface AndonFmStopResult {
 }
 
 export interface AndonFmSpeakerOption {
-  /** Stable identifier used in play requests (speaker name or the
-   *  ``my browser`` magic alias). */
+  /** Stable identifier used in play requests (the speaker's display
+   *  name, since play_on_speakers resolves names not ids). */
   id: string;
   /** Display label. */
   name: string;
-  /** Model string from the backend (Sonos product code, ``""`` for
-   *  the browser alias). */
+  /** Model string from the backend (Sonos product code or empty). */
   model: string;
-  /** Backend that owns this speaker — ``"sonos"``, ``"local"``,
-   *  ``"browser"``, or ``"browser_tab"`` for the virtual entry. */
+  /** Backend that owns this speaker — ``"sonos"`` / ``"local"`` /
+   *  ``"browser"`` / etc. — for the small UPPERCASE chip on the
+   *  right of each picker row. */
   backend: string;
   /** Speaker group label when grouped, ``""`` otherwise. */
   group_name: string;
-  /** True for the synthetic ``"my browser"`` entry. */
-  is_virtual: boolean;
 }
 
 export interface AndonFmSpeakersResponse {

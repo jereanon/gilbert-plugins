@@ -597,9 +597,7 @@ function SpeakerPickerDialog({
                           ) : null}
                         </span>
                         <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
-                          {opt.backend === "browser_tab"
-                            ? "this tab"
-                            : opt.backend || "speaker"}
+                          {opt.backend || "speaker"}
                         </span>
                       </label>
                     </li>

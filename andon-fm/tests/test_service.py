@@ -16,29 +16,33 @@ class _FakeSpeakerInfo:
     """Stand-in for ``gilbert.interfaces.speaker.SpeakerInfo``.
 
     Tests don't import the real dataclass to keep the plugin tests
-    decoupled from core internals — the speakers.list WS handler only
-    reads ``name`` / ``model`` / ``backend_name`` / ``group_name`` via
-    ``getattr``, so a duck-typed stub is sufficient.
+    decoupled from core internals — the speakers.list WS handler
+    reads ``speaker_id`` / ``name`` / ``model`` / ``backend_name`` /
+    ``group_name`` via ``getattr``, so a duck-typed stub is sufficient.
+    ``speaker_id`` matters because the handler relabels the caller's
+    own browser entry to "My browser tab" when it sees
+    ``speaker_id == "browser:<caller_user_id>"``.
     """
 
     def __init__(
         self,
         name: str,
+        speaker_id: str = "",
         model: str = "",
         backend_name: str = "",
         group_name: str = "",
     ) -> None:
         self.name = name
+        self.speaker_id = speaker_id
         self.model = model
         self.backend_name = backend_name
         self.group_name = group_name
 
 
 class _FakeSpeakerSvc:
-    """Stub that satisfies the ``CachedSpeakerLister`` protocol via
-    the ``cached_speakers`` property — that's how the speakers.list
-    WS handler reads available speakers, matching how the real
-    ``SpeakerService`` exposes its cache."""
+    """Stub that satisfies the ``SpeakerLister`` protocol via an
+    async ``list_speakers`` method — the speakers.list WS handler
+    asks for a fresh live list each time the picker opens."""
 
     def __init__(self) -> None:
         self.play_calls: list[dict[str, Any]] = []
@@ -51,8 +55,7 @@ class _FakeSpeakerSvc:
     async def stop_speakers(self, **kwargs: Any) -> None:
         self.stop_calls.append(kwargs)
 
-    @property
-    def cached_speakers(self) -> list[_FakeSpeakerInfo]:
+    async def list_speakers(self) -> list[_FakeSpeakerInfo]:
         return list(self.speakers)
 
 
@@ -198,18 +201,32 @@ async def test_ws_stations_list_returns_catalog(started_service: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ws_speakers_list_prepends_browser_alias(
+async def test_ws_speakers_list_returns_live_speakers(
     started_service: Any,
 ) -> None:
+    """The picker RPC returns whatever the speaker service's live
+    ``list_speakers()`` reports — no synthetic / virtual entries,
+    so a user with no enabled browser tab and no Sonos sees an
+    empty list rather than a misleading "this browser tab" row."""
     svc, speaker = started_service
     speaker.speakers = [
         _FakeSpeakerInfo(
             name="Kitchen",
+            speaker_id="sonos:RINCON_kitchen",
             model="Sonos One",
             backend_name="sonos",
             group_name="Downstairs",
         ),
-        _FakeSpeakerInfo(name="Office", backend_name="local"),
+        _FakeSpeakerInfo(
+            name="Office",
+            speaker_id="local:office",
+            backend_name="local",
+        ),
+        _FakeSpeakerInfo(
+            name="Someone Else's Browser",
+            speaker_id="browser:other_user",
+            backend_name="browser",
+        ),
     ]
     resp = await svc._ws_speakers_list(conn=None, frame={"id": "s-1"})
 
@@ -218,49 +235,108 @@ async def test_ws_speakers_list_prepends_browser_alias(
     assert resp["defaults"]["speakers"] == ["my browser"]
 
     ids = [s["id"] for s in resp["speakers"]]
-    assert ids == ["my browser", "Kitchen", "Office"]
+    assert ids == ["Kitchen", "Office", "Someone Else's Browser"]
 
-    browser_entry = resp["speakers"][0]
-    assert browser_entry["is_virtual"] is True
-    assert browser_entry["backend"] == "browser_tab"
-    assert browser_entry["name"] == "This browser tab"
-
-    kitchen = resp["speakers"][1]
-    assert kitchen["is_virtual"] is False
+    kitchen = resp["speakers"][0]
     assert kitchen["backend"] == "sonos"
     assert kitchen["model"] == "Sonos One"
     assert kitchen["group_name"] == "Downstairs"
 
+    other_browser = resp["speakers"][2]
+    assert other_browser["backend"] == "browser"
+    # Not relabeled — this entry isn't the caller's own browser
+    # (there's no current-user context in this test, so user_id is
+    # empty and the "is_self_browser" relabel doesn't fire).
+    assert other_browser["name"] == "Someone Else's Browser"
+
 
 @pytest.mark.asyncio
-async def test_ws_speakers_list_survives_cache_read_failure(
+async def test_ws_speakers_list_relabels_callers_own_browser(
     started_service: Any,
 ) -> None:
-    """A speaker-service exception reading the cache leaves the picker
-    usable with just the browser-tab fallback — never 500ing the
-    dialog."""
+    """When the caller's own ``browser:<user_id>`` entry shows up in
+    the live speakers list, the picker relabels it ``My browser tab``
+    (with id ``"my browser"``) so the dialog reads naturally and the
+    play request flows through the speaker service's caller-aware
+    magic alias rather than a possibly-non-unique display name."""
+    from gilbert.interfaces.auth import UserContext
+    from gilbert.interfaces.context import set_current_user
+
+    svc, speaker = started_service
+    speaker.speakers = [
+        _FakeSpeakerInfo(
+            name="Kitchen",
+            speaker_id="sonos:RINCON_kitchen",
+            backend_name="sonos",
+        ),
+        _FakeSpeakerInfo(
+            name="Brian Dilley's Browser",
+            speaker_id="browser:vendors",
+            backend_name="browser",
+        ),
+        _FakeSpeakerInfo(
+            name="Alice's Browser",
+            speaker_id="browser:alice",
+            backend_name="browser",
+        ),
+    ]
+
+    set_current_user(
+        UserContext(
+            user_id="vendors",
+            email="vendors@current-la.com",
+            display_name="Brian Dilley",
+        )
+    )
+
+    resp = await svc._ws_speakers_list(conn=None, frame={"id": "s-self"})
+
+    by_id = {s["id"]: s for s in resp["speakers"]}
+    assert "my browser" in by_id, "Caller's own browser should be relabeled"
+    assert by_id["my browser"]["name"] == "My browser tab"
+    assert by_id["my browser"]["backend"] == "browser"
+    # Other users' browsers retain their display name + id so admins
+    # can still tell them apart.
+    assert by_id["Alice's Browser"]["name"] == "Alice's Browser"
+    assert "Kitchen" in by_id
+
+
+@pytest.mark.asyncio
+async def test_ws_speakers_list_returns_empty_when_no_speakers(
+    started_service: Any,
+) -> None:
+    """No registered speakers ⇒ empty payload. The picker dialog
+    treats this as "enable a speaker backend" — no synthetic
+    fallback row to mislead the user."""
+    svc, _ = started_service
+    resp = await svc._ws_speakers_list(conn=None, frame={"id": "s-empty"})
+    assert resp["speakers"] == []
+
+
+@pytest.mark.asyncio
+async def test_ws_speakers_list_survives_live_fetch_failure(
+    started_service: Any,
+) -> None:
+    """An exception inside ``list_speakers()`` leaves the picker
+    rendering an empty list — never 500ing the dialog."""
     svc, _ = started_service
 
     class _ExplodingSvc:
-        @property
-        def cached_speakers(self) -> list[Any]:
-            raise RuntimeError("cache down")
-
-        # Implement the rest of the duck-typed surface so prior wiring
-        # (start, play_on_speakers) is irrelevant to this test.
+        async def list_speakers(self) -> list[Any]:
+            raise RuntimeError("backend down")
 
     svc._speaker_svc = _ExplodingSvc()
     resp = await svc._ws_speakers_list(conn=None, frame={"id": "s-2"})
-    assert [s["id"] for s in resp["speakers"]] == ["my browser"]
+    assert resp["speakers"] == []
 
 
 @pytest.mark.asyncio
 async def test_ws_speakers_list_handles_non_protocol_service(
     started_service: Any,
 ) -> None:
-    """When the resolved speaker service doesn't satisfy
-    ``CachedSpeakerLister`` (no ``cached_speakers``), the picker still
-    renders the browser-tab alias rather than failing outright."""
+    """If the resolved speaker service doesn't satisfy
+    ``SpeakerLister`` (no ``list_speakers``), the picker still
+    returns an empty list rather than crashing."""
     svc, _ = started_service
 
     class _BareSvc:
@@ -269,7 +345,7 @@ async def test_ws_speakers_list_handles_non_protocol_service(
 
     svc._speaker_svc = _BareSvc()
     resp = await svc._ws_speakers_list(conn=None, frame={"id": "s-3"})
-    assert [s["id"] for s in resp["speakers"]] == ["my browser"]
+    assert resp["speakers"] == []
 
 
 @pytest.mark.asyncio
