@@ -1,0 +1,9 @@
+name: openwakeword
+version: "1.0.0"
+description: "openWakeWord — local wake-word detection (no API key)"
+
+provides:
+  - openwakeword
+
+requires: []
+depends_on: []

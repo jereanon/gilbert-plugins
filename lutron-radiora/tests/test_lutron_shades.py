@@ -80,6 +80,9 @@ def fake_pylutron(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 async def _reset() -> None:
     yield
+    # See test_lutron_lights.py::_reset for the rationale on resetting
+    # the module-level ``_BRIDGE_LOCK`` between tests.
+    bridge_module._BRIDGE_LOCK = None
     await reset_shared_bridge()
 
 
@@ -123,7 +126,13 @@ async def test_shared_bridge_with_lights(fake_pylutron: None) -> None:
     shades = LutronShades()
     cfg = {"host": "10.0.0.1", "username": "u", "password": "p"}
     await lights.initialize(cfg)
+    # initialize() backgrounds the connect — wait for both warmups so
+    # the shared bridge is fully constructed before we sample it.
+    assert lights._warmup_task is not None
+    await lights._warmup_task
     bridge_after_lights = bridge_module._BRIDGE
     await shades.initialize(cfg)
+    assert shades._warmup_task is not None
+    await shades._warmup_task
     bridge_after_shades = bridge_module._BRIDGE
     assert bridge_after_lights is bridge_after_shades

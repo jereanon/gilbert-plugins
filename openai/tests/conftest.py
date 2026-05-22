@@ -16,7 +16,7 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    for _mod_name in ("openai_ai", "plugin"):
+    for _mod_name in ("openai_ai", "openai_whisper", "plugin"):
         # Omit ``submodule_search_locations`` so intra-plugin relative
         # imports (``from .foo import Bar``) resolve against the plugin
         # package, not the module itself. See
