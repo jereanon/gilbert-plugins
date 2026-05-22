@@ -31,9 +31,13 @@ class LutronShades(ShadesBackend):
     supports_stop = True
 
     def __init__(self) -> None:
+        import asyncio
+
         self._host = ""
         self._username = ""
         self._password = ""
+        # See lutron_lights for the rationale. Awaitable by tests + close.
+        self._warmup_task: asyncio.Task | None = None
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
@@ -78,17 +82,25 @@ class LutronShades(ShadesBackend):
         ]
 
     async def initialize(self, config: dict[str, object]) -> None:
+        from gilbert.interfaces.service import background_warmup
+
         self._host = str(config.get("host", "") or "")
         self._username = str(config.get("username", "") or "")
         self._password = str(config.get("password", "") or "")
+        # See lutron_lights.initialize() — same rationale: background the
+        # ~15 s telnet handshake. The shared lock in shared_bridge means
+        # whoever (lights or shades) wins the race does the real connect
+        # and the other reuses it.
         if self._host and self._username and self._password:
-            try:
-                await shared_bridge(self._host, self._username, self._password)
-            except Exception:
-                logger.exception("LutronShades: failed to connect to repeater")
+            self._warmup_task = background_warmup(
+                shared_bridge(self._host, self._username, self._password),
+                name="lutron-shades-warmup",
+                log=logger,
+            )
         logger.info(
-            "LutronShades initialized (host=%s, configured=%s)",
+            "LutronShades initialized (host=%s, configured=%s, warming=%s)",
             self._host,
+            bool(self._host and self._username and self._password),
             bool(self._host and self._username and self._password),
         )
 

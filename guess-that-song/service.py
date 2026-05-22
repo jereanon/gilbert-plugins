@@ -357,9 +357,9 @@ class GuessGameService(Service):
         try:
             if not isinstance(self._speaker_svc, SpeakerProvider):
                 raise RuntimeError("Speaker service does not provide SpeakerProvider")
-            speakers = await self._speaker_svc.backend.list_speakers()
-            for s in speakers:
-                speaker_options.append(UIOption(value=s.name, label=s.name))
+            for backend in self._speaker_svc.backends.values():
+                for s in await backend.list_speakers():
+                    speaker_options.append(UIOption(value=s.name, label=s.name))
         except Exception:
             logger.warning("Could not list speakers for setup form")
 

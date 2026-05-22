@@ -134,12 +134,14 @@ class GoogleCalendarBackend(CalendarBackend):
 
     def __init__(self) -> None:
         self._email_address: str = ""
+        self._calendar_id: str = ""
         self._service: Any = None
 
     async def initialize(self, config: dict[str, Any] | None = None) -> None:
         if config is None:
             return
         self._email_address = config.get("email_address", "")
+        self._calendar_id = str(config.get("calendar_id", "") or "")
         sa_json = config.get("service_account_json", "")
         delegated_user = config.get("delegated_user", self._email_address)
         if not sa_json:
@@ -377,7 +379,7 @@ class GoogleCalendarBackend(CalendarBackend):
             svc.calendarList().list().execute,
         )
         items = result.get("items", []) or []
-        return [
+        calendars = [
             {
                 "id": str(c.get("id", "")),
                 "name": str(c.get("summary", "")),
@@ -385,6 +387,23 @@ class GoogleCalendarBackend(CalendarBackend):
                 "primary": bool(c.get("primary", False)),
             }
             for c in items
+        ]
+        if calendars:
+            return calendars
+
+        fallback_id = self._calendar_id or self._email_address
+        if not fallback_id:
+            return []
+        cal = await self._exec_with_mapping(
+            svc.calendars().get(calendarId=fallback_id).execute,
+        )
+        return [
+            {
+                "id": str(cal.get("id", fallback_id)),
+                "name": str(cal.get("summary", fallback_id)),
+                "timezone": str(cal.get("timeZone", "UTC")),
+                "primary": False,
+            }
         ]
 
     async def list_events(

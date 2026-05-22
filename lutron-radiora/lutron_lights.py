@@ -31,10 +31,17 @@ class LutronLights(LightsBackend):
     supports_dimming = True
 
     def __init__(self) -> None:
+        import asyncio
+
         self._host = ""
         self._username = ""
         self._password = ""
         self._cache_dir: Path | None = None
+        # Set by ``initialize()`` to the background warmup task that
+        # connects to the repeater. ``None`` if the backend isn't
+        # configured. Awaitable by callers (tests, ``close``) that need
+        # to know when the connect has completed.
+        self._warmup_task: asyncio.Task | None = None
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
@@ -78,24 +85,32 @@ class LutronLights(LightsBackend):
         ]
 
     async def initialize(self, config: dict[str, object]) -> None:
+        from gilbert.interfaces.service import background_warmup
+
         self._host = str(config.get("host", "") or "")
         self._username = str(config.get("username", "") or "")
         self._password = str(config.get("password", "") or "")
-        # The bridge will be (re)built lazily on the first call. If
-        # credentials changed, ``shared_bridge`` tears down the old one.
+        # Telnet handshake + XML topology fetch takes ~15 s against a
+        # real repeater. Background it so the service starts immediately;
+        # ``shared_bridge`` is lock-serialized so any request that
+        # arrives mid-warmup joins the in-flight connect instead of
+        # racing it. The task is stored on ``self._warmup_task`` so
+        # ``close()`` (and tests) can await/cancel it.
         if self._host and self._username and self._password:
-            try:
-                await shared_bridge(
+            self._warmup_task = background_warmup(
+                shared_bridge(
                     self._host,
                     self._username,
                     self._password,
                     cache_path=self._cache_path(),
-                )
-            except Exception:
-                logger.exception("LutronLights: failed to connect to repeater")
+                ),
+                name="lutron-lights-warmup",
+                log=logger,
+            )
         logger.info(
-            "LutronLights initialized (host=%s, configured=%s)",
+            "LutronLights initialized (host=%s, configured=%s, warming=%s)",
             self._host,
+            bool(self._host and self._username and self._password),
             bool(self._host and self._username and self._password),
         )
 

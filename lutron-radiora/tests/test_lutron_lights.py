@@ -75,6 +75,15 @@ def fake_pylutron(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 async def _reset() -> None:
     yield
+    # Pre-existing issue: each pytest-asyncio test runs in its own event
+    # loop, but ``_BRIDGE_LOCK`` is a module-level ``asyncio.Lock`` that
+    # binds itself to the loop on first acquire. Resetting it forces the
+    # next test's call to ``_lock()`` to create a fresh lock in that
+    # test's loop. Previously masked because the warmup ran synchronously
+    # inside initialize() and never left state behind; now that warmup
+    # is backgrounded, the lock outlives the test loop and trips a
+    # ``RuntimeError: bound to a different event loop`` on teardown.
+    bridge_module._BRIDGE_LOCK = None
     await reset_shared_bridge()
 
 
@@ -95,6 +104,10 @@ async def test_initialize_connects_bridge(fake_pylutron: None) -> None:
     await backend.initialize(
         {"host": "10.0.0.1", "username": "u", "password": "p"}
     )
+    # initialize() backgrounds the telnet handshake. Await the warmup
+    # task so the assertion sees the populated bridge.
+    assert backend._warmup_task is not None
+    await backend._warmup_task
     assert bridge_module._BRIDGE is not None
 
 

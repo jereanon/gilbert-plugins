@@ -153,6 +153,25 @@ class UniFiNetwork:
                 people.setdefault(c.person, []).append(c)
         return people
 
+    async def get_all_resolved_wireless_clients(
+        self,
+    ) -> dict[str, list[WifiClient]]:
+        """All wireless clients with a resolved person, **no phone filter**.
+
+        Used by the presence service's observation feed for the
+        mapping screen: with explicit admin mappings, a tablet or
+        laptop should be just as mappable as a phone. The fuzzy
+        ``get_people_on_network`` path still applies the phone
+        filter so auto-presence detection isn't fooled by random
+        laptops on the network.
+        """
+        clients = await self.get_connected_clients()
+        people: dict[str, list[WifiClient]] = {}
+        for c in clients:
+            if c.person and not c.is_wired:
+                people.setdefault(c.person, []).append(c)
+        return people
+
     def _resolve_person(self, mac: str, device_name: str, hostname: str) -> str:
         """Resolve a person name from MAC, device name, or hostname."""
         # Priority 1: explicit MAC mapping

@@ -432,6 +432,10 @@ class SonosMusic(MusicBackend, LinkedMusicServiceLister):
     supports_loop = True
 
     @classmethod
+    def compatible_speaker_backends(cls) -> frozenset[str]:
+        return frozenset({"sonos"})
+
+    @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
