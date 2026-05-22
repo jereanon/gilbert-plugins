@@ -69,10 +69,41 @@ Rules:
 # round-trip.
 _TAG_RE = re.compile(r"\[[a-z][a-z _]*\]")
 
+# Fraction of input "content words" (length >= 3, lowercased) that must
+# appear in the tag-stripped LLM response for us to trust it as a valid
+# tagging of the input. Below this threshold we assume the director
+# model went off-rails (e.g. "I'm ready, please provide the text…")
+# and fall back to raw text so the user doesn't hear instruction-following
+# slop instead of the actual content.
+_AUDIO_TAG_OVERLAP_THRESHOLD = 0.7
+
 # Tag-injector LRU bound — separate from the audio cache because the
 # values here are tiny (just the tagged string). Stored as an
 # OrderedDict so eviction is O(1) at the cold end.
 _AUDIO_TAG_CACHE_MAX = 256
+
+
+def _tagged_response_overlaps_input(input_text: str, tagged: str) -> bool:
+    """Return True if ``tagged`` looks like ``input_text`` with [emotion]
+    tags inserted (rather than a hallucinated meta-response).
+
+    The director model occasionally interprets the input as a meta-question
+    ("are you ready to tag text?") and replies with its own preamble instead
+    of returning the tagged input. We catch that by stripping ``[…]`` tags
+    from the response and checking that at least
+    ``_AUDIO_TAG_OVERLAP_THRESHOLD`` of the input's content words (length
+    >= 3, lowercased) are present in the stripped response.
+    """
+    stripped = _TAG_RE.sub(" ", tagged).lower()
+    response_words: set[str] = set(re.findall(r"[a-z0-9]+", stripped))
+    input_words = [
+        w for w in re.findall(r"[a-z0-9]+", input_text.lower()) if len(w) >= 3
+    ]
+    if not input_words:
+        # Nothing meaningful to compare; trust the LLM.
+        return True
+    hits = sum(1 for w in input_words if w in response_words)
+    return (hits / len(input_words)) >= _AUDIO_TAG_OVERLAP_THRESHOLD
 
 # ElevenLabs API base
 _BASE_URL = "https://api.elevenlabs.io/v1"
@@ -501,6 +532,16 @@ class ElevenLabsTTS(TTSBackend):
         if not tagged:
             logger.debug(
                 "Audio-tag injector returned empty content; using raw text"
+            )
+            return text
+
+        if not _tagged_response_overlaps_input(text, tagged):
+            logger.warning(
+                "Audio-tag injector response diverged from input "
+                "(likely instruction-following hallucination); falling back to raw text. "
+                "input=%r got=%r",
+                text,
+                tagged,
             )
             return text
 

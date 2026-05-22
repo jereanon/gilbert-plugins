@@ -1,0 +1,11 @@
+name: andon-fm
+version: "1.0.0"
+description: "Andon FM — tune in to AI-hosted internet radio from Andon Labs"
+
+provides:
+  - andon_fm
+
+requires:
+  - speaker_control
+
+depends_on: []

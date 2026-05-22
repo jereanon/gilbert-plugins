@@ -26,16 +26,18 @@ The table below is an index — jump to each plugin's detail section for configu
 | Plugin | Provides | Third-party deps | Category |
 |---|---|---|---|
 | [american-standard](#american-standard) | `ThermostatBackend "american-standard"` | `nexia` | Climate |
+| [andon-fm](#andon-fm) | `andon_fm` service (AI-hosted internet radio tuner under `/media/andon-fm`) | — (uses `httpx`) | Media |
 | [anthropic](#anthropic) | `AIBackend "anthropic"`, `VisionBackend "anthropic"` | `anthropic` | Intelligence |
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
+| [deepgram](#deepgram) | `StreamingTranscriptionBackend "deepgram"` | — (uses `websockets`) | Speech |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
-| [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"` | — (uses `httpx`) | Media |
+| [elevenlabs](#elevenlabs) | `TTSBackend "elevenlabs"`, `BatchTranscriptionBackend "elevenlabs_scribe"`, `StreamingTranscriptionBackend "elevenlabs_scribe_live"` | — (uses `httpx`, `websockets`) | Media / Speech |
 | [gemini](#gemini) | `AIBackend "gemini"` | — (uses `httpx`) | Intelligence |
 | [google](#google) | `AuthBackend "google"`, `UserProviderBackend "google_directory"`, `EmailBackend "gmail"`, `DocumentBackend "google_drive"`, `CalendarBackend "google_calendar"`, `TaskBackend "google_tasks"` | `google-auth`, `google-api-python-client`, `tzdata` | Identity / Communication / Knowledge / Productivity |
-| [groq](#groq) | `AIBackend "groq"` | — (uses `httpx`) | Intelligence |
+| [groq](#groq) | `AIBackend "groq"`, `BatchTranscriptionBackend "groq_whisper"` | — (uses `httpx`) | Intelligence / Speech |
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
@@ -43,9 +45,11 @@ The table below is an index — jump to each plugin's detail section for configu
 | [ntfy](#ntfy) | `PushNotificationBackend "ntfy"` | — (uses `httpx`) | Notifications |
 | [ollama](#ollama) | `AIBackend "ollama"` | — (uses `httpx`) | Intelligence |
 | [open-meteo](#open-meteo) | `WeatherBackend "open-meteo"` | — (uses `httpx`) | Intelligence |
-| [openai](#openai) | `AIBackend "openai"` | — (uses `httpx`) | Intelligence |
+| [openai](#openai) | `AIBackend "openai"`, `BatchTranscriptionBackend "openai_whisper"` | — (uses `httpx`) | Intelligence / Speech |
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
+| [openwakeword](#openwakeword) | `WakeWordBackend "openwakeword"` | `openwakeword` | Speech |
+| [porcupine](#porcupine) | `WakeWordBackend "porcupine"` | `pvporcupine` | Speech |
 | [pushover](#pushover) | `PushNotificationBackend "pushover"` | — (uses `httpx`) | Notifications |
 | [qwen](#qwen) | `AIBackend "qwen"` | — (uses `httpx`) | Intelligence |
 | [slack](#slack) | `slack` service (Socket Mode bot) | `slack-bolt` | Communication |
@@ -84,6 +88,40 @@ The plugin persists Nexia's per-account device UUID under `.gilbert/plugin-data/
 **Config action** — `test_connection`: logs in with a fresh, short-lived `aiohttp.ClientSession` and reports the discovered thermostat + zone counts.
 
 **Third-party deps** — `nexia>=2.7.0`.
+
+---
+
+### andon-fm
+
+Tune in to the four AI-hosted internet radio stations from [Andon Labs](https://andonlabs.com/radio): **Thinking Frequencies** (Claude), **OpenAIR** (GPT), **Backlink Broadcast** (Gemini), and **Grok and Roll** (Grok). Each station is a long-running agent autonomously DJing through the day — picking tracks, writing show blocks, posting on X. The plugin hands the Live365 MP3 stream URLs to Gilbert's existing speaker service, so you can listen on Sonos, the host's speakers, or a browser tab. The tuner is a full page under the **Media** nav group; pressing Play opens a dialog that lets you pick which speakers (and the volume) for that play, instead of always falling back to the configured defaults.
+
+**Service registered**
+- `andon_fm` — `Configurable` + `ToolProvider` + `WsHandlerProvider`. Resolves `speaker_control` (required), and optionally `scheduler` (for the now-playing scraper) and `event_bus` (for live UI updates).
+
+**Slash commands** (namespace `/radio.*`)
+- `/radio.list` — list the four stations with current programming block and listener count.
+- `/radio.play <station> [speakers]` — tune in. `<station>` matches name, host (Claude/GPT/Gemini/Grok), substring, or UUID; `[speakers]` defaults to `default_target_speakers` (typically the caller's browser tab).
+- `/radio.stop [speakers]` — stop Andon FM playback.
+- `/radio.now [station]` — show the current programming block for one station or all four.
+
+**Tuner page** — `UIRoute` at `/media/andon-fm`, slotted under the **Media** nav group as `andon_fm.page`. Renders one card per station with cover art, AI host chip, current block, listener count, and a Play button that opens a speaker-picker dialog (checkbox list of every discovered speaker + the `my browser` magic alias + a volume slider). Block changes stream in live via `andon_fm.now_playing.changed` events — no polling.
+
+**WebSocket RPCs**
+- `andon_fm.stations.list` / `andon_fm.now_playing.get` — catalog + cache snapshot.
+- `andon_fm.speakers.list` — every discovered speaker (with backend + model + group), prefixed by the `my browser` virtual entry, for the picker dialog.
+- `andon_fm.play` / `andon_fm.stop` — wrap the speaker service's play / stop with the station's stream URL.
+
+The plugin is **toggleable** — disabled by default. Enable it under **Settings → Services → "Andon FM"** before the `/media/andon-fm` nav entry, the slash commands, and the WS RPCs come online.
+
+**Configure** (Settings → Media → Andon FM, once enabled)
+- `default_target_speakers` — speakers pre-selected in the picker dialog. Default `["my browser"]` (the caller's tab). Multi-select dropdown sourced from the active speaker list. Slash-command callers (`/radio.play <station>` with no speaker) also use this list.
+- `default_volume` — default volume in the picker dialog and for slash-command callers. 0-100, default `60`.
+- `scraper_enabled` *(restart required)* — fetch each station's current programming block + listener count from `andonlabs.com/radio`. Default `true`. Disable if you only want playback (no metadata).
+- `scrape_interval_seconds` *(restart required)* — refresh interval. Default `90`.
+
+**Stations** — bundled in `stations.py`. The four UUIDs / stream URLs are pulled from the public Andon FM web player; edit that file if Andon Labs renumbers them.
+
+**Third-party deps** — none (uses `httpx` from Gilbert core).
 
 ---
 
@@ -206,6 +244,23 @@ The doctor reads `Plugin.runtime_dependencies()` (see `CLAUDE.md`). With Docker 
 
 ---
 
+### deepgram
+
+Real-time streaming speech-to-text via the [Deepgram Nova API](https://developers.deepgram.com/). Uses raw `websockets` rather than the `deepgram-sdk` package — fewer deps and the WebSocket protocol is straightforward. Audio is sent as binary frames (PCM16LE, 16 kHz mono by default); an empty binary frame signals end-of-stream.
+
+**Backend registered** — `StreamingTranscriptionBackend.backend_name = "deepgram"`.
+
+**Account setup** — Create an account at https://console.deepgram.com and generate an API key. Free tier includes generous transcription minutes.
+
+**Configure** (Settings → Transcription → Streaming, with the `deepgram` backend selected)
+- `api_key` *(sensitive)* — Deepgram API key.
+- `model` — Deepgram model ID (default `nova-3`). Choices: `nova-3`, `nova-2`, `enhanced`, `base`.
+- `ws_url` — WebSocket URL (default `wss://api.deepgram.com/v1/listen`).
+
+**No third-party Python dependencies** — uses `websockets`, which is already a core Gilbert dep.
+
+---
+
 ### deepseek
 
 DeepSeek chat backend, speaking the [OpenAI-compatible DeepSeek API](https://api-docs.deepseek.com/) directly over `httpx`. Runs alongside the other AI backends — pick per-profile in the AI profile editor.
@@ -266,9 +321,12 @@ attempt.
 
 ### elevenlabs
 
-High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.announce` flow, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
+High-quality text-to-speech via the ElevenLabs API, plus batch and streaming speech-to-text via the ElevenLabs Scribe API. Used by the core `speaker.announce` flow, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
 
-**Backend registered** — `TTSBackend.backend_name = "elevenlabs"`.
+**Backends registered**
+- `TTSBackend.backend_name = "elevenlabs"` — synthesizes speech from text.
+- `BatchTranscriptionBackend.backend_name = "elevenlabs_scribe"` — one-shot transcription via `POST /v1/speech-to-text`. Supports diarization.
+- `StreamingTranscriptionBackend.backend_name = "elevenlabs_scribe_live"` — real-time transcription via the Scribe WebSocket endpoint.
 
 **Configure** (Settings → TTS, when the `elevenlabs` backend is selected)
 - `api_key` *(sensitive)* — ElevenLabs API key.
@@ -277,9 +335,23 @@ High-quality text-to-speech via the ElevenLabs API. Used by the core `speaker.an
 - `cache_max_entries` — LRU cache capacity for recently synthesized phrases (default 256).
 - `cache_ttl_seconds` — How long a cached clip lives before re-synthesis (default 1800).
 
+**Configure** (Settings → Transcription → Batch, with the `elevenlabs_scribe` backend selected)
+
+The `elevenlabs_scribe` key is **separate** from the TTS backend's key — each backend has its own config block under `transcription.<role>.backends.elevenlabs_scribe.settings.*`.
+- `api_key` *(sensitive)* — ElevenLabs API key.
+- `model` — Scribe model ID (default `scribe_v1`).
+- `base_url` — API base URL (default `https://api.elevenlabs.io`).
+
+**Configure** (Settings → Transcription → Streaming, with the `elevenlabs_scribe_live` backend selected)
+
+The `elevenlabs_scribe_live` key is also **separate** from both the TTS and batch backends.
+- `api_key` *(sensitive)* — ElevenLabs API key.
+- `model` — Scribe model ID (default `scribe_v1`).
+- `ws_url` — WebSocket URL for the Scribe live endpoint (default `wss://api.elevenlabs.io/v1/speech-to-text/stream`).
+
 **Config action** — `test_connection`: requests the available voices list to verify the API key.
 
-**No third-party Python dependencies** — talks directly to the REST API via `httpx`.
+**No third-party Python dependencies** — talks directly to the REST API and WebSocket via `httpx` and `websockets` (both already core Gilbert deps).
 
 ---
 
@@ -356,9 +428,11 @@ The same service account configured for Gmail / Calendar can host Tasks — add 
 
 ### groq
 
-Groq chat backend — runs open-weight models (Llama, Qwen, Mixtral, DeepSeek distills) on Groq's LPU hardware. Main selling point is inference latency: tokens/second is multiples higher than GPU-hosted providers. Speaks the [OpenAI-compatible endpoint](https://console.groq.com/docs/openai) at `api.groq.com/openai/v1` directly over `httpx`.
+Groq chat backend — runs open-weight models (Llama, Qwen, Mixtral, DeepSeek distills) on Groq's LPU hardware. Main selling point is inference latency: tokens/second is multiples higher than GPU-hosted providers. Speaks the [OpenAI-compatible endpoint](https://console.groq.com/docs/openai) at `api.groq.com/openai/v1` directly over `httpx`. Also provides a batch speech-to-text backend using Groq's Whisper-compatible transcription endpoint.
 
-**Backend registered** — `AIBackend.backend_name = "groq"`: tool-use capable, streaming, per-call model override.
+**Backends registered**
+- `AIBackend.backend_name = "groq"`: tool-use capable, streaming, per-call model override.
+- `BatchTranscriptionBackend.backend_name = "groq_whisper"`: one-shot transcription via Groq's OpenAI-compatible `/audio/transcriptions` endpoint. Supports `whisper-large-v3`, `whisper-large-v3-turbo`, and `distil-whisper-large-v3-en`.
 
 **Configure** (Settings → Intelligence → AI, with the `groq` backend selected)
 - `enabled` — Initialize this backend at startup (default `true`).
@@ -368,6 +442,13 @@ Groq chat backend — runs open-weight models (Llama, Qwen, Mixtral, DeepSeek di
 - `enabled_models` — Subset of advertised models the chat UI and AI profile editor expose. Defaults to the full list: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `qwen-2.5-32b`, `deepseek-r1-distill-llama-70b`, `gemma2-9b-it`.
 - `max_tokens` — Per-response cap (default `8192`).
 - `temperature` — Sampling temperature (default `0.7`).
+
+**Configure** (Settings → Transcription → Batch, with the `groq_whisper` backend selected)
+
+The `groq_whisper` API key is **separate** from the sibling `groq` AI backend's key — each backend has its own config block under `transcription.batch.backends.groq_whisper.settings.*`.
+- `api_key` *(sensitive)* — Groq API key (`gsk_…`).
+- `base_url` — API base URL (default `https://api.groq.com/openai/v1`).
+- `model` — Whisper model ID (default `whisper-large-v3`). Choices: `whisper-large-v3`, `whisper-large-v3-turbo`, `distil-whisper-large-v3-en`.
 
 **Streaming.** OpenAI-compatible SSE — `delta.content` → `TEXT_DELTA`, streamed `tool_calls[i].function.arguments` deltas reassembled into complete `ToolCall`s. `capabilities()` reports `streaming=True, attachments_user=True`.
 
@@ -543,9 +624,11 @@ Weather backend powered by [Open-Meteo](https://open-meteo.com/) — a free, no-
 
 ### openai
 
-OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) directly over `httpx` (no `openai` SDK dependency). Runs alongside the `anthropic` backend — configure either or both, then pick per-profile in the AI profile editor.
+OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.openai.com/docs/api-reference/chat) directly over `httpx` (no `openai` SDK dependency). Runs alongside the `anthropic` backend — configure either or both, then pick per-profile in the AI profile editor. Also provides a batch speech-to-text backend via OpenAI's Whisper API.
 
-**Backend registered** — `AIBackend.backend_name = "openai"`: tool-use capable, streaming, image-input capable on vision models (`gpt-4o`, `gpt-4-turbo`), per-call model override.
+**Backends registered**
+- `AIBackend.backend_name = "openai"`: tool-use capable, streaming, image-input capable on vision models (`gpt-4o`, `gpt-4-turbo`), per-call model override.
+- `BatchTranscriptionBackend.backend_name = "openai_whisper"`: one-shot transcription via `/audio/transcriptions`. Supports `whisper-1`, `gpt-4o-transcribe`, and `gpt-4o-mini-transcribe`.
 
 **Configure** (Settings → Intelligence → AI, with the `openai` backend selected)
 - `enabled` — Initialize this backend at startup (default `true`). Uncheck to hide its settings and stop it being offered in profile dropdowns.
@@ -556,6 +639,13 @@ OpenAI GPT chat backend, speaking the [Chat Completions API](https://platform.op
 - `enabled_models` — Subset of advertised models that the chat UI and AI profile editor expose for selection. Defaults to every model the backend knows about (`gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini`, `o3-mini`).
 - `max_tokens` — Per-response cap, sent as `max_completion_tokens` so it works for both classic chat models and the `o`-series reasoning models (default `16384`).
 - `temperature` — Sampling temperature (default `0.7`). Automatically omitted from requests when the selected model is in the `o`-series, which only accepts the default sampling.
+
+**Configure** (Settings → Transcription → Batch, with the `openai_whisper` backend selected)
+
+The `openai_whisper` API key is **separate** from the sibling `openai` AI backend's key — each backend has its own config block under `transcription.batch.backends.openai_whisper.settings.*`.
+- `api_key` *(sensitive)* — OpenAI API key (`sk-…`).
+- `base_url` — API base URL (default `https://api.openai.com/v1`). Override for compatible providers.
+- `model` — Whisper model ID (default `whisper-1`). Choices: `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`.
 
 **Streaming.** The backend implements `generate_stream` over OpenAI's SSE chunks, translating `delta.content` into `TEXT_DELTA` events and assembling incremental `tool_calls[i].function.arguments` deltas back into complete `ToolCall`s at the end of the stream. All OpenAI-specific SSE parsing stays inside `openai_ai.py`; `capabilities()` reports `streaming=True, attachments_user=True`.
 
@@ -587,6 +677,24 @@ Vendor-neutral Chat Completions backend for endpoints that don't have a dedicate
 - `refresh_models` — `GET /models` and populate the in-memory model list (picked up by `available_models()` — the UI dropdown updates without a restart). On 404, the action reports that `/models` isn't implemented and suggests using the free-form `model` field. The list is in-memory only — re-run after a restart if you want fresh data.
 
 **Attachments.** Image attachments ride as `image_url` content parts with `data:<mime>;base64,…` URLs. Whether the target endpoint actually handles them depends on the model — vision-capable endpoints pick them up, text-only ones ignore them. Document (PDF) attachments become text stubs pointing at the workspace tools; text attachments inline as `## <name>\n\n<body>`.
+
+---
+
+### openwakeword
+
+Local wake-word detection using [openWakeWord](https://github.com/dscripka/openWakeWord) — ONNX-based models running on CPU. No API key, no internet access required. Audio must be 16-bit PCM at 16 kHz mono; the backend buffers incoming chunks into 80 ms windows (1280 samples) for the model.
+
+**Backend registered** — `WakeWordBackend.backend_name = "openwakeword"`.
+
+**Bundled "hey gilbert" model.** The plugin ships a custom-trained `hey_gilbert.onnx` model at `models/hey_gilbert.onnx`. The default `model_paths` config points at it so the backend works out of the box. Callers receive a `WakeEvent` by including `"hey_gilbert"` in their `WakeWordConfig.keywords`. On first use the openwakeword library downloads the feature-extraction models (`melspectrogram.onnx`, `embedding_model.onnx`, `silero_vad.onnx`) into its own cache directory.
+
+**No account needed** — fully local, no API key required.
+
+**Configure** (Settings → Transcription → Wake Word, with the `openwakeword` backend selected)
+- `model_paths` — Comma-separated paths to `.onnx` wake-word model files. Defaults to the bundled `hey_gilbert.onnx`. Add additional paths (or replace) to enable other wake-words. Setting this to an empty string falls back to openwakeword's library-bundled pretrained set (`hey_jarvis`, `alexa`, `hey_mycroft`, `hey_rhasspy`, `timer`, `weather`).
+- `inference_framework` — `"onnx"` (default, works on Python 3.12+) or `"tflite"` (faster on some hardware, but `tflite-runtime` has no wheels for Python 3.12+ yet).
+
+**Third-party deps** — `openwakeword>=0.6`. The bundled `hey_gilbert.onnx` weighs ~200 KB and is committed alongside the plugin.
 
 ---
 
@@ -648,6 +756,21 @@ v1.1 with the outbox so retries are bounded). Click-through deep
 links flow as Pushover's `url` + `url_title` fields.
 
 **No third-party Python dependencies** — uses core's `httpx`.
+
+---
+
+### porcupine
+
+Wake-word detection via [Picovoice Porcupine](https://picovoice.ai/platform/porcupine/). Uses the `pvporcupine` SDK — a C-extension with built-in keyword support (e.g., "computer", "hey google", "ok google", "alexa") and support for custom `.ppn` model files. Audio must be 16-bit PCM at 16 kHz mono; the backend buffers incoming chunks into Porcupine's fixed frame size (typically 512 samples).
+
+**Backend registered** — `WakeWordBackend.backend_name = "porcupine"`.
+
+**Account setup** — Get a free access key at https://console.picovoice.ai. Free tier is available for personal use; commercial use requires a paid licence.
+
+**Configure** (Settings → Transcription → Wake Word, with the `porcupine` backend selected)
+- `access_key` *(sensitive)* — Picovoice access key from https://console.picovoice.ai.
+
+**Third-party deps** — `pvporcupine>=3.0`.
 
 ---
 

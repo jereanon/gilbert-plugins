@@ -16,7 +16,7 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    for _mod_name in ("groq_ai", "plugin"):
+    for _mod_name in ("groq_ai", "groq_whisper", "plugin"):
         _spec = importlib.util.spec_from_file_location(
             f"{_pkg_name}.{_mod_name}",
             _plugin_dir / f"{_mod_name}.py",

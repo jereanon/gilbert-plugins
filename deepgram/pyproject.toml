@@ -1,0 +1,10 @@
+[project]
+name = "gilbert-plugin-deepgram"
+version = "1.0.0"
+description = "Deepgram streaming speech-to-text backend for Gilbert"
+requires-python = ">=3.12"
+# websockets is already a Gilbert core dep — no extra packages needed.
+dependencies = []
+
+[tool.uv]
+package = false
