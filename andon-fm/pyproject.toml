@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-andon-fm"
+version = "1.0.0"
+description = "Andon FM — tune in to the AI-hosted internet radio stations from Andon Labs"
+requires-python = ">=3.12"
+# Pure-stdlib + httpx (already in Gilbert core) — the four stations are
+# plain HTTP MP3 streams on Live365's CDN, and the now-playing scraper
+# uses the core httpx client.
+dependencies = []
+
+[tool.uv]
+package = false

@@ -4,6 +4,7 @@ description: "OpenAI GPT backend — AI chat via the OpenAI Chat Completions API
 
 provides:
   - openai_ai
+  - openai_whisper
 
 requires: []
 
