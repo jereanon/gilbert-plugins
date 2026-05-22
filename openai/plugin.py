@@ -19,6 +19,7 @@ class OpenAIPlugin(Plugin):
 
     async def setup(self, context: PluginContext) -> None:
         from . import openai_ai  # noqa: F401
+        from . import openai_whisper  # noqa: F401
 
     async def teardown(self) -> None:
         pass

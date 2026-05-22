@@ -101,6 +101,7 @@ def backend() -> UniFiPresenceBackend:
     b._access = AsyncMock(spec=UniFiAccess)
     # Default: empty results
     b._network.get_people_on_network = AsyncMock(return_value={})
+    b._network.get_all_resolved_wireless_clients = AsyncMock(return_value={})
     b._protect.get_face_detections = AsyncMock(return_value=[])
     b._access.get_badge_events = AsyncMock(return_value=[])
     # Pre-populate name resolver with test users so signals resolve
@@ -311,6 +312,12 @@ class TestConfig:
         assert config.presence.poll_interval_seconds == 30
 
     def test_presence_full(self) -> None:
+        """Backend-specific keys (unifi_network, device_person_map, …)
+        are NOT in core's typed PresenceConfig schema — they pass
+        through ``BaseConfig.extra="allow"`` as raw dict values, and
+        each backend reads what it needs from the section dict at
+        initialize() time. The test asserts the round-trip rather
+        than dot-typed access."""
         raw = {
             "presence": {
                 "enabled": True,
@@ -333,11 +340,23 @@ class TestConfig:
         }
         config = GilbertConfig.model_validate(raw)
         assert config.presence.enabled is True
-        assert config.presence.unifi_network.host == "https://192.168.1.1"
-        assert config.presence.unifi_protect.verify_ssl is True
-        assert config.presence.device_person_map["aa:bb:cc:dd:ee:ff"] == "brian"
-        assert config.presence.zone_aliases["shop"] == ["warehouse", "bay"]
-        assert config.presence.face_lookback_minutes == 15
+        assert config.presence.backend == "unifi"
+        assert config.presence.poll_interval_seconds == 15
+
+        # Backend-specific extras flow through pydantic's model_extra.
+        extras = config.presence.model_extra or {}
+        assert extras["unifi_network"]["host"] == "https://192.168.1.1"
+        assert extras["unifi_protect"]["verify_ssl"] is True
+        assert extras["device_person_map"]["aa:bb:cc:dd:ee:ff"] == "brian"
+        assert extras["zone_aliases"]["shop"] == ["warehouse", "bay"]
+        assert extras["face_lookback_minutes"] == 15
+        assert extras["badge_lookback_hours"] == 12
+
+        # And model_dump round-trips everything so the entity-store
+        # write / read path preserves backend-specific keys too.
+        dumped = config.presence.model_dump()
+        assert dumped["unifi_network"]["host"] == "https://192.168.1.1"
+        assert dumped["face_lookback_minutes"] == 15
 
 
 # =============================================================================
@@ -493,3 +512,104 @@ class TestUtils:
 
     def test_epoch_ms_zero(self) -> None:
         assert _epoch_ms_to_iso(0) == ""
+
+
+# =============================================================================
+# Phase B: observation emission + mapping overrides
+# =============================================================================
+
+
+class TestObservations:
+    async def test_get_observations_emits_one_per_subsystem(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """Each raw name from each subsystem becomes a PresenceObservation
+        regardless of whether it resolves to a user — that's the whole
+        point of the mapping screen."""
+        backend._access.get_badge_events = AsyncMock(
+            return_value=[_badge("Brian", "in")]
+        )
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Ghost-Face")]
+        )
+        # The mapping path uses get_all_resolved_wireless_clients
+        # (no phone filter) — mock that one for observation tests.
+        backend._network.get_all_resolved_wireless_clients = AsyncMock(
+            return_value=_wifi("Some Unknown Person")
+        )
+
+        observations = await backend.get_observations()
+        backends_seen = {obs.backend for obs in observations}
+        thing_ids = {(obs.backend, obs.thing_id) for obs in observations}
+
+        assert backends_seen == {
+            backend._BACKEND_ACCESS,
+            backend._BACKEND_PROTECT,
+            backend._BACKEND_NETWORK,
+        }
+        assert (backend._BACKEND_PROTECT, "Ghost-Face") in thing_ids
+        assert (backend._BACKEND_NETWORK, "Some Unknown Person") in thing_ids
+
+    async def test_apply_thing_mappings_routes_signals_to_admin_choice(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """An admin-asserted mapping wins over the fuzzy NameResolver
+        — the next get_all_presence cycle emits a UserPresence with
+        the admin-chosen user_id even when fuzzy resolution would
+        have picked a different one (or nothing at all)."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Mystery Person")]
+        )
+
+        # Default fuzzy resolver doesn't know "Mystery Person" — without
+        # a mapping, the signal is silently dropped.
+        result = await backend.get_all_presence()
+        assert result == []
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Mystery Person": "brian"},
+        )
+
+        result = await backend.get_all_presence()
+        assert len(result) == 1
+        assert result[0].user_id == "brian"
+
+    async def test_apply_thing_mappings_unmap_falls_back_to_fuzzy(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """Unmapping (passing an empty user_id) drops the override so
+        the fuzzy NameResolver gets to try again on the next poll."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Brian")]
+        )
+
+        # Map to the wrong user, then unmap.
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": "dale"},
+        )
+        result = await backend.get_all_presence()
+        assert result[0].user_id == "dale"
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": ""},
+        )
+        result = await backend.get_all_presence()
+        # Fuzzy resolver matches "Brian" → user "brian" again.
+        assert result[0].user_id == "brian"
+
+    async def test_apply_thing_mappings_clears_resolver_cache(
+        self, backend: UniFiPresenceBackend
+    ) -> None:
+        """A cached fuzzy resolution must not lock in stale ownership
+        when the admin pushes a new mapping."""
+        backend._protect.get_face_detections = AsyncMock(
+            return_value=[_face("Brian")]
+        )
+        # Prime the resolver cache with the fuzzy "Brian" → "brian" answer.
+        await backend.get_all_presence()
+        assert "brian" in {k.lower() for k in backend._name_resolver._cache}
+
+        await backend.apply_thing_mappings(
+            {f"{backend._BACKEND_PROTECT}:Brian": "dale"},
+        )
+        assert backend._name_resolver._cache == {}

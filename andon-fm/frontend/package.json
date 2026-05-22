@@ -1,0 +1,13 @@
+{
+  "name": "@gilbert-plugin/andon-fm-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Andon FM SPA tuner — dashboard panel that streams AI-hosted radio stations into Gilbert speakers.",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@tanstack/react-query": "^5.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}

@@ -4,6 +4,8 @@ description: "ElevenLabs TTS backend — high-quality text-to-speech via the Ele
 
 provides:
   - elevenlabs_tts
+  - elevenlabs_scribe
+  - elevenlabs_scribe_live
 
 requires: []
 
