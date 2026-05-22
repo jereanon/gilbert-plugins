@@ -300,6 +300,32 @@ class TestLiveAPISurface:
             },
         ]
 
+    async def test_list_calendars_falls_back_to_direct_calendar_lookup(self) -> None:
+        backend, fake = _make_backend()
+        backend._calendar_id = "alice@example.com"
+        fake.calendarList.return_value.list.return_value.execute.return_value = {
+            "items": []
+        }
+        fake.calendars.return_value.get.return_value.execute.return_value = {
+            "id": "alice@example.com",
+            "summary": "Alice",
+            "timeZone": "America/Los_Angeles",
+        }
+
+        out = await backend.list_calendars()
+
+        fake.calendars.return_value.get.assert_called_once_with(
+            calendarId="alice@example.com",
+        )
+        assert out == [
+            {
+                "id": "alice@example.com",
+                "name": "Alice",
+                "timezone": "America/Los_Angeles",
+                "primary": False,
+            }
+        ]
+
     async def test_list_events_passes_order_by_start_time(self) -> None:  # noqa: N802
         backend, fake = _make_backend()
         events_obj = MagicMock()

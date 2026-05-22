@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-openwakeword"
+version = "1.0.0"
+description = "openWakeWord wake-word detection (local, no API key)"
+requires-python = ">=3.12"
+dependencies = [
+    "openwakeword>=0.6",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,9 @@
+name: porcupine
+version: "1.0.0"
+description: "Porcupine wake-word detection"
+
+provides:
+  - porcupine
+
+requires: []
+depends_on: []
