@@ -103,7 +103,7 @@ Plugins extend Gilbert by implementing these interfaces from the main repo's `gi
 
 - **`Plugin`** (`gilbert.interfaces.plugin`) — `metadata()`, `setup(context)`, `teardown()`. Optional hooks: `runtime_dependencies()` (declare non-pip OS deps for `gilbert doctor`) and `ui_panels()` (contribute SPA components into named slots without core knowing about the plugin).
 - **`Service`** (`gilbert.interfaces.service`) — `service_info()`, `start(resolver)`, `stop()`. Implement this when your plugin adds a discoverable service (radio, slack bot, game, etc.).
-- **Backend ABCs** — `AIBackend`, `AuthBackend`, `CameraEventBackend`, `DocumentBackend`, `DoorbellBackend`, `EmailBackend`, `HealthBackend`, `MediaLibraryBackend`, `MusicBackend`, `OCRBackend`, `PresenceBackend`, `SpeakerBackend`, `TaskBackend`, `TTSBackend`, `TunnelBackend`, `UserProviderBackend`, `VisionBackend`, `WebSearchBackend`. Set `backend_name = "…"` on the subclass and the ABC's `__init_subclass__` registers it automatically.
+- **Backend ABCs** — `AIBackend`, `AuthBackend`, `BatchTranscriptionBackend`, `CameraEventBackend`, `DocumentBackend`, `DoorbellBackend`, `EmailBackend`, `HealthBackend`, `MediaLibraryBackend`, `MusicBackend`, `OCRBackend`, `PresenceBackend`, `SpeakerBackend`, `StreamingTranscriptionBackend`, `TaskBackend`, `TTSBackend`, `TunnelBackend`, `UserProviderBackend`, `VisionBackend`, `WakeWordBackend`, `WebSearchBackend`. Set `backend_name = "…"` on the subclass and the ABC's `__init_subclass__` registers it automatically.
 - **`ToolProvider`** protocol (`gilbert.interfaces.tools`) — `tool_provider_name`, `get_tools()`, `execute_tool()`. Implement alongside `Service` to expose AI tools and slash commands.
 - **`ToolOutput`** / **`UIBlock`** (`gilbert.interfaces.ui`) — return interactive forms from tools (inputs, selects, sliders, buttons).
 - **`Configurable`** (`gilbert.interfaces.configuration`) — `config_namespace`, `config_category`, `config_params()`, `on_config_changed()`. Plus `ConfigActionProvider` for "Test connection" / "Link account" buttons on the Settings page.
@@ -149,12 +149,16 @@ class FooPlugin(Plugin):
 
     def ui_routes(self) -> list[UIRoute]:
         """A full SPA page the plugin owns. Optionally synthesizes a
-        nav entry and / or a dashboard card."""
+        nav entry and / or a dashboard card. ``requires_capability``
+        gates the route on a service capability — pair it with your
+        own service's name so a toggled-off plugin's route disappears
+        from both the nav and the SPA's route table."""
         return [UIRoute(path="/foo", panel_id="foo.page",
                         label="Foo", icon="package",
                         add_to_nav=True, nav_parent_group="system",
                         show_in_dashboard=True,
-                        required_role="user")]
+                        required_role="user",
+                        requires_capability="foo")]
 
     def nav_contributions(self) -> list[NavContribution]:
         """Standalone nav items (no associated route)."""
@@ -281,61 +285,13 @@ Treat README drift the same way you treat stale memories: a regression to be fix
 
 Before committing a change that touches any `plugin.yaml`, `plugin.py`, or `config_params()` method, re-read the corresponding README section and confirm it's still accurate. A commit that changes plugin behavior without updating the README is incomplete.
 
-## Agent Memory System
+## Deep-Dive Plugin Docs
 
-Claude AI agents working in this repo use a file-based memory system at `.claude/memory/` to retain knowledge about plugins, their internals, and their gotchas across conversations — the same system Gilbert's main repo uses.
-
-### How it works
-
-1. **Index file:** `.claude/memory/MEMORIES.md` is a flat index of all memories, one per line, each a markdown link to a detailed memory file. The index is the only file Claude loads by default.
-2. **Memory files:** `.claude/memory/memory-<slug>.md` — detailed notes on a specific plugin, integration gotcha, or design decision.
-3. **Loading on demand:** When working on a task, check the index. If a relevant memory exists, read the full file. Always mention in the terminal when you're loading a memory (e.g., "Loading memory: guess-that-song").
-
-### Keeping memories current
-
-**This is not optional.** Memories are how future Claude sessions understand this repo. Treat them like documentation that matters.
-
-- **Create** a memory after designing a non-trivial new plugin or making a significant architectural decision (e.g. "unifi intra-plugin relative imports broke on `submodule_search_locations=[]`").
-- **Update** a memory when the plugin changes in a way that makes the memory stale — new fields, renamed classes, changed behavior, new gotchas.
-- **Remove** a memory when the plugin is deleted or replaced. Stale memories are worse than no memories.
-- **Before every commit in this repo**, review any memories touched by the change. Update stale memories, delete obsolete ones, create new ones for anything significant.
-- After learning something **non-obvious** about a third-party API, a test harness quirk, or a packaging edge case, capture it.
-
-### Memory file format
-
-```markdown
-# <Title>
-
-## Summary
-One or two sentences describing what this is.
-
-## Details
-Detailed information — interfaces used, configuration, how it connects to the
-rest of the system, design decisions, gotchas, test harness surprises, etc.
-
-## Related
-- Links to related memory files or source paths
-```
-
-### Index format (`.claude/memory/MEMORIES.md`)
-
-```markdown
-# Memories
-
-- [Guess That Song Plugin](memory-guess-that-song.md) — multiplayer music guessing game, UI blocks, AI-mediated
-- [UniFi Relative Import Gotcha](memory-unifi-relative-imports.md) — spec_from_file_location + submodule_search_locations=[] breaks intra-plugin relative imports
-```
-
-### Rules
-
-- Keep the index concise — one line per memory, under 120 characters.
-- Memory file names use `memory-<slug>.md` with kebab-case slugs.
-- Don't dump entire source files into memories. Capture the *knowledge* — what it is, why it exists, how it fits together, what surprised you.
-- Always keep `MEMORIES.md` in sync when creating, renaming, or deleting memory files.
+Non-obvious plugin design rationale and gotchas (e.g. the SMAPI-over-SOAP bridge for Spotify-on-Sonos, browser plugin's Docker fallback model) live in `docs/architecture/`. Read on demand when working on that plugin; `ls docs/architecture/` to browse. When a doc drifts from the code, fix it in the same change that caused the drift.
 
 ## Privacy
 
-**Never put private or personal information in tracked files.** This includes plugin source code, `plugin.yaml` examples, README text, and `.claude/memory/` files. API keys, personal email addresses, voice IDs, device names that identify people — none of that goes into commits. If you need an example in a doc, use obvious placeholders (`sk-ant-…`, `xoxb-…`, `example@example.com`).
+**Never put private or personal information in tracked files.** This includes plugin source code, `plugin.yaml` examples, and README text. API keys, personal email addresses, voice IDs, device names that identify people — none of that goes into commits. If you need an example in a doc, use obvious placeholders (`sk-ant-…`, `xoxb-…`, `example@example.com`).
 
 ## Existing Plugins
 

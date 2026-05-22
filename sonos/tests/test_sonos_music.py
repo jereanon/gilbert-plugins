@@ -440,3 +440,12 @@ async def test_link_complete_reads_auth_code_from_saved_settings() -> None:
     persist = result.data["persist"]
     assert persist["settings.refresh_token"] == "refreshed"
     assert persist["settings.spotify_auth_code"] == ""
+
+
+# ── compatible_speaker_backends ────────────────────────────────────────
+
+
+def test_sonos_music_only_compatible_with_sonos_speakers() -> None:
+    """SonosMusic produces Spotify URIs that only Sonos speakers can
+    consume, so it declares sonos-specific compatibility."""
+    assert SonosMusic.compatible_speaker_backends() == frozenset({"sonos"})

@@ -4,6 +4,7 @@ description: "Groq backend — AI chat via Groq's LPU-hosted OpenAI-compatible A
 
 provides:
   - groq_ai
+  - groq_whisper
 
 requires: []
 

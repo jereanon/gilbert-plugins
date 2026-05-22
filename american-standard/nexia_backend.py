@@ -91,6 +91,10 @@ class NexiaThermostatBackend(ThermostatBackend):
         self._session: aiohttp.ClientSession | None = None
         self._home: NexiaHome | None = None
         self._lock = asyncio.Lock()
+        # Background warmup task spawned in initialize() so the Nexia
+        # cloud login doesn't block service startup. Awaitable by tests
+        # / cancellable by close.
+        self._warmup_task: asyncio.Task | None = None
 
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
@@ -138,6 +142,8 @@ class NexiaThermostatBackend(ThermostatBackend):
         ]
 
     async def initialize(self, config: dict[str, object]) -> None:
+        from gilbert.interfaces.service import background_warmup
+
         self._username = str(config.get("username", "") or "")
         self._password = str(config.get("password", "") or "")
         self._brand = str(config.get("brand", "nexia") or "nexia")
@@ -149,10 +155,13 @@ class NexiaThermostatBackend(ThermostatBackend):
             logger.info("Nexia thermostat: not configured (missing credentials)")
             return
 
-        try:
-            await self._connect()
-        except Exception:
-            logger.exception("Nexia thermostat: failed to connect")
+        # ``_connect`` does a Nexia cloud login + state pull (several
+        # seconds). Background it so the thermostat service comes up
+        # immediately; ``self._lock`` inside ``_connect`` serializes
+        # concurrent waiters.
+        self._warmup_task = background_warmup(
+            self._connect(), name="nexia-warmup", log=logger
+        )
 
     async def close(self) -> None:
         await self._close_home()

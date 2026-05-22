@@ -529,6 +529,77 @@ async def test_audio_tags_skip_pretagged_input(backend: ElevenLabsTTS) -> None:
     await backend.close()
 
 
+async def test_audio_tags_fall_back_when_response_diverges(
+    backend: ElevenLabsTTS,
+) -> None:
+    """If the director model goes off-rails and returns something that
+    isn't the input with tags (e.g. an instruction-following meta-reply),
+    fall back to raw text instead of speaking the hallucination."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    # Real-world failure mode: input is a time-of-day response, model
+    # replies with "I'm ready to tag text, please provide the input."
+    ai = _stub_ai(
+        "I understand. I'm ready to tag text for ElevenLabs v3 audio with "
+        "performance cues. Please provide the text you'd like me to add tags to."
+    )
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(
+            SynthesisRequest(
+                text="It's currently 9:36 PM PDT on Sunday, May 17th, 2026.",
+                voice_id="v1",
+            )
+        )
+        # The hallucinated meta-reply MUST NOT be what reaches the API.
+        sent = mock_post.call_args.kwargs["json"]["text"]
+        assert sent == "It's currently 9:36 PM PDT on Sunday, May 17th, 2026."
+
+    await backend.close()
+
+
+async def test_audio_tags_accept_tagged_response_with_high_overlap(
+    backend: ElevenLabsTTS,
+) -> None:
+    """A response that's clearly the input with tags inserted passes the
+    divergence check (regression — make sure the validator isn't too strict)."""
+    await backend.initialize(
+        {"api_key": "sk-test", "enable_audio_tags": True, "audio_tag_min_chars": 0}
+    )
+    ai = _stub_ai(
+        "[curious] Mount Everest is the largest mountain in the world, "
+        "standing at 29,032 feet above sea level. [calm] It's located in "
+        "the Himalayas on the border between Nepal and Tibet."
+    )
+    backend.set_ai_sampling(ai)
+
+    with patch.object(
+        backend._client,  # type: ignore[union-attr]
+        "post",
+        return_value=_make_mock_response(),
+    ) as mock_post:
+        await backend.synthesize(
+            SynthesisRequest(
+                text=(
+                    "Mount Everest is the largest mountain in the world, "
+                    "standing at 29,032 feet above sea level. It's located in "
+                    "the Himalayas on the border between Nepal and Tibet."
+                ),
+                voice_id="v1",
+            )
+        )
+        sent = mock_post.call_args.kwargs["json"]["text"]
+        assert sent.startswith("[curious]")
+
+    await backend.close()
+
+
 async def test_audio_tags_fallback_on_ai_error(backend: ElevenLabsTTS) -> None:
     """If the AI call blows up, synthesize() still succeeds with the
     raw text — TTS must never depend on the director being healthy."""
