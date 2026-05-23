@@ -21,7 +21,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
-import { Mic, MicOff, Loader2 } from "lucide-react";
+import { Mic, MicOff, Loader2, Ear } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -37,7 +37,14 @@ interface TranscriptTurn {
   key: string;
 }
 
-type SessionState = "idle" | "starting" | "active" | "stopping";
+type SessionState =
+  | "idle"
+  | "starting"
+  | "active"      // engine listening + responding
+  | "dormant"     // conversational-mode only: waiting for "Hey Gilbert"
+  | "stopping";
+
+type SessionMode = "turn_based" | "conversational";
 
 const TARGET_SAMPLE_RATE = 16000;
 // We downsample with a ScriptProcessor of bufferSize 4096; at the
@@ -49,6 +56,7 @@ const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
 export function VoiceAgentPage(): ReactElement {
   const { connected, rpc, subscribe } = useWebSocket();
   const [state, setState] = useState<SessionState>("idle");
+  const [mode, setMode] = useState<SessionMode>("turn_based");
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
@@ -93,6 +101,25 @@ export function VoiceAgentPage(): ReactElement {
     return unsub;
   }, [subscribe, teardownAudio]);
 
+  // Conversational mode emits ``voice_agent.state_changed`` when the
+  // server transitions between ``active`` (engine listening) and
+  // ``dormant`` (only the wake-word detector listening, waiting for
+  // "Hey Gilbert" to resume). Reflect the state in the UI so the
+  // user knows what's going on. Mic stays open in both states — only
+  // the routing on the server side changes.
+  useEffect(() => {
+    const unsub = subscribe("voice_agent.state_changed", (event) => {
+      const data = event.data ?? {};
+      const newState = String(data.state ?? "");
+      if (newState === "dormant") {
+        setState("dormant");
+      } else if (newState === "active") {
+        setState("active");
+      }
+    });
+    return unsub;
+  }, [subscribe]);
+
   // Auto-scroll the transcript on every new turn.
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -125,7 +152,10 @@ export function VoiceAgentPage(): ReactElement {
   }, []);
 
   const stop = useCallback(async () => {
-    if (state !== "active") return;
+    // ``dormant`` is a perfectly valid state to stop from too —
+    // conversational mode sits there waiting for "Hey Gilbert" but
+    // the user might want to hard-end without doing the dance.
+    if (state !== "active" && state !== "dormant") return;
     setState("stopping");
     teardownAudio();
     if (sessionId) {
@@ -169,10 +199,12 @@ export function VoiceAgentPage(): ReactElement {
     streamRef.current = stream;
 
     // Tell the backend to open a session. It returns a session_id we
-    // tag every audio chunk with.
+    // tag every audio chunk with. ``mode`` selects the lifecycle:
+    // - ``turn_based``: classic press-button-to-talk
+    // - ``conversational``: wake-word fallback after 10s of silence
     let resp: { ok: boolean; session_id?: string; error?: string };
     try {
-      resp = await rpc({ type: "voice_agent.start_session" });
+      resp = await rpc({ type: "voice_agent.start_session", mode });
     } catch (err) {
       setError(
         err instanceof Error
@@ -258,7 +290,7 @@ export function VoiceAgentPage(): ReactElement {
     muted.connect(audioCtx.destination);
 
     setState("active");
-  }, [state, rpc, teardownAudio]);
+  }, [state, mode, rpc, teardownAudio]);
 
   // Tear down on unmount.
   useEffect(() => {
@@ -277,10 +309,37 @@ export function VoiceAgentPage(): ReactElement {
 
       <Card className="p-6 flex flex-col items-center gap-4">
         {state === "idle" && (
-          <Button size="lg" onClick={start} disabled={!connected}>
-            <Mic className="mr-2 h-5 w-5" />
-            Start Conversation
-          </Button>
+          <>
+            <div className="flex gap-2" role="radiogroup" aria-label="Mode">
+              <Button
+                size="sm"
+                variant={mode === "turn_based" ? "default" : "outline"}
+                onClick={() => setMode("turn_based")}
+                role="radio"
+                aria-checked={mode === "turn_based"}
+              >
+                Turn-based
+              </Button>
+              <Button
+                size="sm"
+                variant={mode === "conversational" ? "default" : "outline"}
+                onClick={() => setMode("conversational")}
+                role="radio"
+                aria-checked={mode === "conversational"}
+              >
+                Conversational
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground max-w-md text-center">
+              {mode === "turn_based"
+                ? "Press the button, talk; Gilbert speaks back. Stays open until you (or he) ends it."
+                : "Like turn-based, but after 10 seconds of silence the session drops to wake-word mode. Say “Hey Gilbert” to wake him up again."}
+            </p>
+            <Button size="lg" onClick={start} disabled={!connected}>
+              <Mic className="mr-2 h-5 w-5" />
+              Start Conversation
+            </Button>
+          </>
         )}
         {state === "starting" && (
           <Button size="lg" disabled>
@@ -289,6 +348,12 @@ export function VoiceAgentPage(): ReactElement {
           </Button>
         )}
         {state === "active" && (
+          <Button size="lg" variant="destructive" onClick={stop}>
+            <MicOff className="mr-2 h-5 w-5" />
+            End Conversation
+          </Button>
+        )}
+        {state === "dormant" && (
           <Button size="lg" variant="destructive" onClick={stop}>
             <MicOff className="mr-2 h-5 w-5" />
             End Conversation
@@ -304,6 +369,12 @@ export function VoiceAgentPage(): ReactElement {
         {state === "active" && (
           <p className="text-sm text-muted-foreground">
             Listening… speak naturally. Gilbert will respond by voice.
+          </p>
+        )}
+        {state === "dormant" && (
+          <p className="flex items-center gap-2 text-sm font-medium text-amber-600 dark:text-amber-400">
+            <Ear className="h-4 w-4" />
+            Waiting for &ldquo;Hey Gilbert&rdquo; — say the wake phrase to resume.
           </p>
         )}
         {error && (

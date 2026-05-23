@@ -333,6 +333,18 @@ class _ActiveSession:
     """One in-flight voice-agent session. Tracks the conversation
     session object so audio chunks from the SPA can be routed to its
     inbound queue, plus the engine task so cleanup can cancel it.
+
+    Conversational mode adds a small state machine:
+
+    - ``active``: audio flows to both the engine (STT path) and the
+      wake-word detector. Brain responds normally.
+    - ``dormant``: audio flows ONLY to the wake detector. Engine sits
+      idle (no transcripts, no LLM calls, no TTS). Recovers via
+      ``"Hey Gilbert"`` wake-word firing.
+
+    ``last_user_activity_ts`` is the timestamp of the most recent
+    user transcript turn — a silence-monitor task watches it to
+    decide when to drop ``active → dormant``.
     """
 
     conversation_id: str
@@ -340,6 +352,15 @@ class _ActiveSession:
     conn_id: str
     session: "_VoiceAgentSession"
     task: asyncio.Task[Any] | None = None
+
+    # Conversational-mode wiring. ``turn_based`` sessions leave these
+    # all None/unused.
+    mode: str = "turn_based"                  # "turn_based" | "conversational"
+    state: str = "active"                     # "active" | "dormant"
+    last_user_activity_ts: float = 0.0
+    wake_detector: Any = None                 # WakeWordDetector | None
+    wake_task: asyncio.Task[Any] | None = None
+    silence_task: asyncio.Task[Any] | None = None
 
 
 # ── Persisted record shape ───────────────────────────────────────────
@@ -561,6 +582,14 @@ class VoiceAgentService(Service):
             old.task.cancel()
 
         originating_conv_id = str(frame.get("originating_conversation_id") or "")
+        # Mode: "turn_based" (default, original behaviour) or
+        # "conversational" (silence-detection → wake-word dormant
+        # state → resume on "Hey Gilbert"). Anything else falls back
+        # to turn_based so a malformed client request doesn't break
+        # the session.
+        mode = str(frame.get("mode") or "turn_based")
+        if mode not in ("turn_based", "conversational"):
+            mode = "turn_based"
         conversation_id = f"vc_{uuid.uuid4().hex[:12]}"
         log = logger.getChild(f"voice:{conversation_id}")
 
@@ -588,8 +617,43 @@ class VoiceAgentService(Service):
             user_id=user_id,
             conn_id=conn.connection_id,
             session=session,
+            mode=mode,
         )
         self._sessions[conn.connection_id] = active
+
+        # Conversational-mode wiring: open a wake-word detector + spawn
+        # two helper tasks (wake-event consumer + silence monitor).
+        # Failure to open the wake detector is logged but doesn't fail
+        # the session — degrade to turn_based behaviour.
+        if mode == "conversational" and self._wake_listener is not None:
+            try:
+                wake_cfg = WakeWordConfig(
+                    keywords=["hey_gilbert"],
+                    format=TranscriptionAudioFormat(
+                        encoding=AudioEncoding.PCM_S16LE,
+                        sample_rate=16000,
+                        channels=1,
+                    ),
+                    sensitivity=0.5,
+                )
+                active.wake_detector = await self._wake_listener.open_detector(
+                    wake_cfg
+                )
+                active.wake_task = asyncio.create_task(
+                    self._consume_wake_events(active),
+                    name=f"voice-agent-wake:{conversation_id}",
+                )
+                active.silence_task = asyncio.create_task(
+                    self._monitor_silence(active),
+                    name=f"voice-agent-silence:{conversation_id}",
+                )
+                log.info("conversational mode: wake detector + silence monitor armed")
+            except Exception:
+                log.exception(
+                    "Failed to open wake-word detector — "
+                    "falling back to turn_based behaviour for this session"
+                )
+                active.mode = "turn_based"
 
         # Connection-drop cleanup. Mirrors TranscriptionService.
         def _on_close(cid: str = conn.connection_id) -> None:
@@ -641,6 +705,21 @@ class VoiceAgentService(Service):
             chunk = base64.b64decode(b64)
         except Exception:
             return {"ref": ref, "ok": False, "error": "invalid base64"}
+
+        # Conversational mode: ALWAYS feed the wake detector (cheap,
+        # local) so "Hey Gilbert" can recover from dormant state.
+        # In DORMANT, don't feed the engine — that's the whole point;
+        # the engine pauses, no STT cost, no LLM calls.
+        if active.mode == "conversational" and active.wake_detector is not None:
+            try:
+                await active.wake_detector.send(chunk)
+            except Exception:
+                logger.debug("wake detector send failed", exc_info=True)
+            if active.state == "dormant":
+                # Audio still flows through us (for the wake detector)
+                # but the engine doesn't see it.
+                return {"ref": ref, "ok": True}
+
         await active.session.push_audio_in(chunk)
         return {"ref": ref, "ok": True}
 
@@ -659,7 +738,142 @@ class VoiceAgentService(Service):
         active = self._sessions.get(conn_id)
         if active is None:
             return
+        # Cancel the conversational helpers first so they don't fire
+        # state transitions during shutdown.
+        if active.wake_task is not None:
+            active.wake_task.cancel()
+        if active.silence_task is not None:
+            active.silence_task.cancel()
+        if active.wake_detector is not None:
+            try:
+                await active.wake_detector.close()
+            except Exception:
+                logger.debug("wake detector close failed", exc_info=True)
         await active.session.end_session()
+
+    # --- Conversational-mode helpers ---------------------------------
+
+    _SILENCE_THRESHOLD_SECONDS = 10.0
+    """How long without a user transcript before we drop ``active``
+    sessions into ``dormant`` (wake-word listening) mode."""
+
+    async def _publish_state_change(
+        self,
+        active: _ActiveSession,
+        new_state: str,
+        reason: str = "",
+    ) -> None:
+        """Emit a ``voice_agent.state_changed`` bus event so the SPA
+        can update its UI (e.g. show "Listening for 'Hey Gilbert'…"
+        when dormant). Same per-user visibility filter as other
+        voice_agent events."""
+        if self._bus is None:
+            return
+        from gilbert.interfaces.events import Event
+
+        await self._bus.publish(
+            Event(
+                event_type="voice_agent.state_changed",
+                data={
+                    "user_id": active.user_id,
+                    "session_id": active.conversation_id,
+                    "state": new_state,
+                    "reason": reason,
+                },
+                source="voice_agent",
+            )
+        )
+
+    async def _transition_to_dormant(
+        self, active: _ActiveSession, reason: str = "silence"
+    ) -> None:
+        if active.state == "dormant":
+            return
+        active.state = "dormant"
+        logger.info(
+            "voice-agent session %s → dormant (%s)",
+            active.conversation_id,
+            reason,
+        )
+        # Drain any half-buffered audio toward STT so the engine
+        # doesn't accidentally process leftover speech after we go
+        # dormant. The audio_in queue's bounded size keeps this from
+        # being unbounded work.
+        try:
+            while True:
+                active.session._audio_in_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        await self._publish_state_change(active, "dormant", reason)
+
+    async def _transition_to_active(
+        self, active: _ActiveSession, reason: str = "wake_word"
+    ) -> None:
+        if active.state == "active":
+            return
+        active.state = "active"
+        # Resetting the activity timestamp prevents the silence
+        # monitor from firing again immediately after a wake.
+        active.last_user_activity_ts = asyncio.get_event_loop().time()
+        logger.info(
+            "voice-agent session %s → active (%s)",
+            active.conversation_id,
+            reason,
+        )
+        await self._publish_state_change(active, "active", reason)
+
+    async def _monitor_silence(self, active: _ActiveSession) -> None:
+        """Watch ``last_user_activity_ts``; drop to dormant after
+        ``_SILENCE_THRESHOLD_SECONDS`` of nothing.
+
+        Started once per conversational session, cancelled at
+        teardown. Polls every 1s — finer-grained doesn't gain
+        anything since the threshold is 10s.
+        """
+        log = logger.getChild(f"silence:{active.conversation_id}")
+        try:
+            while not active.session.closed:
+                await asyncio.sleep(1.0)
+                if active.state != "active":
+                    continue
+                if active.last_user_activity_ts == 0.0:
+                    # Conversation hasn't seen any user audio yet
+                    # (still in the opener). Don't switch to dormant
+                    # before the user has even spoken.
+                    continue
+                elapsed = (
+                    asyncio.get_event_loop().time() - active.last_user_activity_ts
+                )
+                if elapsed >= self._SILENCE_THRESHOLD_SECONDS:
+                    await self._transition_to_dormant(
+                        active, reason=f"{int(elapsed)}s silence"
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("silence monitor crashed")
+
+    async def _consume_wake_events(self, active: _ActiveSession) -> None:
+        """Consume ``WakeEvent``s from the detector and switch
+        dormant → active on a hit."""
+        log = logger.getChild(f"wake:{active.conversation_id}")
+        if active.wake_detector is None:
+            return
+        try:
+            async for ev in active.wake_detector.events():
+                log.info(
+                    "wake event fired — keyword=%r confidence=%s",
+                    ev.keyword,
+                    ev.confidence,
+                )
+                if active.state == "dormant":
+                    await self._transition_to_active(active, reason=ev.keyword)
+                # In active mode, wake events are no-ops — the user
+                # said "Hey Gilbert" but the line was already live.
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("wake event consumer crashed")
 
     @property
     def config_namespace(self) -> str:
@@ -776,6 +990,14 @@ class VoiceAgentService(Service):
                 {"who": who, "text": text, "ts": ts_seconds}
             )
             await self._save_record(record)
+            # Conversational mode: user transcripts reset the silence
+            # timer that decides when to drop into dormant. We update
+            # on EVERY user turn (not just first), so the monitor
+            # only fires after a real gap.
+            if who == "them" and active.mode == "conversational":
+                active.last_user_activity_ts = (
+                    asyncio.get_event_loop().time()
+                )
             # Live-mirror the turn back to the user's voice-agent
             # browser tab. Publishing via the bus instead of holding
             # a ref to the conn keeps the service decoupled from
