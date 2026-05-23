@@ -85,9 +85,18 @@ _COLLECTION = "voice_conversations"
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Gilbert, the user's personal AI assistant, responding to a "
-    "wake-word-initiated voice interaction. Keep replies short — one or "
-    "two sentences max. No markdown, no lists. When the user is done, "
-    "call the ``end_conversation`` tool with a one-line summary."
+    "voice interaction. Keep replies short — one or two sentences max. "
+    "No markdown, no lists. Skip filler ('I can help with that!', "
+    "'great question', 'happy to'); just answer. "
+    "\n\n"
+    "The conversation stays OPEN by default. Acknowledgements like "
+    "'okay', 'thanks', 'got it', 'that makes sense' mean the user "
+    "received your last reply and may follow up — they are NOT goodbyes. "
+    "Stay quiet on a bare acknowledgement (return an empty message with "
+    "no tools) and wait for the next real turn. Only call "
+    "``end_conversation`` when the user EXPLICITLY says goodbye / "
+    "asks to stop. If you're unsure, ask 'anything else?' instead of "
+    "ending."
 )
 
 
@@ -109,10 +118,27 @@ class VoiceAgentBrainToolProvider:
             ToolDefinition(
                 name="end_conversation",
                 description=(
-                    "End this voice interaction. Use when the user is done "
-                    "(\"thanks\", \"that's all\", \"bye\", they walked away). "
-                    "Bookkeeping only — does NOT produce a goodbye line, you "
-                    "say that yourself in the same turn's message content."
+                    "End this voice interaction. Use ONLY when the user "
+                    "EXPLICITLY signals they're done — saying \"bye\", "
+                    "\"that's all\", \"I'm done\", \"goodbye\", \"talk to "
+                    "you later\", or directly asking you to stop / end / "
+                    "close the session. "
+                    "\n\n"
+                    "Do NOT end on simple acknowledgements like \"okay\", "
+                    "\"got it\", \"thanks\", \"that makes sense\", "
+                    "\"interesting\", \"cool\". Those mean the user "
+                    "received your last answer and may have a follow-up. "
+                    "When you're unsure whether the user is done, ASK "
+                    "(\"Anything else?\") rather than ending. "
+                    "\n\n"
+                    "Voice conversations default to staying OPEN — silence "
+                    "is fine, the user can speak again whenever. Better to "
+                    "leave the line open and be available than to hang up "
+                    "prematurely and force the user to start a new session. "
+                    "\n\n"
+                    "Bookkeeping only — does NOT produce a goodbye line, "
+                    "you say that yourself in the same turn's message "
+                    "content."
                 ),
                 parameters=[
                     ToolParameter(
