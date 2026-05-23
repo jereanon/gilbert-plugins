@@ -62,6 +62,7 @@ from gilbert.interfaces.conversation import (
     ConversationStatusEvent,
     OpeningBehavior,
     OpeningPolicy,
+    get_current_conversation_ctx,
 )
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.storage import StorageProvider
@@ -415,7 +416,11 @@ class VoiceAgentService(Service):
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="voice_agent",
-            capabilities=frozenset({"voice_agent", "ws_handlers"}),
+            # ``ai_tools`` advertises the ToolProvider implementation
+            # below — the AI service discovers ``end_conversation`` and
+            # makes it available to LLM turns whose ContextVar puts us
+            # inside an active voice session.
+            capabilities=frozenset({"voice_agent", "ws_handlers", "ai_tools"}),
             requires=frozenset(
                 {
                     "voice_brain",
@@ -429,6 +434,87 @@ class VoiceAgentService(Service):
             toggleable=True,
             toggle_description="Wake-word voice conversations.",
         )
+
+    # --- ToolProvider — voice-session brain tools as Gilbert AI tools ----
+    #
+    # When voice-agent runs the engine in ``use_full_ai_service`` mode,
+    # the LLM gets access to the entire Gilbert tool ecosystem
+    # (knowledge.search, MCP tools, agent dispatch, scheduler, …) via
+    # ``AIService.chat()``. The session-control tools that used to live
+    # in ``VoiceAgentBrainToolProvider`` (the engine-private brain-tool
+    # dispatch path) now live HERE — as regular Gilbert tools the AI
+    # service discovers + dispatches like anything else.
+    #
+    # Visibility gating: ``get_tools`` returns ``[]`` when there's no
+    # active voice ``ConversationContext``, so ``end_conversation``
+    # doesn't pollute regular chat tool lists. The engine sets the
+    # ContextVar before invoking ai.chat().
+
+    @property
+    def tool_provider_name(self) -> str:
+        return "voice_agent"
+
+    def get_tools(
+        self, user_ctx: Any = None
+    ) -> list[ToolDefinition]:
+        # Only surface ``end_conversation`` when we're inside an
+        # active voice session. Regular chat turns never see this
+        # tool — that prevents the LLM from accidentally calling
+        # "end the conversation" in a context where there's no
+        # conversation to end.
+        if get_current_conversation_ctx() is None:
+            return []
+        return [
+            ToolDefinition(
+                name="end_conversation",
+                description=(
+                    "End the active voice conversation. Use ONLY when "
+                    "the user EXPLICITLY signals they're done — saying "
+                    "\"bye\", \"goodbye\", \"I'm done\", \"talk to you "
+                    "later\", or directly asking you to stop / end / "
+                    "close the session. "
+                    "\n\n"
+                    "Do NOT end on simple acknowledgements like \"okay\", "
+                    "\"got it\", \"thanks\", \"that makes sense\", "
+                    "\"interesting\". Those mean the user received "
+                    "your last answer and may have a follow-up. When "
+                    "unsure, ASK (\"Anything else?\") rather than ending. "
+                    "\n\n"
+                    "Voice conversations default to staying OPEN — "
+                    "silence is fine. Better to leave the line open "
+                    "than to hang up prematurely. The tool itself is "
+                    "bookkeeping — say a goodbye line in your message "
+                    "content of the same turn."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="summary",
+                        type=ToolParameterType.STRING,
+                        description=(
+                            "One-line summary of what was accomplished. "
+                            "Posted into the user's chat conversation."
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+    async def execute_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> str:
+        if name == "end_conversation":
+            ctx = get_current_conversation_ctx()
+            if ctx is None:
+                return "(no active voice conversation to end)"
+            summary = str(arguments.get("summary") or "").strip()
+            if summary:
+                ctx.outcome["session_summary"] = summary
+                await ctx.record_turn("system", f"(summary: {summary})")
+            # The engine inspects this flag after each ai.chat() round
+            # and terminates the session when it's set.
+            ctx.outcome["end_requested"] = True
+            return f"OK, ending the conversation. Summary recorded: {summary}"
+        raise KeyError(f"voice_agent has no tool {name!r}")
 
     # --- WS handlers (the SPA's voice-agent page talks to these) ----
 
@@ -783,6 +869,16 @@ class VoiceAgentService(Service):
             # treats MP3 bytes like mulaw and stretches a 22-second
             # clip into 44 seconds of buffering time.
             tts_realtime_pacing=False,
+            # Full Gilbert tool ecosystem: knowledge.search, MCP tools,
+            # agent dispatch, scheduler, calendar, etc. The engine
+            # uses ``AIProvider.chat()`` (multi-round, tool-aggregating)
+            # instead of ``complete_one_shot`` (single-round, brain-
+            # tools-only). End-of-conversation is signalled via the
+            # ``end_conversation`` Gilbert tool which lives on this
+            # service's own ToolProvider; the tool flips
+            # ``ctx.outcome["end_requested"]`` and the engine notices
+            # after each chat() round.
+            use_full_ai_service=True,
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
                 sample_rate=16000,
