@@ -54,7 +54,12 @@ class VoiceAgentPlugin(Plugin):
                 # nav entry and the SPA route.
                 requires_capability="voice_agent",
                 add_to_nav=True,
-                nav_parent_group="chat",
+                # Top-level nav entry (no parent group). Leaving
+                # ``nav_parent_group`` blank tells the nav-merge logic
+                # in core/services/web_api.py to synthesize a new
+                # group keyed off the route's label. Renders as a
+                # standalone "Voice" leaf with the mic icon, same
+                # shape as Calendar / Feeds / Tasks etc.
             ),
         ]
 
