@@ -226,11 +226,26 @@ class _TelnyxAudioSink:
 
     def __init__(self, session: _TelnyxCallSession) -> None:
         self._session = session
+        # Per-call telemetry — bytes/frames out, dropped writes.
+        # Logged from ``write`` so we can tell at a glance whether
+        # audio is actually leaving Gilbert.
+        self._sent = 0
+        self._dropped = 0
 
     async def write(self, chunk: bytes) -> None:
         ws = self._session.media_ws
         if ws is None:
-            return  # carrier not connected yet — silently drop
+            # Surface this — silent drops here look identical to "TTS
+            # ran but the recipient heard silence," and we've burned
+            # debugging cycles on exactly that.
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 50 == 0:
+                logger.warning(
+                    "media WS write dropped (no active WS) — count=%d call=%s",
+                    self._dropped,
+                    self._session.call_id,
+                )
+            return
         frame = {
             "event": "media",
             "stream_id": self._session.stream_id,
@@ -240,8 +255,24 @@ class _TelnyxAudioSink:
         }
         try:
             await ws.send_text(json.dumps(frame))
+            self._sent += 1
+            # First-byte log is the smoking gun for "did any audio
+            # leave Gilbert at all" — keep it loud.
+            if self._sent == 1:
+                logger.info(
+                    "media WS first outbound chunk sent — call=%s "
+                    "stream_id=%s bytes=%d",
+                    self._session.call_id,
+                    self._session.stream_id,
+                    len(chunk),
+                )
         except Exception:
-            logger.debug("media WS send failed", exc_info=True)
+            logger.warning(
+                "media WS send failed — call=%s sent_before_failure=%d",
+                self._session.call_id,
+                self._sent,
+                exc_info=True,
+            )
 
     async def clear(self) -> None:
         ws = self._session.media_ws
