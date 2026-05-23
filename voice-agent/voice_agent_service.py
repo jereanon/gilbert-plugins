@@ -751,6 +751,12 @@ class VoiceAgentService(Service):
             on_transcript_turn=_on_transcript_turn,
             tts_output_format=_TTSAudioFormat.MP3,
             tts_output_mime="audio/mpeg",
+            # Browser plays the whole MP3 in one shot from a data URL,
+            # so the engine doesn't need to pace chunks at carrier
+            # rate. Without this the engine's 20ms-per-160-byte loop
+            # treats MP3 bytes like mulaw and stretches a 22-second
+            # clip into 44 seconds of buffering time.
+            tts_realtime_pacing=False,
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
                 sample_rate=16000,
