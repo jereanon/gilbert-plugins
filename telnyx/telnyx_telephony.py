@@ -390,7 +390,25 @@ class TelnyxTelephony(TelephonyBackend):
                     ),
                 },
             )
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Surface Telnyx's structured error body — they return
+                # JSON with a list of {code, title, detail, source}
+                # objects that pinpoint which field / config is wrong.
+                # ``raise_for_status`` alone gives "Client error 403"
+                # with no actionable detail, which makes diagnosing
+                # carrier-side misconfigurations a guessing game.
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {"raw": r.text[:500]}
+                logger.error(
+                    "Telnyx place_call rejected: status=%d body=%s",
+                    r.status_code,
+                    body,
+                )
+                raise RuntimeError(
+                    f"Telnyx returned {r.status_code}: {body}"
+                )
             data = r.json().get("data", {})
             session.call_control_id = str(data.get("call_control_id") or "")
             _call_control_to_gilbert[session.call_control_id] = call_id
