@@ -377,7 +377,13 @@ class TelnyxTelephony(TelephonyBackend):
                     "webhook_url_method": "POST",
                     "stream_url": media_url,
                     "stream_track": "both_tracks",
-                    "stream_bidirectional_mode": "rtp",
+                    # ``stream_bidirectional_mode`` is RTP-specific and
+                    # caused Telnyx to fire ``streaming.failed`` events
+                    # on the WebSocket transport we use. Two-way audio
+                    # over the Media WS just works without it — Telnyx
+                    # accepts ``event: media`` frames back over the
+                    # same socket by default.
+                    "stream_bidirectional_codec": "PCMU",
                     # Round-trip the token so the media-WS handshake
                     # can authenticate the inbound socket against the
                     # correct session.
