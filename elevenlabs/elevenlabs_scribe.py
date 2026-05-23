@@ -54,13 +54,15 @@ _SEEN_KINDS: set[str] = set()
 
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
 _DEFAULT_BATCH_MODEL = "scribe_v1"
-# Realtime Scribe lives on a separate endpoint with a different model
-# family ("scribe_realtime_v1" / "scribe_realtime_v2"). The earlier
-# default of ``scribe_v1`` was a guess that pre-dated the docs and is
-# rejected by the realtime endpoint with HTTP 403. The live URL is
-# also distinct from what we used to send — it's ``/realtime``, not
-# ``/stream``.
-_DEFAULT_LIVE_MODEL = "scribe_realtime_v2"
+# Realtime Scribe lives on a separate endpoint with its own model
+# id. The realtime endpoint rejects the batch ``scribe_v1`` model
+# (used to fail silently — the WS handshake passed, then every
+# session got dropped before transcribing anything). The current
+# realtime model is ``scribe_v2_realtime`` — note the suffix order
+# (the prefix is ``scribe_v2_`` then ``realtime``, not
+# ``scribe_realtime_v2``). ElevenLabs' own ``invalid_request``
+# error message dictated the exact spelling.
+_DEFAULT_LIVE_MODEL = "scribe_v2_realtime"
 _DEFAULT_LIVE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 
@@ -296,10 +298,21 @@ class _ScribeLiveStream(TranscriptionStream):
                 "quota_exceeded",
                 "rate_limited",
                 "session_error",
+                "invalid_request",
                 "error",
             ):
+                # ``invalid_request`` is the API's discriminator for
+                # bad query params / bad model_id / bad audio_format
+                # values. Surface as a non-recoverable error so the
+                # listen_loop knows to degrade gracefully — previously
+                # this fell through to the silent ``else`` branch and
+                # the brain kept happily streaming audio at a server
+                # that had already given up on the session.
                 yield TranscriptionError(
-                    message=f"{kind}: {msg.get('message') or msg.get('detail') or '?'}",
+                    message=(
+                        f"{kind}: "
+                        f"{msg.get('message') or msg.get('error') or msg.get('detail') or '?'}"
+                    ),
                     recoverable=False,
                 )
 
