@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
@@ -205,7 +206,8 @@ async def exchange_google_oauth_code(
     redirect_uri: str,
     auth_code: str,
 ) -> dict[str, str]:
-    response = await httpx.post(
+    response = await asyncio.to_thread(
+        httpx.post,
         GOOGLE_TOKEN_URI,
         data={
             "client_id": client_id,

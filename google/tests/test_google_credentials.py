@@ -187,7 +187,7 @@ async def test_exchange_oauth_code_returns_persist_payload(
 
     captured: dict[str, Any] = {}
 
-    async def fake_post(url: str, data: dict[str, Any]) -> FakeResponse:
+    def fake_post(url: str, data: dict[str, Any]) -> FakeResponse:
         captured["url"] = url
         captured["data"] = data
         return FakeResponse()
