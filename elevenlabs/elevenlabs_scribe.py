@@ -13,6 +13,7 @@ may need tweaking.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
@@ -24,6 +25,7 @@ import httpx
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.transcription import (
+    AudioEncoding,
     BatchTranscriptionBackend,
     FinalTranscript,
     PartialTranscript,
@@ -43,8 +45,14 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
 _DEFAULT_BATCH_MODEL = "scribe_v1"
-_DEFAULT_LIVE_MODEL = "scribe_v1"
-_DEFAULT_LIVE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/stream"
+# Realtime Scribe lives on a separate endpoint with a different model
+# family ("scribe_realtime_v1" / "scribe_realtime_v2"). The earlier
+# default of ``scribe_v1`` was a guess that pre-dated the docs and is
+# rejected by the realtime endpoint with HTTP 403. The live URL is
+# also distinct from what we used to send — it's ``/realtime``, not
+# ``/stream``.
+_DEFAULT_LIVE_MODEL = "scribe_realtime_v2"
+_DEFAULT_LIVE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 
 def _common_config(default_model: str) -> list[ConfigParam]:
@@ -160,16 +168,34 @@ class ElevenLabsScribeBackend(BatchTranscriptionBackend):
 
 
 class _ScribeLiveStream(TranscriptionStream):
-    """A live streaming session backed by an ElevenLabs WebSocket."""
+    """A live streaming session backed by an ElevenLabs WebSocket.
 
-    def __init__(self, ws: Any) -> None:
+    Implements ElevenLabs' Scribe Realtime protocol (as documented at
+    https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime).
+
+    Client → server frames are JSON ``input_audio_chunk`` messages
+    carrying base64-encoded audio. Server → client frames are JSON
+    with ``message_type`` ∈ {``session_started``, ``partial_transcript``,
+    ``committed_transcript``, …} plus various error variants. With
+    ``commit_strategy=vad`` selected at session creation the server
+    automatically commits a transcript when it detects end of speech,
+    so we don't need a manual commit signal.
+    """
+
+    def __init__(self, ws: Any, sample_rate: int) -> None:
         self._ws = ws
         self._closed = False
+        self._sample_rate = sample_rate
 
     async def send(self, chunk: bytes) -> None:
         if self._closed:
             return
-        await self._ws.send(chunk)
+        payload = {
+            "message_type": "input_audio_chunk",
+            "audio_base_64": base64.b64encode(chunk).decode("ascii"),
+            "sample_rate": self._sample_rate,
+        }
+        await self._ws.send(json.dumps(payload))
 
     async def close(self) -> None:
         if self._closed:
@@ -192,25 +218,44 @@ class _ScribeLiveStream(TranscriptionStream):
                 msg = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
             except Exception:  # noqa: BLE001
                 continue
-            kind = msg.get("type", "")
-            if kind == "partial":
+            # The realtime API uses ``message_type`` as the discriminator
+            # (older code looked for ``type`` — that field never exists
+            # on the live endpoint and made every message a silent
+            # no-op).
+            kind = msg.get("message_type") or msg.get("type") or ""
+            if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
-                    text=str(msg.get("text", "")),
+                    text=str(msg.get("text") or msg.get("transcript") or ""),
                     start_seconds=float(msg.get("start", 0.0)),
                 )
-            elif kind == "final":
+            elif kind in (
+                "committed_transcript",
+                "committed_transcript_with_timestamps",
+                "final",
+            ):
                 yield FinalTranscript(
-                    text=str(msg.get("text", "")),
+                    text=str(msg.get("text") or msg.get("transcript") or ""),
                     start_seconds=float(msg.get("start", 0.0)),
                     end_seconds=float(msg.get("end", 0.0)),
                 )
-            elif kind == "speech_started":
+            elif kind in ("speech_started", "vad_speech_start"):
                 yield SpeechStarted(at_seconds=float(msg.get("at", 0.0)))
-            elif kind == "speech_ended":
+            elif kind in ("speech_ended", "vad_speech_end"):
                 yield SpeechEnded(at_seconds=float(msg.get("at", 0.0)))
-            elif kind == "error":
+            elif kind == "session_started":
+                # Handshake-complete signal; no event for the brain to
+                # consume, but useful in logs if we ever wire up
+                # session-level diagnostics here.
+                continue
+            elif kind in (
+                "auth_error",
+                "quota_exceeded",
+                "rate_limited",
+                "session_error",
+                "error",
+            ):
                 yield TranscriptionError(
-                    message=str(msg.get("message", "scribe error")),
+                    message=f"{kind}: {msg.get('message') or msg.get('detail') or '?'}",
                     recoverable=False,
                 )
 
@@ -246,14 +291,35 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
 
     async def open_stream(self, config: StreamConfig) -> TranscriptionStream:
         import ssl
+        from urllib.parse import urlencode
 
         import certifi
         import websockets  # deferred — only needed for streaming
 
-        url = (
-            f"{self._ws_url}?model_id={self._model}"
-            f"&language_code={config.language or 'auto'}"
-        )
+        # Pick an ``audio_format`` query value that matches what we'll
+        # be sending. The realtime endpoint accepts a fixed set of
+        # encodings; pick the closest match to the StreamConfig the
+        # caller asked for. Falls back to ``pcm_16000`` (the API
+        # default) when we can't tell.
+        audio_format = _audio_format_for(config.format.encoding, config.format.sample_rate)
+
+        params = {
+            "model_id": self._model,
+            "audio_format": audio_format,
+            # ``commit_strategy=vad`` makes ElevenLabs run server-side
+            # voice-activity detection and emit ``committed_transcript``
+            # frames at end-of-speech automatically. Without it the
+            # client must manually commit (we'd have to bolt VAD on
+            # locally), and the brain wouldn't see FinalTranscript
+            # events without an explicit signal — which is exactly the
+            # symptom the user reported ("Gilbert said his opening line
+            # but didn't respond to my question").
+            "commit_strategy": "vad",
+        }
+        if config.language and config.language != "auto":
+            params["language_code"] = config.language
+        url = f"{self._ws_url}?{urlencode(params)}"
+
         # Pass an explicit SSL context using certifi's CA bundle. On
         # NixOS (and other distros where the system CA path isn't
         # ``/etc/ssl/cert.pem``) Python's default SSL context can't
@@ -269,4 +335,29 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
             max_size=None,
             ssl=ssl_context,
         )
-        return _ScribeLiveStream(ws)
+        logger.info(
+            "ElevenLabs Scribe Live: connected — model=%s audio_format=%s",
+            self._model,
+            audio_format,
+        )
+        return _ScribeLiveStream(ws, sample_rate=config.format.sample_rate)
+
+
+def _audio_format_for(encoding: AudioEncoding, sample_rate: int) -> str:
+    """Map our internal ``AudioEncoding`` + sample rate to the value the
+    ElevenLabs realtime endpoint expects in its ``audio_format`` query
+    param. The API supports a fixed list (``pcm_8000``, ``pcm_16000``,
+    ``pcm_22050``, ``pcm_24000``, ``pcm_44100``, ``pcm_48000``,
+    ``ulaw_8000``); anything else gets clamped to the closest PCM rate.
+    """
+    if encoding == AudioEncoding.PCM_S16LE:
+        # ElevenLabs only accepts a discrete set of PCM rates.
+        for rate in (8000, 16000, 22050, 24000, 44100, 48000):
+            if rate >= sample_rate:
+                return f"pcm_{rate}"
+        return "pcm_48000"
+    # Caller asked for something exotic (opus, mp3, mulaw via a custom
+    # encoding) — best-effort fall through to mulaw 8k since that's
+    # what the phone-call path actually sends (the brain converts to
+    # PCM upstream, but a future caller might bypass that).
+    return "ulaw_8000"
