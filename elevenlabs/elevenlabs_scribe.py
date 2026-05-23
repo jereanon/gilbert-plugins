@@ -227,11 +227,6 @@ class _ScribeLiveStream(TranscriptionStream):
 
     async def events(self) -> AsyncIterator[TranscriptionEvent]:
         recv_count = 0
-        # Latched per-utterance: True after we've yielded a
-        # SpeechStarted for the current run of partials, reset to
-        # False after a commit. Stops us from firing one event per
-        # partial during a single user utterance.
-        partial_seen = False
         while True:
             try:
                 raw = await self._ws.recv()
@@ -285,34 +280,25 @@ class _ScribeLiveStream(TranscriptionStream):
             # Synthesize ``SpeechStarted`` events from
             # ``partial_transcript`` frames. The Scribe Realtime API
             # doesn't have a dedicated speech-start signal — it sends
-            # ``partial_transcript`` continuously as it transcribes
-            # streaming audio, then a ``committed_transcript`` after
-            # the VAD silence threshold (1.5s). Without this synthesis
-            # the phone-call brain's barge-in handler never fires:
-            # the user can speak DURING Gilbert's TTS, but the
-            # ``committed_transcript`` only arrives ~1.5s after they
-            # stop, by which time Gilbert has played through his
-            # entire utterance. The user-visible symptom is
-            # "everything I said got queued up after Gilbert finished."
+            # ``partial_transcript`` as it transcribes (sometimes
+            # in real-time, sometimes batched against its VAD
+            # commit cadence) and a ``committed_transcript`` once the
+            # silence threshold elapses. Without this synthesis the
+            # phone-call brain's barge-in handler never fires: the
+            # user can speak DURING Gilbert's TTS, but the events
+            # the brain watches for (``SpeechStarted``) simply don't
+            # exist on this protocol.
             #
-            # We emit a single ``SpeechStarted`` on the FIRST
-            # non-empty partial after each commit, not every partial
-            # — the brain's barge-in handler is idempotent (checks
-            # ``speaking.active``) but a steady stream of identical
-            # events is just noise.
+            # Fire on EVERY non-empty partial (no per-utterance latch).
+            # The brain's ``speaking.cancelled = True; audio_out.clear()``
+            # is idempotent. When Scribe batches partials and dumps
+            # six at once, all six firing SpeechStarted is fine — the
+            # first one barges-out, the rest are no-ops. The cost of
+            # the redundant signal is a few log lines and that's it.
             if kind in ("partial_transcript", "partial"):
                 partial_text = str(msg.get("text") or msg.get("transcript") or "").strip()
-                if partial_text and not partial_seen:
-                    partial_seen = True
+                if partial_text:
                     yield SpeechStarted(at_seconds=float(msg.get("at", 0.0)))
-            elif kind in (
-                "committed_transcript",
-                "committed_transcript_with_timestamps",
-                "final",
-            ):
-                # Commit resets the partial-arming flag so the next
-                # utterance triggers a fresh SpeechStarted.
-                partial_seen = False
             if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
                     text=str(msg.get("text") or msg.get("transcript") or ""),
@@ -416,6 +402,21 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
             # symptom the user reported ("Gilbert said his opening line
             # but didn't respond to my question").
             "commit_strategy": "vad",
+            # The API default is 1.5s — too slow for a phone-call brain
+            # that needs to barge-in on the user's interruption. Diagnostic
+            # showed Scribe was holding *all* partials AND the final
+            # commit until 1.5s of silence elapsed; during a continuous
+            # Gilbert-and-user-overlap window the user's words wouldn't
+            # reach the brain until the very end of Gilbert's TTS. 0.3s
+            # is still long enough to absorb normal between-word pauses
+            # ("um, so, …") without false-committing mid-thought, but
+            # fast enough that interruptions land while Gilbert is still
+            # mid-utterance and barge-in actually has something to cancel.
+            "vad_silence_threshold_secs": "0.3",
+            # min_speech_duration_ms — 100ms (the API default) means a
+            # brief cough / "uh" can fire a SpeechStarted. Bump to 200
+            # so background noises don't keep canceling Gilbert's TTS.
+            "min_speech_duration_ms": "200",
         }
         if config.language and config.language != "auto":
             params["language_code"] = config.language
