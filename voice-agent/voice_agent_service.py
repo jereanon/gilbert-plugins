@@ -664,6 +664,30 @@ class VoiceAgentService(Service):
                 {"who": who, "text": text, "ts": ts_seconds}
             )
             await self._save_record(record)
+            # Live-mirror the turn back to the user's voice-agent
+            # browser tab. Publishing via the bus instead of holding
+            # a ref to the conn keeps the service decoupled from
+            # WS connection lifecycle — if the user refreshes mid-
+            # conversation the new connection still gets future
+            # turns via the subscription. ``user_id`` in data is what
+            # the WS visibility filter uses to scope the event to
+            # the right tab.
+            if self._bus is not None:
+                from gilbert.interfaces.events import Event
+
+                await self._bus.publish(
+                    Event(
+                        event_type="voice_agent.transcript_turn",
+                        data={
+                            "user_id": active.user_id,
+                            "session_id": active.conversation_id,
+                            "who": who,
+                            "text": text,
+                            "ts": ts_seconds,
+                        },
+                        source="voice_agent",
+                    )
+                )
 
         async def _on_status_change(
             status: ConversationStatus, reason: str

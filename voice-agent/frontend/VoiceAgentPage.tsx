@@ -27,6 +27,16 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
+/** A single transcript turn rendered in the live feed. */
+interface TranscriptTurn {
+  who: string;       // "us" (Gilbert) | "them" (the user) | "system"
+  text: string;
+  ts: number;        // seconds since session start
+  /** Local React-only id so we can render this without a key collision when
+   * the same text repeats. The server doesn't issue ids; we mint per-row. */
+  key: string;
+}
+
 type SessionState = "idle" | "starting" | "active" | "stopping";
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -37,10 +47,41 @@ const TARGET_SAMPLE_RATE = 16000;
 const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
 
 export function VoiceAgentPage(): ReactElement {
-  const { connected, rpc } = useWebSocket();
+  const { connected, rpc, subscribe } = useWebSocket();
   const [state, setState] = useState<SessionState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Subscribe to live transcript-turn events from the backend. The
+  // server emits ``voice_agent.transcript_turn`` for every "them"
+  // (user-side STT commit) and "us" (LLM reply) turn so the SPA can
+  // render the conversation as it happens — useful even when the
+  // audio-out path is misbehaving and the user can't hear Gilbert.
+  useEffect(() => {
+    const unsub = subscribe("voice_agent.transcript_turn", (event) => {
+      const data = event.data ?? {};
+      const who = String(data.who ?? "");
+      const text = String(data.text ?? "");
+      const ts =
+        typeof data.ts === "number" ? data.ts : Number(data.ts ?? 0);
+      if (!who || !text) return;
+      const newTurn: TranscriptTurn = {
+        who,
+        text,
+        ts,
+        key: `${ts}-${who}-${Math.random().toString(36).slice(2, 8)}`,
+      };
+      setTranscript((prev) => [...prev, newTurn]);
+    });
+    return unsub;
+  }, [subscribe]);
+
+  // Auto-scroll the transcript on every new turn.
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcript]);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -89,6 +130,7 @@ export function VoiceAgentPage(): ReactElement {
   const start = useCallback(async () => {
     if (state !== "idle") return;
     setError(null);
+    setTranscript([]);
     setState("starting");
 
     let stream: MediaStream;
@@ -258,6 +300,47 @@ export function VoiceAgentPage(): ReactElement {
           </p>
         )}
       </Card>
+
+      {transcript.length > 0 && (
+        <Card className="mt-6 p-4 max-h-[400px] overflow-y-auto">
+          <h2 className="text-sm font-semibold text-muted-foreground mb-3">
+            Live transcript
+          </h2>
+          <div className="space-y-2 text-sm">
+            {transcript.map((t) => (
+              <div
+                key={t.key}
+                className={
+                  t.who === "us"
+                    ? "flex items-start gap-3"
+                    : t.who === "them"
+                      ? "flex items-start gap-3"
+                      : "flex items-start gap-3 text-muted-foreground italic"
+                }
+              >
+                <span
+                  className={
+                    "shrink-0 font-semibold w-20 " +
+                    (t.who === "us"
+                      ? "text-primary"
+                      : t.who === "them"
+                        ? "text-foreground"
+                        : "text-muted-foreground")
+                  }
+                >
+                  {t.who === "us"
+                    ? "Gilbert"
+                    : t.who === "them"
+                      ? "You"
+                      : "System"}
+                </span>
+                <span className="flex-1 break-words">{t.text}</span>
+              </div>
+            ))}
+            <div ref={transcriptEndRef} />
+          </div>
+        </Card>
+      )}
 
       <div className="mt-6 text-xs text-muted-foreground space-y-1">
         <p>
