@@ -713,8 +713,14 @@ class VoiceAgentService(Service):
                 behavior=OpeningBehavior.SPEAK_FIRST,
                 fallback_timeout_seconds=1.0,
             ),
+            # NOTE: ``max_conversation_seconds`` is the engine's hard
+            # cap — if the conversation runs longer than this, the
+            # watchdog forces it to end. NOT the same as
+            # ``idle_timeout_seconds`` (which would be silence-based).
+            # Default to 5 min so the watchdog isn't a routine hit;
+            # idle handling is a TODO.
             max_conversation_seconds=int(
-                self._config.get("idle_timeout_seconds", 60) or 60
+                self._config.get("max_conversation_seconds", 300) or 300
             ),
             priming_messages=priming,
             on_status_change=_on_status_change,
