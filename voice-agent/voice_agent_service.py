@@ -427,13 +427,19 @@ class VoiceAgentService(Service):
     async def _ws_start_session(
         self, conn: Any, frame: dict[str, Any]
     ) -> dict[str, Any]:
+        # The SPA's ``rpc()`` matches replies by ``frame.ref`` echoing
+        # the original frame's ``id``. The WS dispatch layer doesn't
+        # auto-inject this — handlers have to echo it themselves on
+        # every response or the SPA's pending promise hits the 15-second
+        # RPC timeout.
+        ref = frame.get("id")
         if not self._enabled:
-            return {"ok": False, "error": "voice-agent service disabled"}
+            return {"ref": ref, "ok": False, "error": "voice-agent service disabled"}
         if self._voice_brain is None:
-            return {"ok": False, "error": "voice_brain unavailable"}
+            return {"ref": ref, "ok": False, "error": "voice_brain unavailable"}
         user_id = conn.user_id or ""
         if not user_id:
-            return {"ok": False, "error": "unauthenticated connection"}
+            return {"ref": ref, "ok": False, "error": "unauthenticated connection"}
 
         # One session per WS connection. If a stale one is still
         # around (browser refresh, dropped task), tear it down before
@@ -504,36 +510,38 @@ class VoiceAgentService(Service):
             ConversationStatusEvent(status=ConversationStatus.ACTIVE)
         )
 
-        return {"ok": True, "session_id": conversation_id}
+        return {"ref": ref, "ok": True, "session_id": conversation_id}
 
     async def _ws_send_audio_chunk(
         self, conn: Any, frame: dict[str, Any]
     ) -> dict[str, Any]:
         import base64
 
+        ref = frame.get("id")
         sid = frame.get("session_id")
         b64 = frame.get("audio_b64")
         if not isinstance(sid, str) or not isinstance(b64, str):
-            return {"ok": False, "error": "missing session_id or audio_b64"}
+            return {"ref": ref, "ok": False, "error": "missing session_id or audio_b64"}
         active = self._sessions.get(conn.connection_id)
         if active is None or active.conversation_id != sid:
-            return {"ok": False, "error": "unknown session"}
+            return {"ref": ref, "ok": False, "error": "unknown session"}
         try:
             chunk = base64.b64decode(b64)
         except Exception:
-            return {"ok": False, "error": "invalid base64"}
+            return {"ref": ref, "ok": False, "error": "invalid base64"}
         await active.session.push_audio_in(chunk)
-        return {"ok": True}
+        return {"ref": ref, "ok": True}
 
     async def _ws_end_session(
         self, conn: Any, frame: dict[str, Any]
     ) -> dict[str, Any]:
+        ref = frame.get("id")
         sid = frame.get("session_id")
         active = self._sessions.get(conn.connection_id)
         if active is None or (sid is not None and active.conversation_id != sid):
-            return {"ok": False, "error": "unknown session"}
+            return {"ref": ref, "ok": False, "error": "unknown session"}
         await active.session.end_session()
-        return {"ok": True}
+        return {"ref": ref, "ok": True}
 
     async def _teardown_session_by_conn(self, conn_id: str) -> None:
         active = self._sessions.get(conn_id)
@@ -674,6 +682,28 @@ class VoiceAgentService(Service):
         )
         from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
 
+        # Priming message so the SPEAK_FIRST opener has something to
+        # respond to. The Anthropic Messages API rejects requests with
+        # ``messages=[]`` (400 "at least one message is required"), so
+        # the engine's first ``_think_and_speak`` would crash on
+        # session start without this. We use a synthetic user-role
+        # cue rather than baking it into the system prompt so the
+        # LLM treats it as "the user just signalled they want to
+        # talk" rather than as an instruction.
+        from gilbert.interfaces.ai import Message as _Message
+        from gilbert.interfaces.ai import MessageRole as _MessageRole
+
+        priming = [
+            _Message(
+                role=_MessageRole.USER,
+                content=(
+                    "(SYSTEM) The user just activated voice mode. Greet "
+                    "them briefly — one short sentence — and let them "
+                    "know you're listening."
+                ),
+            )
+        ]
+
         config = ConversationConfig(
             system_prompt=str(
                 self._config.get("system_prompt") or _DEFAULT_SYSTEM_PROMPT
@@ -686,7 +716,7 @@ class VoiceAgentService(Service):
             max_conversation_seconds=int(
                 self._config.get("idle_timeout_seconds", 60) or 60
             ),
-            priming_messages=[],
+            priming_messages=priming,
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
             tts_output_format=_TTSAudioFormat.MP3,
