@@ -61,6 +61,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `aiosonos`, `zeroconf` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
 | [telegram](#telegram) | `PushNotificationBackend "telegram"` | — (uses `httpx`) | Notifications |
+| [telnyx](#telnyx) | `TelephonyBackend "telnyx"` (drives `PhoneCallService`) | — (uses `httpx`, `websockets`) | Telephony |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
@@ -1206,6 +1207,31 @@ exposed via `runtime_data["bot_username"]` so the chat-id wizard's
 roundtrip. The bot **token** is never present in `runtime_data`.
 
 **No third-party Python dependencies** — uses core's `httpx`.
+
+---
+
+### telnyx
+
+Telnyx telephony backend that powers `PhoneCallService` — places outbound PSTN calls and streams bidirectional G.711 mulaw audio over a Telnyx Media Stream WebSocket. The conversation brain (STT, LLM, TTS, barge-in handling) lives in core's `PhoneCallService`; this plugin handles only the carrier side.
+
+Two integration points Telnyx talks to on Gilbert:
+
+- `POST /api/telnyx/webhook` — call-control events (`call.initiated`, `call.answered`, `call.hangup`, `call.dtmf.received`, `streaming.failed`).
+- `WS /api/telnyx/media` — bidirectional media stream. Telnyx forwards remote-side mulaw audio inbound; Gilbert writes synthesized mulaw outbound through the same socket.
+
+Both endpoints must be reachable from Telnyx's network, which means Gilbert needs a publicly-routable HTTPS URL — either an existing reverse-proxy / tunnel (Cloudflared, ngrok, your own ingress) or the ngrok plugin's tunnel service.
+
+**Backend registered** — `TelephonyBackend.backend_name = "telnyx"`.
+
+**Configure** (Settings → Phone → backend selector + below)
+
+- `api_key` — Telnyx API v2 key (starts with `KEY...`). Found in the Telnyx portal under Account → API Keys. **Sensitive — redacted in the UI.**
+- `connection_id` — Telnyx Call Control Connection id. Found under Voice → Call Control Applications. Tells Telnyx which application's webhook URL to use for events from outbound calls.
+- `public_url` — Public HTTPS base URL Telnyx can reach this Gilbert instance at (e.g. `https://gilbert.example.com`). Webhooks land at `/api/telnyx/webhook`, the media stream at `wss://.../api/telnyx/media`.
+
+The corresponding `PhoneCallService` settings (caller-ID, max-call-seconds, opening-disclosure prompt, call system prompt) live under Settings → Phone too — see the main Gilbert README for the service-level config.
+
+**No third-party Python dependencies** — talks to Telnyx via `httpx` and the Media Stream over the same `websockets` library Deepgram uses.
 
 ---
 

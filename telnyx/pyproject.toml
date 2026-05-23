@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-telnyx"
+version = "1.0.0"
+description = "Telnyx telephony backend (outbound PSTN + bidirectional media streaming) for Gilbert"
+requires-python = ">=3.12"
+# ``httpx`` is in Gilbert core. ``websockets`` we already pull in via
+# Deepgram. No additional third-party deps.
+dependencies = []
+
+[tool.uv]
+package = false

@@ -1,0 +1,9 @@
+name: telnyx
+version: "1.0.0"
+description: "Telnyx telephony backend — outbound PSTN calls + bidirectional media streaming for PhoneCallService"
+
+provides:
+  - telnyx_telephony
+
+requires: []
+depends_on: []
