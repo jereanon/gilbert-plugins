@@ -246,9 +246,17 @@ class _TelnyxAudioSink:
                     self._session.call_id,
                 )
             return
+        # Telnyx's docs for bidirectional WS injection (see
+        # /docs/voice/programmable-voice/media-streaming) show the
+        # outbound frame as just ``{"event": "media", "media":
+        # {"payload": ...}}`` — no ``stream_id`` at the top level.
+        # The WebSocket itself is already scoped to one stream, so
+        # the field is implicit. We used to send a top-level
+        # ``stream_id`` defensively but it's not part of the documented
+        # contract; keeping it out matches what their reference
+        # examples do.
         frame = {
             "event": "media",
-            "stream_id": self._session.stream_id,
             "media": {
                 "payload": base64.b64encode(chunk).decode("ascii"),
             },
@@ -280,10 +288,10 @@ class _TelnyxAudioSink:
             return
         # Telnyx supports ``clear`` to drop everything they have
         # buffered for the outbound direction — used on barge-in.
+        # Same shape contract as ``media`` frames: no top-level
+        # ``stream_id`` needed; the WS scopes the operation.
         try:
-            await ws.send_text(
-                json.dumps({"event": "clear", "stream_id": self._session.stream_id})
-            )
+            await ws.send_text(json.dumps({"event": "clear"}))
         except Exception:
             logger.debug("media WS clear failed", exc_info=True)
 
@@ -408,12 +416,21 @@ class TelnyxTelephony(TelephonyBackend):
                     "webhook_url_method": "POST",
                     "stream_url": media_url,
                     "stream_track": "both_tracks",
-                    # ``stream_bidirectional_mode`` is RTP-specific and
-                    # caused Telnyx to fire ``streaming.failed`` events
-                    # on the WebSocket transport we use. Two-way audio
-                    # over the Media WS just works without it — Telnyx
-                    # accepts ``event: media`` frames back over the
-                    # same socket by default.
+                    # Bidirectional mode is REQUIRED to send audio FROM
+                    # the application INTO the call. Without it Telnyx
+                    # silently drops every outbound media frame — no
+                    # ``streaming.failed`` event, no error on the WS,
+                    # just dead air on the recipient's phone. The name
+                    # ``"rtp"`` is a Telnyx misnomer: no separate RTP
+                    # socket is opened. Audio still flows back over
+                    # this same WebSocket; ``"rtp"`` just enables the
+                    # inject-into-call path. (Earlier we'd briefly
+                    # tried this value and seen ``streaming.failed``,
+                    # but that was a different config defect — the
+                    # docs at developers.telnyx.com/docs/voice
+                    # /programmable-voice/media-streaming explicitly
+                    # require this for outbound injection.)
+                    "stream_bidirectional_mode": "rtp",
                     "stream_bidirectional_codec": "PCMU",
                     # ``stream_custom_parameters`` is what Telnyx echoes
                     # into the ``start`` frame's ``custom_parameters``.
