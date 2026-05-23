@@ -483,6 +483,20 @@ async def deliver_webhook_event(payload: dict[str, Any]) -> None:
     event_type = str(data.get("event_type") or "")
     inner = data.get("payload") or {}
     cc_id = str(inner.get("call_control_id") or "")
+    # One-line per-webhook trace so the call's full lifecycle is
+    # visible in the journal. ``hangup_cause`` is the most useful
+    # snippet for the common case (call ended); other event types
+    # have their own per-handler logging below.
+    logger.info(
+        "Telnyx webhook: event=%s call_control_id=%s extras=%s",
+        event_type,
+        cc_id[:24] + "…" if len(cc_id) > 24 else cc_id,
+        {
+            k: v
+            for k, v in inner.items()
+            if k in ("hangup_cause", "hangup_source", "reason", "state")
+        },
+    )
     if not cc_id:
         return
     session = find_session_by_call_control_id(cc_id)
@@ -516,9 +530,26 @@ async def deliver_webhook_event(payload: dict[str, Any]) -> None:
         # mostly don't need to surface these to the brain, but logging
         # them helps when debugging carrier-side stream issues.
         if event_type == "streaming.failed":
+            # Telnyx is inconsistent about which key carries the
+            # actual failure reason — sometimes ``reason``, sometimes
+            # ``description``, sometimes nested under ``meta``. Log
+            # the whole inner payload so we can see what they
+            # actually said.
+            logger.warning(
+                "Telnyx streaming.failed for call %s — full payload: %s",
+                session.call_id,
+                inner,
+            )
+            failure_text = (
+                inner.get("reason")
+                or inner.get("description")
+                or inner.get("failure_reason")
+                or (inner.get("meta") or {}).get("reason")
+                or "no reason given"
+            )
             await session.push_event(
                 CallErrorEvent(
-                    message=f"Telnyx stream failed: {inner.get('reason', '')}",
+                    message=f"Telnyx stream failed: {failure_text}",
                     recoverable=False,
                 )
             )
