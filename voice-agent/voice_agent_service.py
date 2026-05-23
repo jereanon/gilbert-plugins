@@ -583,8 +583,13 @@ class VoiceAgentService(Service):
             if isinstance(config_svc, ConfigurationReader):
                 section = config_svc.get_section(self.config_namespace)
 
-        if not section.get("enabled", False):
-            logger.info("Voice-agent service disabled")
+        # First-run: nothing in the DB yet means "use the default."
+        # voice-agent ships ``enabled: true`` in plugin.yaml; mirror
+        # that here as the fall-through default so a fresh install
+        # exposes the feature without requiring a trip to /settings.
+        # Explicit ``enabled: false`` via the UI still wins.
+        if not section.get("enabled", True):
+            logger.info("Voice-agent service disabled (set explicitly)")
             return
 
         self._enabled = True
