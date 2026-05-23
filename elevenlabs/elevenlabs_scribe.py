@@ -250,16 +250,23 @@ class _ScribeLiveStream(TranscriptionStream):
             # no-op).
             kind = msg.get("message_type") or msg.get("type") or ""
             recv_count += 1
-            # Log every distinct message_type the first time we see it
-            # so we can spot protocol drift. Also log the first frame
-            # unconditionally — its shape tells us whether the API is
-            # actually talking to us or we're just sending into a void.
-            if recv_count <= 5 or kind not in _SEEN_KINDS:
+            # Log every transcript event (each one has unique content)
+            # plus the first sighting of any other discriminator (so
+            # we still catch protocol drift without spamming on
+            # session_started / heartbeats / etc.).
+            is_transcript = kind in (
+                "partial_transcript",
+                "committed_transcript",
+                "committed_transcript_with_timestamps",
+                "final",
+                "partial",
+            )
+            if is_transcript or kind not in _SEEN_KINDS:
                 _SEEN_KINDS.add(kind)
-                # Trim large transcript bodies so the log stays
-                # readable; the discriminator + length is enough.
+                # Trim large bodies for non-transcript frames; for
+                # transcripts the ``text`` field IS the payload.
                 preview = {
-                    k: (v if not isinstance(v, str) else v[:120])
+                    k: (v if not isinstance(v, str) else v[:200])
                     for k, v in msg.items()
                     if k != "audio_base_64"
                 }
