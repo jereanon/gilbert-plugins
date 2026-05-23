@@ -78,6 +78,21 @@ export function VoiceAgentPage(): ReactElement {
     return unsub;
   }, [subscribe]);
 
+  // Subscribe to "session ended" so the SPA can flip back to idle
+  // when the brain decides the conversation is over (e.g. the user
+  // said "talk to you later" and the LLM called end_conversation).
+  // Without this the SPA stays in active mode, holding the mic open
+  // and pumping audio that nothing's listening to. Defined below the
+  // teardown helper so it can call it cleanly.
+  useEffect(() => {
+    const unsub = subscribe("voice_agent.session_ended", () => {
+      teardownAudio();
+      setSessionId(null);
+      setState("idle");
+    });
+    return unsub;
+  }, [subscribe, teardownAudio]);
+
   // Auto-scroll the transcript on every new turn.
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });

@@ -927,6 +927,35 @@ class VoiceAgentService(Service):
             except Exception:
                 log.debug("chat-summary post failed", exc_info=True)
 
+        # Notify the SPA so it can flip its UI from "active" back
+        # to "idle", tear down mic capture, and stop pumping audio.
+        # Without this the SPA stays in active mode after the brain
+        # ended the session — looks like the conversation is still
+        # going from the user's perspective.
+        if self._bus is not None:
+            from gilbert.interfaces.events import Event
+
+            await self._bus.publish(
+                Event(
+                    event_type="voice_agent.session_ended",
+                    data={
+                        "user_id": active.user_id,
+                        "session_id": active.conversation_id,
+                        "reason": (
+                            "end_conversation"
+                            if outcome and outcome.outcome.get("end_requested")
+                            else "closed"
+                        ),
+                        "summary": str(
+                            outcome.outcome.get("session_summary") or ""
+                        )
+                        if outcome
+                        else "",
+                    },
+                    source="voice_agent",
+                )
+            )
+
         return active.conversation_id
 
     # --- Persistence + summary --------------------------------------
