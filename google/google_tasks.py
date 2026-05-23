@@ -44,6 +44,15 @@ from gilbert.interfaces.tasks import (
 )
 from gilbert.interfaces.tools import ToolParameterType
 
+from .google_credentials import (
+    GoogleCredentialMode,
+    build_google_credentials,
+    build_google_oauth_authorization_url,
+    exchange_google_oauth_code,
+    google_credential_spec_from_config,
+    require_google_credential_mode,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +69,18 @@ class GoogleTasksBackend(TaskBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
+                key="credential_mode",
+                type=ToolParameterType.STRING,
+                description="Google credential mode. Use oauth_bot for ordinary Google accounts.",
+                default=GoogleCredentialMode.OAUTH_BOT.value,
+                choices=(
+                    GoogleCredentialMode.OAUTH_BOT.value,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT.value,
+                    GoogleCredentialMode.SHARED_SERVICE_ACCOUNT.value,
+                ),
+                restart_required=True,
+            ),
+            ConfigParam(
                 key="service_account_json",
                 type=ToolParameterType.STRING,
                 description=(
@@ -68,9 +89,7 @@ class GoogleTasksBackend(TaskBackend):
                     "Gmail / Calendar if domain-wide delegation is set "
                     "up; the admin must additionally grant the "
                     "https://www.googleapis.com/auth/tasks scope to the "
-                    "service account's client ID. **Personal gmail.com "
-                    "accounts are not supported** — DWD requires Google "
-                    "Workspace."
+                    "service account's client ID."
                 ),
                 sensitive=True,
                 restart_required=True,
@@ -84,6 +103,40 @@ class GoogleTasksBackend(TaskBackend):
                     "for the Tasks API; without it the backend will "
                     "raise on initialize."
                 ),
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_client_id",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client ID for oauth_bot mode.",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_client_secret",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client secret for oauth_bot mode.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_redirect_uri",
+                type=ToolParameterType.STRING,
+                description="OAuth redirect URI registered for this backend.",
+                default="urn:ietf:wg:oauth:2.0:oob",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_refresh_token",
+                type=ToolParameterType.STRING,
+                description="OAuth refresh token populated by Connect Google.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_auth_code",
+                type=ToolParameterType.STRING,
+                description="Temporary Google OAuth authorization code for Connect Google complete.",
+                sensitive=True,
                 restart_required=True,
             ),
             ConfigParam(
@@ -101,6 +154,16 @@ class GoogleTasksBackend(TaskBackend):
     @classmethod
     def backend_actions(cls) -> list[ConfigAction]:
         return [
+            ConfigAction(
+                key="connect_google",
+                label="Connect Google",
+                description="Open Google's OAuth consent screen for this Tasks backend.",
+            ),
+            ConfigAction(
+                key="connect_google_complete",
+                label="Complete Google connection",
+                description="Exchange oauth_auth_code for a refresh token.",
+            ),
             ConfigAction(
                 key="test_connection",
                 label="Test connection",
@@ -126,6 +189,10 @@ class GoogleTasksBackend(TaskBackend):
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
+        if key == "connect_google":
+            return self._action_connect_google(payload)
+        if key == "connect_google_complete":
+            return await self._action_connect_google_complete(payload)
         if key == "list_tasklists":
             return await self._action_list_tasklists()
         return ConfigActionResult(
@@ -156,6 +223,44 @@ class GoogleTasksBackend(TaskBackend):
                 f"Connected to Google Tasks — {len(tasklists)} tasklist(s) "
                 "accessible."
             ),
+        )
+
+    def _action_connect_google(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        client_id = str(cfg.get("oauth_client_id") or "")
+        redirect_uri = str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob")
+        if not client_id:
+            return ConfigActionResult(status="error", message="oauth_client_id is required before connecting Google.")
+        return ConfigActionResult(
+            status="pending",
+            message="Open Google, approve access, paste the code into oauth_auth_code, then continue.",
+            open_url=build_google_oauth_authorization_url(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                scopes=self._scopes(),
+            ),
+            followup_action="connect_google_complete",
+        )
+
+    async def _action_connect_google_complete(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        auth_code = str(cfg.get("oauth_auth_code") or "")
+        if not auth_code:
+            return ConfigActionResult(status="error", message="Paste the Google authorization code into oauth_auth_code first.")
+        try:
+            persist = await exchange_google_oauth_code(
+                client_id=str(cfg.get("oauth_client_id") or ""),
+                client_secret=str(cfg.get("oauth_client_secret") or ""),
+                redirect_uri=str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob"),
+                auth_code=auth_code,
+            )
+        except Exception as exc:
+            return ConfigActionResult(status="error", message=f"Google OAuth error: {exc}")
+        persist["credential_mode"] = GoogleCredentialMode.OAUTH_BOT.value
+        return ConfigActionResult(
+            status="ok",
+            message="Google OAuth refresh token saved into the form. Save to persist it.",
+            data={"persist": persist},
         )
 
     async def _action_list_tasklists(self) -> ConfigActionResult:
@@ -190,57 +295,47 @@ class GoogleTasksBackend(TaskBackend):
         self._tasklist_id: str = ""
         self._service: Any = None  # googleapiclient resource
 
+    @staticmethod
+    def _scopes() -> tuple[str, ...]:
+        return ("https://www.googleapis.com/auth/tasks",)
+
+    @staticmethod
+    def _payload_config(payload: dict[str, Any]) -> dict[str, Any]:
+        cfg = payload.get("config") if isinstance(payload, dict) else None
+        return dict(cfg if isinstance(cfg, dict) else payload)
+
     async def initialize(self, config: dict[str, Any] | None = None) -> None:
         if config is None:
             return
-        sa_json = config.get("service_account_json", "")
-        delegated_user = config.get("delegated_user", "")
         self._tasklist_id = str(config.get("tasklist_id", ""))
-        if not sa_json:
-            logger.warning(
-                "Google Tasks backend: no service_account_json configured"
-            )
-            return
-        if not delegated_user:
-            logger.error(
-                "Google Tasks backend: delegated_user is required for "
-                "domain-wide delegation"
-            )
-            raise TaskBackendAuthError(
-                "Google Tasks backend requires delegated_user (DWD)"
-            )
-        try:
-            sa_info = (
-                json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-            )
-        except json.JSONDecodeError as exc:
-            logger.error("Google Tasks backend: invalid service_account_json")
-            raise TaskBackendAuthError(
-                f"Invalid service_account_json: {exc}"
-            ) from exc
         try:
             from googleapiclient.discovery import build
 
-            from google.oauth2 import service_account
-
-            scopes = ["https://www.googleapis.com/auth/tasks"]
-            creds = service_account.Credentials.from_service_account_info(
-                sa_info,
-                scopes=scopes,
+            spec = google_credential_spec_from_config(
+                config,
+                scopes=self._scopes(),
             )
-            if delegated_user:
-                creds = creds.with_subject(delegated_user)
+            require_google_credential_mode(
+                spec,
+                supported_modes={
+                    GoogleCredentialMode.OAUTH_BOT,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT,
+                },
+                backend_label="Google Tasks",
+            )
             self._service = await asyncio.to_thread(
                 build,
                 "tasks",
                 "v1",
-                credentials=creds,
+                credentials=build_google_credentials(spec),
             )
             logger.info(
                 "Google Tasks backend initialized (tasklist=%s, user=%s)",
                 self._tasklist_id,
-                delegated_user,
+                spec.delegated_user or "(oauth)",
             )
+        except ValueError as exc:
+            raise TaskBackendAuthError(str(exc)) from exc
         except Exception:
             logger.exception("Failed to initialize Google Tasks backend")
             raise
@@ -553,4 +648,3 @@ class GoogleTasksBackend(TaskBackend):
         except TaskBackendNotFoundError:
             # Naturally idempotent — already gone is success.
             return
-
