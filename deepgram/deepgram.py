@@ -153,6 +153,9 @@ class DeepgramBackend(StreamingTranscriptionBackend):
         pass
 
     async def open_stream(self, config: StreamConfig) -> TranscriptionStream:
+        import ssl
+
+        import certifi
         import websockets  # deferred — only needed at stream-open time
 
         params: dict[str, Any] = {
@@ -169,9 +172,16 @@ class DeepgramBackend(StreamingTranscriptionBackend):
             params["diarize"] = "true"
 
         url = f"{self._ws_url}?{urlencode(params)}"
+        # Explicit SSL context using certifi's CA bundle — Python's
+        # default trust store path doesn't exist on NixOS, so
+        # ``websockets.connect`` fails the WSS handshake with
+        # ``unable to get local issuer certificate``. certifi ships
+        # with the Mozilla bundle and is already a transitive dep.
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         ws = await websockets.connect(
             url,
             additional_headers={"Authorization": f"Token {self._api_key}"},
             max_size=None,
+            ssl=ssl_context,
         )
         return _DeepgramStream(ws)

@@ -245,15 +245,28 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
         pass
 
     async def open_stream(self, config: StreamConfig) -> TranscriptionStream:
+        import ssl
+
+        import certifi
         import websockets  # deferred — only needed for streaming
 
         url = (
             f"{self._ws_url}?model_id={self._model}"
             f"&language_code={config.language or 'auto'}"
         )
+        # Pass an explicit SSL context using certifi's CA bundle. On
+        # NixOS (and other distros where the system CA path isn't
+        # ``/etc/ssl/cert.pem``) Python's default SSL context can't
+        # find the trust store and the WSS handshake fails with
+        # ``unable to get local issuer certificate``. httpx and the
+        # rest of Gilbert's HTTP stack avoid this by going through
+        # certifi internally; the websockets library uses Python's
+        # default context unless we tell it otherwise.
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         ws = await websockets.connect(
             url,
             additional_headers={"xi-api-key": self._api_key},
             max_size=None,
+            ssl=ssl_context,
         )
         return _ScribeLiveStream(ws)
