@@ -1,0 +1,12 @@
+{
+  "name": "@gilbert-plugin/voice-agent-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Voice-agent SPA page — start a real-time voice conversation with Gilbert through the browser microphone.",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}

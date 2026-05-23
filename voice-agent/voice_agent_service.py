@@ -146,28 +146,78 @@ class VoiceAgentBrainToolProvider:
 # ── Conversation session — concrete impl for wake-word modality ──────
 
 
-class _VoiceAgentAudioSink:
-    """Stub ``AudioSink``. Until the speaker backend wires up to a real
-    continuous output sink (a browser tab? a Sonos group? a local
-    audio device?), writes are logged and dropped on the floor. The
-    engine doesn't care — it just calls ``write`` and ``clear``.
+class _BrowserAudioSink:
+    """Buffers TTS bytes per utterance and ships each completed clip
+    to the browser tab via the standard ``speaker.browser.play`` event
+    on the event bus.
+
+    The engine writes 20ms chunks at 50fps via ``write()``. We
+    accumulate them in a ``bytearray``. ``flush()`` (called by the
+    engine at end-of-utterance) base64-encodes the whole clip as a
+    ``data:`` URL and emits the bus event the existing
+    ``useBrowserSpeaker`` SPA hook is already listening for.
+    ``clear()`` discards anything buffered (mid-utterance barge-in,
+    though barge-in is unavailable in turn-taking mode anyway).
+
+    Real-time bytes-over-WS playback is a future iteration — turning
+    each utterance into a single MP3 keeps the demo simple and reuses
+    the BrowserSpeaker plumbing that's been working for months.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        bus: Any,
+        user_id: str,
+        session_id: str,
+        mime: str = "audio/mpeg",
+    ) -> None:
+        self._bus = bus
+        self._user_id = user_id
         self._session_id = session_id
-        self._chunks = 0
+        self._mime = mime
+        self._buffer = bytearray()
+        self._utterances_sent = 0
 
     async def write(self, chunk: bytes) -> None:
-        self._chunks += 1
-        if self._chunks == 1:
-            logger.warning(
-                "VoiceAgentAudioSink stub: first chunk dropped — wire to "
-                "a real SpeakerBackend output (session=%s)",
-                self._session_id,
-            )
+        self._buffer.extend(chunk)
 
     async def clear(self) -> None:
-        return None
+        self._buffer.clear()
+
+    async def flush(self) -> None:
+        if not self._buffer:
+            return
+        import base64
+
+        from gilbert.interfaces.events import Event
+
+        data_b64 = base64.b64encode(bytes(self._buffer)).decode("ascii")
+        url = f"data:{self._mime};base64,{data_b64}"
+        self._utterances_sent += 1
+        logger.info(
+            "BrowserAudioSink flush — session=%s utterance=%d bytes=%d",
+            self._session_id,
+            self._utterances_sent,
+            len(self._buffer),
+        )
+        await self._bus.publish(
+            Event(
+                event_type="speaker.browser.play",
+                data={
+                    "user_id": self._user_id,
+                    "conversation_id": "",
+                    "url": url,
+                    "title": f"Gilbert (voice-agent {self._session_id})",
+                    "volume": 80,
+                    "announce": False,
+                    "position_seconds": 0,
+                    "kind": "voice_agent_turn",
+                },
+                source="voice_agent",
+            )
+        )
+        self._buffer.clear()
 
 
 @dataclass
@@ -248,6 +298,23 @@ class _VoiceAgentSession(ConversationSession):
             pass
 
 
+# ── Per-WS-connection active-session tracker ────────────────────────
+
+
+@dataclass
+class _ActiveSession:
+    """One in-flight voice-agent session. Tracks the conversation
+    session object so audio chunks from the SPA can be routed to its
+    inbound queue, plus the engine task so cleanup can cancel it.
+    """
+
+    conversation_id: str
+    user_id: str
+    conn_id: str
+    session: "_VoiceAgentSession"
+    task: asyncio.Task[Any] | None = None
+
+
 # ── Persisted record shape ───────────────────────────────────────────
 
 
@@ -312,17 +379,17 @@ class VoiceAgentService(Service):
         self._wake_listener: WakeWordListener | None = None
         self._message_poster: ConversationMessagePoster | None = None
         self._storage: StorageProvider | None = None
-        # Active wake-word detector task. None when in active-session
-        # mode (we close the detector while a conversation is running
-        # to avoid double-billing STT).
-        self._wake_task: asyncio.Task[None] | None = None
+        self._bus: Any = None
         # Active session task. None when in wake-listen mode.
         self._session_task: asyncio.Task[None] | None = None
+        # Per-WS-connection active session. Keyed by conn.connection_id.
+        # One voice-agent session at a time per browser tab.
+        self._sessions: dict[str, _ActiveSession] = {}
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="voice_agent",
-            capabilities=frozenset({"voice_agent"}),
+            capabilities=frozenset({"voice_agent", "ws_handlers"}),
             requires=frozenset(
                 {
                     "voice_brain",
@@ -336,6 +403,143 @@ class VoiceAgentService(Service):
             toggleable=True,
             toggle_description="Wake-word voice conversations.",
         )
+
+    # --- WS handlers (the SPA's voice-agent page talks to these) ----
+
+    def get_ws_handlers(self) -> dict[str, Any]:
+        """Three RPCs the SPA's voice-agent page uses to drive a session.
+
+        - ``voice_agent.start_session(audio_format)`` — open a session,
+          return ``session_id``. The session starts ACTIVE immediately
+          (wake-word gating comes in a follow-up).
+        - ``voice_agent.send_audio_chunk(session_id, audio_b64)`` —
+          base64 PCM_S16LE 16 kHz mono chunks (whatever the SPA's
+          AudioWorklet captures).
+        - ``voice_agent.end_session(session_id)`` — clean stop. Also
+          fires automatically on WS connection close.
+        """
+        return {
+            "voice_agent.start_session": self._ws_start_session,
+            "voice_agent.send_audio_chunk": self._ws_send_audio_chunk,
+            "voice_agent.end_session": self._ws_end_session,
+        }
+
+    async def _ws_start_session(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._enabled:
+            return {"ok": False, "error": "voice-agent service disabled"}
+        if self._voice_brain is None:
+            return {"ok": False, "error": "voice_brain unavailable"}
+        user_id = conn.user_id or ""
+        if not user_id:
+            return {"ok": False, "error": "unauthenticated connection"}
+
+        # One session per WS connection. If a stale one is still
+        # around (browser refresh, dropped task), tear it down before
+        # spawning a new one.
+        old = self._sessions.pop(conn.connection_id, None)
+        if old is not None and old.task is not None:
+            old.task.cancel()
+
+        originating_conv_id = str(frame.get("originating_conversation_id") or "")
+        conversation_id = f"vc_{uuid.uuid4().hex[:12]}"
+        log = logger.getChild(f"voice:{conversation_id}")
+
+        # Build the session — audio_in/audio_out wired to the
+        # browser via the bus.
+        session = _VoiceAgentSession(
+            session_id=conversation_id,
+            audio_in=None,  # type: ignore[arg-type]  — set below
+            audio_out=_BrowserAudioSink(
+                bus=self._bus,
+                user_id=user_id,
+                session_id=conversation_id,
+                mime="audio/mpeg",
+            ),
+            events=None,  # type: ignore[arg-type]
+        )
+        session.audio_in = session._audio_in_iter()  # type: ignore[assignment]
+        session.events = session._events_iter()  # type: ignore[assignment]
+
+        # Spawn the session task. We don't await it here; the
+        # ``send_audio_chunk`` handler pushes into the session's
+        # queue while the engine consumes.
+        active = _ActiveSession(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            conn_id=conn.connection_id,
+            session=session,
+        )
+        self._sessions[conn.connection_id] = active
+
+        # Connection-drop cleanup. Mirrors TranscriptionService.
+        def _on_close(cid: str = conn.connection_id) -> None:
+            asyncio.create_task(self._teardown_session_by_conn(cid))
+
+        conn.add_close_callback(_on_close)
+
+        active.task = asyncio.create_task(
+            self._run_voice_session(
+                active=active,
+                originating_conversation_id=originating_conv_id,
+            ),
+            name=f"voice-agent-brain:{conversation_id}",
+        )
+        active.task.add_done_callback(
+            lambda _t, cid=conn.connection_id: self._sessions.pop(cid, None)
+        )
+
+        log.info(
+            "voice-agent session opened (conn=%s user=%s originating_conv=%r)",
+            conn.connection_id,
+            user_id,
+            originating_conv_id,
+        )
+
+        # Mark the session ACTIVE so the engine fires its opening
+        # policy (SPEAK_FIRST). Done after task creation so the
+        # status loop is running when the event arrives.
+        await session.push_event(
+            ConversationStatusEvent(status=ConversationStatus.ACTIVE)
+        )
+
+        return {"ok": True, "session_id": conversation_id}
+
+    async def _ws_send_audio_chunk(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        import base64
+
+        sid = frame.get("session_id")
+        b64 = frame.get("audio_b64")
+        if not isinstance(sid, str) or not isinstance(b64, str):
+            return {"ok": False, "error": "missing session_id or audio_b64"}
+        active = self._sessions.get(conn.connection_id)
+        if active is None or active.conversation_id != sid:
+            return {"ok": False, "error": "unknown session"}
+        try:
+            chunk = base64.b64decode(b64)
+        except Exception:
+            return {"ok": False, "error": "invalid base64"}
+        await active.session.push_audio_in(chunk)
+        return {"ok": True}
+
+    async def _ws_end_session(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        sid = frame.get("session_id")
+        active = self._sessions.get(conn.connection_id)
+        if active is None or (sid is not None and active.conversation_id != sid):
+            return {"ok": False, "error": "unknown session"}
+        await active.session.end_session()
+        return {"ok": True}
+
+    async def _teardown_session_by_conn(self, conn_id: str) -> None:
+        active = self._sessions.get(conn_id)
+        if active is None:
+            return
+        await active.session.end_session()
 
     @property
     def config_namespace(self) -> str:
@@ -362,6 +566,13 @@ class VoiceAgentService(Service):
         ai = resolver.get_capability("ai_chat")
         if isinstance(ai, ConversationMessagePoster):
             self._message_poster = ai
+        # Event bus for ``speaker.browser.play`` (TTS playback) + any
+        # future ``voice_agent.*`` server-initiated events.
+        from gilbert.interfaces.events import EventBusProvider
+
+        bus_svc = resolver.get_capability("event_bus")
+        if isinstance(bus_svc, EventBusProvider):
+            self._bus = bus_svc.bus
 
         # Pull config — same pattern as PhoneCallService.
         config_svc = resolver.get_capability("configuration")
@@ -398,55 +609,40 @@ class VoiceAgentService(Service):
 
     # --- Session lifecycle (the actual conversation) -----------------
 
-    async def start_session(
+    async def _run_voice_session(
         self,
         *,
-        user_id: str,
-        audio_in: AsyncIterator[bytes],
-        audio_out: AudioSink,
-        originating_conversation_id: str = "",
+        active: _ActiveSession,
+        originating_conversation_id: str,
     ) -> str:
-        """Run a single wake-word-activated voice session to completion.
+        """Drive one voice-agent conversation through the engine.
 
-        The caller (the wake-word listening loop, once wired up) hands
-        over a fresh inbound-audio iterator + outbound sink. We build
-        a ``_VoiceAgentSession`` around them, mark it ACTIVE, and let
-        the engine drive. On completion, post a chat summary.
+        Invoked as a background task by ``_ws_start_session`` — the
+        SPA pumps audio chunks via ``send_audio_chunk`` while the
+        engine runs here. Returns when:
 
-        Returns the conversation_id of the completed session.
+        - The brain calls ``end_conversation``
+        - The session's idle-timeout watchdog fires
+        - The SPA explicitly ends the session
+        - The WS connection drops
+
+        Persists a per-session record and (when an originating chat
+        was supplied) posts a one-line summary back into that chat
+        via ``ConversationMessagePoster``.
         """
         if self._voice_brain is None:
             raise RuntimeError("voice_agent: voice_brain not available")
 
-        conversation_id = f"vc_{uuid.uuid4().hex[:12]}"
-        log = logger.getChild(f"voice:{conversation_id}")
+        log = logger.getChild(f"voice:{active.conversation_id}")
+        session = active.session
 
         record = _VoiceConversationRecord(
-            conversation_id=conversation_id,
-            user_id=user_id,
+            conversation_id=active.conversation_id,
+            user_id=active.user_id,
             originating_conversation_id=originating_conversation_id,
             started_at=_now_iso(),
         )
         await self._save_record(record)
-
-        session = _VoiceAgentSession(
-            session_id=conversation_id,
-            audio_in=audio_in,
-            audio_out=audio_out,
-            events=None,  # type: ignore[arg-type]  — set below
-        )
-        # The events iterator lives on the same instance — Python's
-        # @dataclass inheritance forces us to set it post-construction
-        # because the iterator is itself a method on the instance.
-        session.events = session._events_iter()  # type: ignore[assignment]
-
-        # Mark the session ACTIVE so the engine fires its opening
-        # policy. The voice-agent skips the wait-for-remote dance —
-        # the user just said the wake word, the brain should respond
-        # immediately.
-        await session.push_event(
-            ConversationStatusEvent(status=ConversationStatus.ACTIVE)
-        )
 
         async def _on_transcript_turn(
             who: str, text: str, ts_seconds: float
@@ -460,6 +656,18 @@ class VoiceAgentService(Service):
             status: ConversationStatus, reason: str
         ) -> None:
             log.info("voice-agent status: %s (reason=%r)", status.value, reason)
+
+        # Engine configuration tuned for browser audio:
+        # - TTS: MP3 (browser can play via HTMLAudioElement data URL).
+        # - STT: 16 kHz PCM (what the SPA's mic captures cleanly).
+        # - Audio input format: PCM_S16LE 16 kHz (skip ulaw decode).
+        from gilbert.interfaces.transcription import (
+            AudioEncoding as _STTAudioEncoding,
+        )
+        from gilbert.interfaces.transcription import (
+            AudioFormat as _STTAudioFormat,
+        )
+        from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
 
         config = ConversationConfig(
             system_prompt=str(
@@ -476,6 +684,18 @@ class VoiceAgentService(Service):
             priming_messages=[],
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
+            tts_output_format=_TTSAudioFormat.MP3,
+            tts_output_mime="audio/mpeg",
+            audio_input_format=_STTAudioFormat(
+                encoding=_STTAudioEncoding.PCM_S16LE,
+                sample_rate=16000,
+                channels=1,
+            ),
+            stt_audio_format=_STTAudioFormat(
+                encoding=_STTAudioEncoding.PCM_S16LE,
+                sample_rate=16000,
+                channels=1,
+            ),
         )
 
         outcome: ConversationOutcome | None = None
@@ -514,7 +734,7 @@ class VoiceAgentService(Service):
             except Exception:
                 log.debug("chat-summary post failed", exc_info=True)
 
-        return conversation_id
+        return active.conversation_id
 
     # --- Persistence + summary --------------------------------------
 

@@ -1,0 +1,275 @@
+/**
+ * Voice-agent page — a single "Start Conversation" toggle.
+ *
+ * Captures the browser microphone via `getUserMedia` + an
+ * `AudioContext` ScriptProcessor (the simple, broadly-supported
+ * path — AudioWorklet would be slightly nicer but requires a
+ * separate worklet module file). Downsamples to 16 kHz mono
+ * PCM_S16LE and pumps base64'd chunks to the backend via the
+ * `voice_agent.send_audio_chunk` WS RPC at 50fps.
+ *
+ * Outbound audio (Gilbert's TTS) goes through the existing
+ * `useBrowserSpeaker` plumbing — the voice-agent service publishes
+ * a `speaker.browser.play` event with the synthesized MP3 inlined
+ * as a `data:` URL, and the browser-speaker hook already running in
+ * the app shell plays it via its HTMLAudioElement.
+ *
+ * This is the v1 turn-taking experience: press button → talk →
+ * Gilbert speaks → talk again → end. Real-time barge-in needs
+ * raw-bytes-over-WS playback (different audio sink shape) and is a
+ * future iteration.
+ */
+
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
+import { Mic, MicOff, Loader2 } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { useWebSocket } from "@/hooks/useWebSocket";
+
+type SessionState = "idle" | "starting" | "active" | "stopping";
+
+const TARGET_SAMPLE_RATE = 16000;
+// We downsample with a ScriptProcessor of bufferSize 4096; at the
+// browser's native 48 kHz that's ~85 ms per buffer (4096/48000). After
+// downsample to 16 kHz it's 4096 * (16000/48000) ≈ 1365 PCM samples
+// per buffer. We send each buffer as its own ws frame.
+const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
+
+export function VoiceAgentPage(): ReactElement {
+  const { connected, rpc } = useWebSocket();
+  const [state, setState] = useState<SessionState>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const teardownAudio = useCallback(() => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    if (streamRef.current) {
+      for (const t of streamRef.current.getTracks()) t.stop();
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {
+        /* already closed */
+      });
+      audioCtxRef.current = null;
+    }
+  }, []);
+
+  const stop = useCallback(async () => {
+    if (state !== "active") return;
+    setState("stopping");
+    teardownAudio();
+    if (sessionId) {
+      try {
+        await rpc<{ ok: boolean }>({
+          type: "voice_agent.end_session",
+          session_id: sessionId,
+        });
+      } catch {
+        /* server may already be torn down */
+      }
+    }
+    setSessionId(null);
+    setState("idle");
+  }, [state, sessionId, rpc, teardownAudio]);
+
+  const start = useCallback(async () => {
+    if (state !== "idle") return;
+    setError(null);
+    setState("starting");
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `Microphone permission denied: ${err.message}`
+          : "Microphone permission denied"
+      );
+      setState("idle");
+      return;
+    }
+    streamRef.current = stream;
+
+    // Tell the backend to open a session. It returns a session_id we
+    // tag every audio chunk with.
+    let resp: { ok: boolean; session_id?: string; error?: string };
+    try {
+      resp = await rpc({ type: "voice_agent.start_session" });
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? `Failed to start session: ${err.message}`
+          : "Failed to start session"
+      );
+      teardownAudio();
+      setState("idle");
+      return;
+    }
+    if (!resp.ok || !resp.session_id) {
+      setError(resp.error ?? "Server refused the session");
+      teardownAudio();
+      setState("idle");
+      return;
+    }
+    const newSessionId = resp.session_id;
+    setSessionId(newSessionId);
+
+    // Wire up the audio graph: MediaStreamSource → ScriptProcessor →
+    // (discard the output, we don't want a feedback loop with the
+    // speakers; the ScriptProcessor's `onaudioprocess` gives us the
+    // input buffer regardless of whether the output is connected).
+    const audioCtx = new AudioContext();
+    audioCtxRef.current = audioCtx;
+    const sourceNode = audioCtx.createMediaStreamSource(stream);
+    sourceRef.current = sourceNode;
+    const processor = audioCtx.createScriptProcessor(
+      SCRIPT_PROCESSOR_BUFFER_SIZE,
+      1,
+      1
+    );
+    processorRef.current = processor;
+
+    const sourceSampleRate = audioCtx.sampleRate;
+    const downsampleRatio = sourceSampleRate / TARGET_SAMPLE_RATE;
+
+    processor.onaudioprocess = (event) => {
+      // Input buffer is Float32 in [-1, 1] at the AudioContext's
+      // native sample rate (typically 48000 Hz). Downsample by
+      // averaging blocks of `downsampleRatio` samples, then convert
+      // each averaged sample to int16.
+      const input = event.inputBuffer.getChannelData(0);
+      const outLen = Math.floor(input.length / downsampleRatio);
+      const out = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const start = Math.floor(i * downsampleRatio);
+        const end = Math.floor((i + 1) * downsampleRatio);
+        let sum = 0;
+        let n = 0;
+        for (let j = start; j < end && j < input.length; j++) {
+          sum += input[j];
+          n++;
+        }
+        const v = n > 0 ? sum / n : 0;
+        const clamped = Math.max(-1, Math.min(1, v));
+        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+      }
+      // Base64-encode the bytes and ship via WS RPC. Fire-and-forget
+      // — we don't await the promise so the audio thread isn't held.
+      const bytes = new Uint8Array(out.buffer);
+      let bin = "";
+      for (let i = 0; i < bytes.byteLength; i++) {
+        bin += String.fromCharCode(bytes[i]);
+      }
+      const b64 = btoa(bin);
+      void rpc({
+        type: "voice_agent.send_audio_chunk",
+        session_id: newSessionId,
+        audio_b64: b64,
+      }).catch(() => {
+        /* server will have already torn the session down */
+      });
+    };
+
+    sourceNode.connect(processor);
+    // ScriptProcessor needs its output connected for `onaudioprocess`
+    // to fire reliably across browsers. Route to a dummy gain that
+    // muted to zero so we don't echo the mic back to the speakers.
+    const muted = audioCtx.createGain();
+    muted.gain.value = 0;
+    processor.connect(muted);
+    muted.connect(audioCtx.destination);
+
+    setState("active");
+  }, [state, rpc, teardownAudio]);
+
+  // Tear down on unmount.
+  useEffect(() => {
+    return () => {
+      teardownAudio();
+    };
+  }, [teardownAudio]);
+
+  return (
+    <div className="container mx-auto max-w-2xl py-8">
+      <h1 className="text-2xl font-semibold mb-2">Voice conversation</h1>
+      <p className="text-muted-foreground mb-6">
+        Start a real-time voice conversation with Gilbert. The mic
+        captures locally; Gilbert speaks back through this tab.
+      </p>
+
+      <Card className="p-6 flex flex-col items-center gap-4">
+        {state === "idle" && (
+          <Button size="lg" onClick={start} disabled={!connected}>
+            <Mic className="mr-2 h-5 w-5" />
+            Start Conversation
+          </Button>
+        )}
+        {state === "starting" && (
+          <Button size="lg" disabled>
+            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+            Starting…
+          </Button>
+        )}
+        {state === "active" && (
+          <Button size="lg" variant="destructive" onClick={stop}>
+            <MicOff className="mr-2 h-5 w-5" />
+            End Conversation
+          </Button>
+        )}
+        {state === "stopping" && (
+          <Button size="lg" disabled>
+            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+            Stopping…
+          </Button>
+        )}
+
+        {state === "active" && (
+          <p className="text-sm text-muted-foreground">
+            Listening… speak naturally. Gilbert will respond by voice.
+          </p>
+        )}
+        {error && (
+          <p className="text-sm text-destructive font-medium">{error}</p>
+        )}
+        {!connected && (
+          <p className="text-sm text-muted-foreground">
+            Reconnecting to Gilbert…
+          </p>
+        )}
+      </Card>
+
+      <div className="mt-6 text-xs text-muted-foreground space-y-1">
+        <p>
+          Tips: keep the browser tab focused, allow microphone access
+          when prompted, and use a headset for the cleanest pickup.
+        </p>
+        <p>
+          This is v1 — turn-taking only. Real-time barge-in (cutting
+          Gilbert off mid-sentence) requires a different audio path
+          and is coming next.
+        </p>
+      </div>
+    </div>
+  );
+}
