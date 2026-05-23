@@ -43,6 +43,15 @@ from gilbert.interfaces.transcription import (
 
 logger = logging.getLogger(__name__)
 
+
+# Process-wide set of message_type values we've already logged in
+# ``Scribe Live: recv …`` lines. Each new value gets one INFO log;
+# subsequent occurrences are quiet. Used as a tripwire for protocol
+# drift — if ElevenLabs introduces a new message kind we don't yet
+# handle, we'll see it once in the journal instead of silently
+# dropping it forever.
+_SEEN_KINDS: set[str] = set()
+
 _DEFAULT_BASE_URL = "https://api.elevenlabs.io"
 _DEFAULT_BATCH_MODEL = "scribe_v1"
 # Realtime Scribe lives on a separate endpoint with a different model
@@ -186,6 +195,9 @@ class _ScribeLiveStream(TranscriptionStream):
         self._ws = ws
         self._closed = False
         self._sample_rate = sample_rate
+        # Telemetry — first send + first recv are the diagnostic
+        # gold for "is the pipe actually moving."
+        self._sent_count = 0
 
     async def send(self, chunk: bytes) -> None:
         if self._closed:
@@ -196,6 +208,13 @@ class _ScribeLiveStream(TranscriptionStream):
             "sample_rate": self._sample_rate,
         }
         await self._ws.send(json.dumps(payload))
+        self._sent_count += 1
+        if self._sent_count == 1:
+            logger.info(
+                "Scribe Live: first audio chunk sent — bytes=%d sample_rate=%d",
+                len(chunk),
+                self._sample_rate,
+            )
 
     async def close(self) -> None:
         if self._closed:
@@ -205,6 +224,7 @@ class _ScribeLiveStream(TranscriptionStream):
             await self._ws.close()
 
     async def events(self) -> AsyncIterator[TranscriptionEvent]:
+        recv_count = 0
         while True:
             try:
                 raw = await self._ws.recv()
@@ -217,12 +237,36 @@ class _ScribeLiveStream(TranscriptionStream):
             try:
                 msg = json.loads(raw) if isinstance(raw, str | bytes | bytearray) else raw
             except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Scribe Live: non-JSON frame from server: %r",
+                    raw[:200] if isinstance(raw, (bytes, str)) else raw,
+                )
                 continue
             # The realtime API uses ``message_type`` as the discriminator
             # (older code looked for ``type`` — that field never exists
             # on the live endpoint and made every message a silent
             # no-op).
             kind = msg.get("message_type") or msg.get("type") or ""
+            recv_count += 1
+            # Log every distinct message_type the first time we see it
+            # so we can spot protocol drift. Also log the first frame
+            # unconditionally — its shape tells us whether the API is
+            # actually talking to us or we're just sending into a void.
+            if recv_count <= 5 or kind not in _SEEN_KINDS:
+                _SEEN_KINDS.add(kind)
+                # Trim large transcript bodies so the log stays
+                # readable; the discriminator + length is enough.
+                preview = {
+                    k: (v if not isinstance(v, str) else v[:120])
+                    for k, v in msg.items()
+                    if k != "audio_base_64"
+                }
+                logger.info(
+                    "Scribe Live: recv #%d kind=%r msg=%s",
+                    recv_count,
+                    kind,
+                    preview,
+                )
             if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
                     text=str(msg.get("text") or msg.get("transcript") or ""),
