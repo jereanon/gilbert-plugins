@@ -108,12 +108,21 @@ def _tagged_response_overlaps_input(input_text: str, tagged: str) -> bool:
 # ElevenLabs API base
 _BASE_URL = "https://api.elevenlabs.io/v1"
 
-# Map our AudioFormat enum to ElevenLabs output_format parameter values
+# Map our AudioFormat enum to ElevenLabs output_format parameter values.
+# Without an explicit entry for a given AudioFormat we silently fall
+# back to MP3 — which is the wrong thing to do for telephony where
+# Telnyx + carrier gear expects raw 8 kHz µ-law and will silently
+# drop / mangle anything else. ALWAYS add a map entry when extending
+# AudioFormat — the fallback masks real bugs.
 _FORMAT_MAP: dict[AudioFormat, str] = {
     AudioFormat.MP3: "mp3_44100_128",
     AudioFormat.WAV: "pcm_44100",
     AudioFormat.OGG: "ogg_vorbis",
     AudioFormat.PCM: "pcm_44100",
+    # ElevenLabs returns raw 8-bit µ-law samples at 8 kHz with no
+    # container — exactly what Telnyx Media Streams expects to
+    # forward to PSTN. Don't wrap, don't resample, don't re-encode.
+    AudioFormat.MULAW_8000: "ulaw_8000",
 }
 
 # Default synthesis cache capacity — enough to cover a busy day of
