@@ -62,6 +62,37 @@ export function VoiceAgentPage(): ReactElement {
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
+  // Audio-graph refs + the teardown helper live ABOVE the useEffect
+  // subscriptions because the ``session_ended`` subscription calls
+  // teardownAudio in its handler — TypeScript's strict block-scope
+  // check (``tsc -b`` is stricter than ``tsc --noEmit``) rejects
+  // referencing it before declaration.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const teardownAudio = useCallback(() => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    if (streamRef.current) {
+      for (const t of streamRef.current.getTracks()) t.stop();
+      streamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {
+        /* already closed */
+      });
+      audioCtxRef.current = null;
+    }
+  }, []);
+
   // Subscribe to live transcript-turn events from the backend. The
   // server emits ``voice_agent.transcript_turn`` for every "them"
   // (user-side STT commit) and "us" (LLM reply) turn so the SPA can
@@ -124,32 +155,6 @@ export function VoiceAgentPage(): ReactElement {
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [transcript]);
-
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-
-  const teardownAudio = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (sourceRef.current) {
-      sourceRef.current.disconnect();
-      sourceRef.current = null;
-    }
-    if (streamRef.current) {
-      for (const t of streamRef.current.getTracks()) t.stop();
-      streamRef.current = null;
-    }
-    if (audioCtxRef.current) {
-      audioCtxRef.current.close().catch(() => {
-        /* already closed */
-      });
-      audioCtxRef.current = null;
-    }
-  }, []);
 
   const stop = useCallback(async () => {
     // ``dormant`` is a perfectly valid state to stop from too —
