@@ -1,0 +1,15 @@
+name: phone
+version: "1.0.0"
+description: "Outbound phone calls — PhoneCallService + make_phone_call AI tool. Carrier comes from a separate plugin (telnyx)."
+
+provides:
+  - phone_calls
+
+requires: []
+depends_on:
+  - voice_brain          # core engine that drives the conversation loop
+  - speech_to_text       # streaming STT (Scribe Live etc)
+  - text_to_speech       # ElevenLabs etc
+  - ai_chat              # LLM provider
+  - entity_storage       # phone_calls collection
+  - event_bus            # phone.call.* lifecycle events

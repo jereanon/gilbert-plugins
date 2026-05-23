@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-phone"
+version = "1.0.0"
+description = "Outbound phone calls — PhoneCallService + make_phone_call AI tool. Carrier comes from a separate plugin."
+requires-python = ">=3.12"
+# No third-party deps. The service resolves everything it needs via
+# the service-manager capability registry (voice_brain, STT, TTS,
+# AI, storage, event_bus).
+dependencies = []
+
+[tool.uv]
+package = false

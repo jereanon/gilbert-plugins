@@ -1,8 +1,8 @@
-"""Register the voice-agent plugin as a Python package for tests.
+"""Register the phone plugin as a Python package for tests.
 
 Mirrors the convention used by the other std-plugins (anthropic,
 tesseract, etc.) — the plugin directory is registered as
-``gilbert_plugin_voice_agent`` so relative imports inside the plugin
+``gilbert_plugin_phone`` so relative imports inside the plugin
 resolve during test collection.
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 from types import ModuleType
 
 _plugin_dir = Path(__file__).resolve().parent.parent
-_pkg_name = "gilbert_plugin_voice_agent"
+_pkg_name = "gilbert_plugin_phone"
 
 if _pkg_name not in sys.modules:
     pkg = ModuleType(_pkg_name)
@@ -22,10 +22,7 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    for _mod_name in ("voice_agent_service", "plugin"):
-        # Omit ``submodule_search_locations`` so intra-plugin relative
-        # imports resolve against the plugin package, not the module
-        # itself.
+    for _mod_name in ("phone_call", "plugin"):
         _spec = importlib.util.spec_from_file_location(
             f"{_pkg_name}.{_mod_name}",
             _plugin_dir / f"{_mod_name}.py",
