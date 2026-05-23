@@ -217,8 +217,16 @@ async def exchange_google_oauth_code(
             "grant_type": "authorization_code",
         },
     )
-    response.raise_for_status()
     data = response.json()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        error = str(data.get("error") or "")
+        description = str(data.get("error_description") or "")
+        detail = ": ".join(part for part in (error, description) if part)
+        if detail:
+            raise ValueError(f"Google OAuth token exchange failed: {detail}") from exc
+        raise
     refresh_token = str(data.get("refresh_token") or "")
     if not refresh_token:
         raise ValueError(

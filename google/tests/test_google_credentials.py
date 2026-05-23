@@ -210,6 +210,43 @@ async def test_exchange_oauth_code_returns_persist_payload(
     }
 
 
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_surfaces_google_error_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            import httpx
+
+            request = httpx.Request("POST", "https://oauth2.googleapis.com/token")
+            response = httpx.Response(400, request=request)
+            raise httpx.HTTPStatusError("bad request", request=request, response=response)
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "error": "invalid_grant",
+                "error_description": "Bad Request",
+            }
+
+    def fake_post(url: str, data: dict[str, Any]) -> FakeResponse:
+        return FakeResponse()
+
+    import gilbert_plugin_google.google_credentials as google_credentials
+
+    monkeypatch.setattr(google_credentials.httpx, "post", fake_post)
+
+    with pytest.raises(ValueError) as exc:
+        await exchange_google_oauth_code(
+            client_id="client-id",
+            client_secret="client-secret",
+            redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+            auth_code="auth-code",
+        )
+
+    assert "invalid_grant" in str(exc.value)
+    assert "Bad Request" in str(exc.value)
+
+
 def test_service_account_email_extracts_share_target() -> None:
     assert (
         service_account_email({"client_email": "share-me@example.iam.gserviceaccount.com"})
