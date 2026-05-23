@@ -415,7 +415,26 @@ class TelnyxTelephony(TelephonyBackend):
                     "webhook_url": webhook_url,
                     "webhook_url_method": "POST",
                     "stream_url": media_url,
-                    "stream_track": "both_tracks",
+                    # ``inbound_track`` = the remote party's audio
+                    # only. With ``both_tracks`` Telnyx mixes
+                    # Gilbert's own outbound TTS back into the
+                    # inbound stream; STT then transcribes Gilbert
+                    # talking to himself and the brain sees every
+                    # one of its own utterances as a fresh "user
+                    # said" turn. The reported "Gilbert kept asking
+                    # me to ask a question" symptom was exactly that
+                    # feedback loop — Scribe was returning lines
+                    # like "Hi, this is Gilbert, Jeremy Arnold's
+                    # personal assistant." as user input.
+                    #
+                    # Outbound audio still works because the
+                    # ``stream_bidirectional_mode`` setting below
+                    # enables the inject-into-call path independently
+                    # of which track gets mirrored back to us. If we
+                    # ever want a full-call recording, use Telnyx's
+                    # separate recording API rather than tee'ing the
+                    # media stream — that keeps the STT input clean.
+                    "stream_track": "inbound_track",
                     # Bidirectional mode is REQUIRED to send audio FROM
                     # the application INTO the call. Without it Telnyx
                     # silently drops every outbound media frame — no
