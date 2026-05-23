@@ -186,15 +186,23 @@ class _TelnyxCallSession:
 
     def as_call_session(self) -> CallSession:
         sink = _TelnyxAudioSink(self)
+        # ``CallSession`` now inherits ``session_id`` / ``audio_in``
+        # / ``audio_out`` / ``events`` from the generic
+        # ``ConversationSession``. Phone-specific code still reads
+        # ``call_id`` (kept as a property alias) and ``hang_up``
+        # (kept as a method alias for ``end_session``).
         session = CallSession(
-            call_id=self.call_id,
+            session_id=self.call_id,
             audio_in=self._audio_in_iter(),
             audio_out=sink,
             events=self._events_iter(),
         )
         # Bind hang_up at construction so the brain can ``await
         # session.hang_up()`` without holding a backend reference.
+        # The same callable is exposed under ``end_session`` so the
+        # conversation engine can drive any session uniformly.
         session.hang_up = self._do_hang_up  # type: ignore[method-assign]
+        session.end_session = self._do_hang_up  # type: ignore[method-assign]
         return session
 
     async def _do_hang_up(self) -> None:

@@ -1,0 +1,42 @@
+name: voice-agent
+version: "0.1.0"
+description: "Wake-word activated voice conversations driven by the voice_brain engine."
+
+provides:
+  - voice_agent
+
+requires: []
+depends_on:
+  - voice_brain  # core service — engine that drives the conversation loop
+
+config:
+  # Whether the service is enabled. Off by default — until the mic
+  # source is wired up (TODO), the service is structurally there but
+  # can't actually run a session.
+  enabled: false
+  # Comma-separated list of wake-word keywords. Maps to
+  # ``WakeWordConfig.keywords``. The active wake-word backend
+  # (porcupine, openwakeword) determines which keywords are available.
+  wake_keywords:
+    - "hey gilbert"
+  # Wake-word backend name. Empty = use whatever
+  # ``TranscriptionService`` selected as default.
+  wake_word_backend: ""
+  # How sensitive the detector should be. 0..1, higher = more triggers.
+  sensitivity: 0.5
+  # Idle timeout — close the active conversation after this many
+  # seconds of no inbound speech. Returns the session to wake-word-only
+  # listening (cheap, local) instead of holding open an STT stream
+  # (billed per-minute).
+  idle_timeout_seconds: 12.0
+  # System prompt the brain runs with during an active voice session.
+  # Tightly scoped because wake-word interactions are conversational
+  # but short — different style register from phone calls.
+  system_prompt: |
+    You are Gilbert, the user's personal AI assistant, responding to a
+    wake-word-initiated voice interaction. Keep replies short — one or
+    two sentences max, the way a person would answer over a smart
+    speaker. No markdown, no lists. If you need to do something that
+    takes more than a moment, say "give me a second" then do it. If
+    you're done, call the ``end_conversation`` tool with a one-line
+    summary of what happened so the chat log gets a useful entry.

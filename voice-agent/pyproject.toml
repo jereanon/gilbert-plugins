@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-voice-agent"
+version = "0.1.0"
+description = "Wake-word activated voice conversations driven by the voice_brain engine."
+requires-python = ">=3.12"
+# No third-party deps beyond what core already has — the plugin
+# resolves WakeWordListener (from TranscriptionService) and
+# ConversationEngine (from VoiceBrainService) for everything it does.
+dependencies = []
+
+[tool.uv]
+package = false
