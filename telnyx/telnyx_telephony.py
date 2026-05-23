@@ -384,6 +384,17 @@ class TelnyxTelephony(TelephonyBackend):
                     # accepts ``event: media`` frames back over the
                     # same socket by default.
                     "stream_bidirectional_codec": "PCMU",
+                    # ``stream_custom_parameters`` is what Telnyx echoes
+                    # into the ``start`` frame's ``custom_parameters``.
+                    # We use ``call_control_id`` from the start frame
+                    # as the primary auth signal, but this is a useful
+                    # belt-and-suspenders so a future media-WS handler
+                    # that wants the Gilbert call_id can grab it
+                    # without round-tripping through the sidecar map.
+                    "stream_custom_parameters": {
+                        "call_id": call_id,
+                        "token": webhook_token,
+                    },
                     # Round-trip the token so the media-WS handshake
                     # can authenticate the inbound socket against the
                     # correct session.
