@@ -227,6 +227,11 @@ class _ScribeLiveStream(TranscriptionStream):
 
     async def events(self) -> AsyncIterator[TranscriptionEvent]:
         recv_count = 0
+        # Latched per-utterance: True after we've yielded a
+        # SpeechStarted for the current run of partials, reset to
+        # False after a commit. Stops us from firing one event per
+        # partial during a single user utterance.
+        partial_seen = False
         while True:
             try:
                 raw = await self._ws.recv()
@@ -276,6 +281,38 @@ class _ScribeLiveStream(TranscriptionStream):
                     kind,
                     preview,
                 )
+
+            # Synthesize ``SpeechStarted`` events from
+            # ``partial_transcript`` frames. The Scribe Realtime API
+            # doesn't have a dedicated speech-start signal — it sends
+            # ``partial_transcript`` continuously as it transcribes
+            # streaming audio, then a ``committed_transcript`` after
+            # the VAD silence threshold (1.5s). Without this synthesis
+            # the phone-call brain's barge-in handler never fires:
+            # the user can speak DURING Gilbert's TTS, but the
+            # ``committed_transcript`` only arrives ~1.5s after they
+            # stop, by which time Gilbert has played through his
+            # entire utterance. The user-visible symptom is
+            # "everything I said got queued up after Gilbert finished."
+            #
+            # We emit a single ``SpeechStarted`` on the FIRST
+            # non-empty partial after each commit, not every partial
+            # — the brain's barge-in handler is idempotent (checks
+            # ``speaking.active``) but a steady stream of identical
+            # events is just noise.
+            if kind in ("partial_transcript", "partial"):
+                partial_text = str(msg.get("text") or msg.get("transcript") or "").strip()
+                if partial_text and not partial_seen:
+                    partial_seen = True
+                    yield SpeechStarted(at_seconds=float(msg.get("at", 0.0)))
+            elif kind in (
+                "committed_transcript",
+                "committed_transcript_with_timestamps",
+                "final",
+            ):
+                # Commit resets the partial-arming flag so the next
+                # utterance triggers a fresh SpeechStarted.
+                partial_seen = False
             if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
                     text=str(msg.get("text") or msg.get("transcript") or ""),
