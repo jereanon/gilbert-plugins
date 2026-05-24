@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -705,6 +706,51 @@ class ElevenLabsTTS(TTSBackend):
         # Only cache successful synthesis
         self._cache_put(cache_key, result)
         return result
+
+    def synthesize_stream(
+        self, request: SynthesisRequest,
+    ) -> AsyncIterator[bytes]:
+        """Stream MP3/PCM audio chunks via the ElevenLabs streaming endpoint.
+
+        Skips the local response cache — streaming is intended for
+        long replies where the caller wants minimal first-byte latency
+        anyway. Skips audio-tag injection too; the director model would
+        block first-byte latency on its own round-trip. Callers that
+        want tagged audio should use ``synthesize`` instead."""
+        if not request.voice_id:
+            if self._voice_id:
+                request = SynthesisRequest(
+                    text=request.text, voice_id=self._voice_id,
+                    output_format=request.output_format, speed=request.speed,
+                    stability=request.stability, similarity_boost=request.similarity_boost,
+                    context=request.context,
+                )
+            else:
+                raise ValueError("No voice_id configured — set voice_id in TTS backend settings")
+        client = self._require_client()
+        output_format = _FORMAT_MAP.get(request.output_format, "mp3_44100_128")
+        body: dict[str, Any] = {"text": request.text, "model_id": self._model_id}
+        voice_settings: dict[str, float] = {}
+        if request.stability is not None:
+            voice_settings["stability"] = request.stability
+        if request.similarity_boost is not None:
+            voice_settings["similarity_boost"] = request.similarity_boost
+        if voice_settings:
+            body["voice_settings"] = voice_settings
+
+        async def _gen() -> AsyncIterator[bytes]:
+            async with client.stream(
+                "POST",
+                f"/text-to-speech/{request.voice_id}/stream",
+                json=body,
+                params={"output_format": output_format},
+            ) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+
+        return _gen()
 
     async def list_voices(self) -> list[Voice]:
         client = self._require_client()
