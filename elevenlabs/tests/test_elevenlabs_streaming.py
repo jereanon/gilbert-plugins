@@ -2,17 +2,16 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
+from gilbert_plugin_elevenlabs.elevenlabs_tts import ElevenLabsTTS
 
 from gilbert.interfaces.tts import (
     AudioFormat,
     StreamingTTSCapability,
     SynthesisRequest,
 )
-from gilbert_plugin_elevenlabs.elevenlabs_tts import ElevenLabsTTS
 
 
 def test_elevenlabs_implements_streaming_capability():
