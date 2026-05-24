@@ -101,6 +101,19 @@ _DEFAULT_PHONE_FILLER_PHRASES = [
     "Hold on a moment please.",
 ]
 
+# Spoken by the engine when the LLM calls hang_up / escalate_to_user
+# without including a goodbye line in the same turn. The system
+# prompt + tool descriptions both tell the brain to speak goodbye
+# itself, but Anthropic occasionally non-complies and we'd otherwise
+# drop into dead air → dial tone. Phone etiquette: warm, brief.
+_DEFAULT_PHONE_GOODBYE_PHRASES = [
+    "Thanks so much. Have a good one!",
+    "Alright, thanks. Take care!",
+    "Thanks for your time. Goodbye.",
+    "Appreciate it. Have a great day.",
+    "Okay, thanks again. Talk to you later.",
+]
+
 # How long of remote silence after the brain finishes speaking before we
 # proactively prompt the remote ("are you still there?"). Voicemail
 # detection sits on top of this — see ``_VOICEMAIL_SILENCE_SECONDS``.
@@ -880,8 +893,12 @@ class PhoneCallService(Service):
         if name == "hang_up":
             reason = str(arguments.get("reason") or "")
             ctx.outcome["hang_up_reason"] = reason
+            # Past system note said "(brain hung up: …)" which was
+            # ambiguous — users reading the transcript wondered who
+            # "brain" was and whether Gilbert or the remote ended
+            # the call. Make it unambiguous.
             await ctx.record_turn(
-                "system", f"(brain hung up: {reason})"
+                "system", f"(Gilbert ended the call: {reason})"
             )
             ctx.outcome["end_requested"] = True
             return f"OK, hanging up. Reason: {reason}"
@@ -892,7 +909,7 @@ class PhoneCallService(Service):
                 ctx.outcome.update(summary)
             await ctx.record_turn(
                 "system",
-                f"(brain reading back confirmation: {summary})",
+                f"(Gilbert recorded outcome: {summary})",
             )
             return f"Outcome recorded: {summary}"
 
@@ -902,7 +919,7 @@ class PhoneCallService(Service):
             ctx.outcome["escalation_reason"] = reason
             await ctx.record_turn(
                 "system",
-                f"(brain escalating: {reason})",
+                f"(Gilbert escalating to you: {reason})",
             )
             await ctx.publish_event(
                 "phone.call.escalation_requested",
@@ -1252,6 +1269,14 @@ class PhoneCallService(Service):
             filler_phrases=list(
                 self._config.get("filler_phrases")
                 or _DEFAULT_PHONE_FILLER_PHRASES
+            ),
+            # Fallback goodbye if the LLM calls hang_up without
+            # speaking — engine picks one and plays it before
+            # session.end_session() so we don't drop to a dial
+            # tone mid-sentence.
+            default_goodbye_phrases=list(
+                self._config.get("goodbye_phrases")
+                or _DEFAULT_PHONE_GOODBYE_PHRASES
             ),
             # Operator-directive bridge — engine's synthetic-turn
             # loop drains this queue and runs _think_and_speak for

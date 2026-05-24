@@ -99,6 +99,18 @@ _DEFAULT_FILLER_PHRASES = [
     "Just a sec.",
 ]
 
+# Fallback goodbyes — spoken by the engine if the LLM calls
+# end_conversation without including its own goodbye line. Casual
+# tone since voice-agent is the user talking to their own
+# assistant (no need for phone-call formality).
+_DEFAULT_GOODBYE_PHRASES = [
+    "Talk to you later!",
+    "Catch you later.",
+    "See you soon!",
+    "Alright, later then.",
+    "Bye for now!",
+]
+
 
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Gilbert, the user's personal AI assistant, responding to a "
@@ -1399,6 +1411,10 @@ class VoiceAgentService(Service):
             filler_phrases=list(
                 self._config.get("filler_phrases")
                 or _DEFAULT_FILLER_PHRASES
+            ),
+            default_goodbye_phrases=list(
+                self._config.get("goodbye_phrases")
+                or _DEFAULT_GOODBYE_PHRASES
             ),
             # Conversational mode: the engine watches this Event
             # and closes/reopens its STT stream on set/clear, so
