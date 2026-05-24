@@ -1099,16 +1099,6 @@ class VoiceAgentService(Service):
                 active.last_user_activity_ts = (
                     asyncio.get_event_loop().time()
                 )
-
-        async def _on_speaking_done() -> None:
-            """Fired by the engine after each TTS playback completes.
-            Resets the dormant-silence timer so the 10-second
-            countdown only starts when Gilbert has finished talking.
-            """
-            if active.mode == "conversational":
-                active.last_user_activity_ts = (
-                    asyncio.get_event_loop().time()
-                )
             # Live-mirror the turn back to the user's voice-agent
             # browser tab. Publishing via the bus instead of holding
             # a ref to the conn keeps the service decoupled from
@@ -1132,6 +1122,16 @@ class VoiceAgentService(Service):
                         },
                         source="voice_agent",
                     )
+                )
+
+        async def _on_speaking_done() -> None:
+            """Fired by the engine after each TTS playback completes.
+            Resets the dormant-silence timer so the 10-second
+            countdown only starts when Gilbert has finished talking.
+            """
+            if active.mode == "conversational":
+                active.last_user_activity_ts = (
+                    asyncio.get_event_loop().time()
                 )
 
         async def _on_status_change(
