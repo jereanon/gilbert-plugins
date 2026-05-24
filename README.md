@@ -353,7 +353,7 @@ attempt.
 High-quality text-to-speech via the ElevenLabs API, plus batch and streaming speech-to-text via the ElevenLabs Scribe API. Used by the core `speaker.announce` flow, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
 
 **Backends registered**
-- `TTSBackend.backend_name = "elevenlabs"` — synthesizes speech from text.
+- `TTSBackend.backend_name = "elevenlabs"` — synthesizes speech from text. Also implements `StreamingTTSCapability` (chunked output via the HTTP `/stream` endpoint) and `BidirectionalTTSCapability` (push-text / read-audio sessions via the stream-input WebSocket).
 - `BatchTranscriptionBackend.backend_name = "elevenlabs_scribe"` — one-shot transcription via `POST /v1/speech-to-text`. Supports diarization.
 - `StreamingTranscriptionBackend.backend_name = "elevenlabs_scribe_live"` — real-time transcription via the Scribe WebSocket endpoint.
 
@@ -726,7 +726,7 @@ tech debt; v1 mandates `0600` on `.gilbert/gilbert.db`.
 Local text-to-speech backend powered by the open-weights [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model. Runs entirely in-process — no cloud API, no HTTP server. Default-disabled because of heavyweight dependencies (PyTorch ~700 MB, ~327 MB model on first use).
 
 **Backend registered**
-- `TTSBackend.backend_name = "kokoro"` — synthesizes speech from text using one `kokoro.KPipeline` per language, lazily instantiated on first use.
+- `TTSBackend.backend_name = "kokoro"` — synthesizes speech from text using one `kokoro.KPipeline` per language, lazily instantiated on first use. Also implements `StreamingTTSCapability` (chunked output via sentence-split — each sentence is synthesized and encoded separately, so audio starts arriving before the full text finishes).
 
 **Runtime check** — `./gilbert.sh doctor --plugin kokoro` runs a minimal end-to-end synthesis to verify the full stack (torch + kokoro + libgomp + PyAV) is functional. The probe imports `av` and `kokoro`, builds a `KPipeline(lang_code='a')`, and synthesizes one phoneme.
 
