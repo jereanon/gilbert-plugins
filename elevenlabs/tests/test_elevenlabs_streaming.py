@@ -98,8 +98,14 @@ async def test_open_stream_returns_tts_stream(monkeypatch):
     cfg = TTSStreamConfig(voice_id="v1", output_format=AudioFormat.MP3)
     stream = await backend.open_stream(cfg)
     assert isinstance(stream, TTSStream)
-    # The opening "initialize voice settings" frame was sent.
-    assert any('"text"' in s for s in fake_ws.sent)
+    # The priming frame must be the FIRST send and have the exact
+    # shape ElevenLabs' stream-input API requires.
+    assert fake_ws.sent, "no frames were sent — priming frame is missing"
+    priming = _json.loads(fake_ws.sent[0])
+    assert priming["text"] == " "
+    assert "voice_settings" in priming
+    assert "stability" in priming["voice_settings"]
+    assert "similarity_boost" in priming["voice_settings"]
     await stream.close()
 
 
