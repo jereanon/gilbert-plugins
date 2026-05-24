@@ -494,6 +494,11 @@ class VoiceAgentService(Service):
     against a second consumer.
     """
 
+    # Slash namespace for any user-facing slash commands this service
+    # provider exposes. Required for tool-providing plugin services so
+    # we don't fall back to the hyphenated directory name (``voice-agent``).
+    slash_namespace = "voice"
+
     def __init__(self) -> None:
         self._resolver: ServiceResolver | None = None
         self._enabled: bool = False
