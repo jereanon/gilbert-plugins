@@ -3,8 +3,11 @@ name = "gilbert-plugin-elevenlabs"
 version = "1.0.0"
 description = "ElevenLabs TTS backend for Gilbert"
 requires-python = ">=3.12"
-# Uses ``httpx`` which is already a Gilbert core dep.
-dependencies = []
+# ``httpx`` is already a Gilbert core dep; ``websockets`` is pulled in
+# for the bidirectional ``stream-input`` TTS WebSocket API.
+dependencies = [
+    "websockets>=12.0",
+]
 
 [tool.uv]
 package = false
