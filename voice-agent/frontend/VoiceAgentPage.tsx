@@ -31,10 +31,24 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 interface TranscriptTurn {
   who: string;       // "us" (Gilbert) | "them" (the user) | "system"
   text: string;
-  ts: number;        // seconds since session start
+  ts: number;        // seconds since session start (from server)
+  /** Wall-clock epoch millis captured at SPA receive time. Used to
+   * render a HH:MM:SS column so we can spot turn-queue weirdness
+   * (e.g. user repeating themselves because the first attempt
+   * looked stuck, then both attempts processing back-to-back). */
+  receivedAt: number;
   /** Local React-only id so we can render this without a key collision when
    * the same text repeats. The server doesn't issue ids; we mint per-row. */
   key: string;
+}
+
+/** Format epoch ms as "HH:MM:SS" in the user's local timezone. */
+function formatWallClock(epochMs: number): string {
+  const d = new Date(epochMs);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 }
 
 type SessionState =
@@ -106,10 +120,12 @@ export function VoiceAgentPage(): ReactElement {
       const ts =
         typeof data.ts === "number" ? data.ts : Number(data.ts ?? 0);
       if (!who || !text) return;
+      const receivedAt = Date.now();
       const newTurn: TranscriptTurn = {
         who,
         text,
         ts,
+        receivedAt,
         key: `${ts}-${who}-${Math.random().toString(36).slice(2, 8)}`,
       };
       setTranscript((prev) => [...prev, newTurn]);
@@ -409,6 +425,12 @@ export function VoiceAgentPage(): ReactElement {
                       : "flex items-start gap-3 text-muted-foreground italic"
                 }
               >
+                <span
+                  className="shrink-0 font-mono text-xs text-muted-foreground w-20 pt-0.5"
+                  title={`Received ${new Date(t.receivedAt).toLocaleString()} · session t=${t.ts.toFixed(2)}s`}
+                >
+                  {formatWallClock(t.receivedAt)}
+                </span>
                 <span
                   className={
                     "shrink-0 font-semibold w-20 " +
