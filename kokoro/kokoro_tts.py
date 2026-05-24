@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
+from collections.abc import AsyncIterator
 from typing import Any
 
 import numpy as np
@@ -187,6 +189,20 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
     return buf.getvalue()
 
 
+# Sentence-splitter: terminal . ! ? optionally followed by quote, then
+# whitespace, OR end-of-string. Trailing fragments without terminal
+# punctuation are kept as a final chunk. Tuned for English; non-English
+# voices still produce sensible-enough boundaries since the regex
+# matches the same Latin punctuation other Kokoro languages use.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])["\'\)\]]?\s+')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split ``text`` into a list of non-empty sentence-ish chunks."""
+    parts = _SENTENCE_SPLIT_RE.split(text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _build_pipeline(lang_code: str, device: str) -> Any:
     """Construct a kokoro.KPipeline. Isolated so tests can patch it."""
     from kokoro import KPipeline  # type: ignore[attr-defined]  # kokoro has no py.typed stubs
@@ -306,6 +322,39 @@ class KokoroTTSBackend(TTSBackend):
             duration_seconds=duration,
             characters_used=len(request.text),
         )
+
+    def synthesize_stream(
+        self, request: SynthesisRequest,
+    ) -> AsyncIterator[bytes]:
+        """Stream audio sentence-by-sentence.
+
+        Splits the input text on sentence boundaries and yields each
+        sentence's encoded audio as a separate chunk. The speaker hears
+        sentence 1 while sentence 2 renders, which materially improves
+        perceived latency on long replies — even though kokoro is local
+        CPU inference."""
+        if request.voice_id not in _VOICES_BY_ID:
+            raise ValueError(f"Unknown Kokoro voice: {request.voice_id!r}")
+        lang = _lang_code_for_voice(request.voice_id)
+        speed = float(request.speed) if request.speed else self._speed
+        sentences = _split_sentences(request.text) or [request.text]
+
+        async def _gen() -> AsyncIterator[bytes]:
+            pipeline = self._get_pipeline(lang)
+            loop = asyncio.get_running_loop()
+            for sentence in sentences:
+                def _run_sync(s: str = sentence) -> np.ndarray:
+                    chunks: list[np.ndarray] = []
+                    for _g, _p, audio in pipeline(s, voice=request.voice_id, speed=speed):
+                        arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+                        chunks.append(arr)
+                    if not chunks:
+                        return np.zeros(0, dtype=np.float32)
+                    return np.concatenate(chunks)
+                samples = await loop.run_in_executor(None, _run_sync)
+                yield _encode(samples, request.output_format)
+
+        return _gen()
 
     async def list_voices(self) -> list[Voice]:
         return list(_VOICES)
