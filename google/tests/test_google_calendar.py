@@ -461,9 +461,15 @@ def test_backend_auto_registers() -> None:
 def test_backend_config_params_include_required_keys() -> None:
     keys = {p.key for p in GoogleCalendarBackend.backend_config_params()}
     assert keys == {
+        "credential_mode",
         "email_address",
         "service_account_json",
         "delegated_user",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "oauth_redirect_uri",
+        "oauth_refresh_token",
+        "oauth_auth_code",
     }
 
 

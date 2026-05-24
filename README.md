@@ -553,7 +553,7 @@ Google Gemini chat backend, speaking the [OpenAI-compatible Gemini endpoint](htt
 
 ### google
 
-Bundled Google Workspace integration suite. One plugin, six backends — they share credential plumbing (OAuth, service account, delegated access), so splitting them would just duplicate boilerplate.
+Bundled Google integration suite. One plugin, six backends — they share credential plumbing (OAuth, shared service accounts, delegated Workspace access), so splitting them would just duplicate boilerplate.
 
 **Backends registered**
 - `AuthBackend.backend_name = "google"` — OAuth ID token verification for the login system.
@@ -561,7 +561,7 @@ Bundled Google Workspace integration suite. One plugin, six backends — they sh
 - `EmailBackend.backend_name = "gmail"` — used by the Inbox service for polling, threads, drafts, and sending.
 - `DocumentBackend.backend_name = "google_drive"` — Google Drive document sync into the Knowledge service.
 - `CalendarBackend.backend_name = "google_calendar"` — Google Calendar v3 events, free/busy, and mutations for the Calendar service.
-- `TaskBackend.backend_name = "google_tasks"` — Google Tasks v1 list / create / update / complete / delete for the Tasks service. One Gilbert task list = one Google `tasklist` (bound by `tasklist_id`); polling uses `updatedMin` for delta semantics. **DWD requires Google Workspace** — personal `gmail.com` accounts cannot use this backend.
+- `TaskBackend.backend_name = "google_tasks"` — Google Tasks v1 list / create / update / complete / delete for the Tasks service. One Gilbert task list = one Google `tasklist` (bound by `tasklist_id`); polling uses `updatedMin` for delta semantics.
 
 **Configure**
 
@@ -569,12 +569,14 @@ Bundled Google Workspace integration suite. One plugin, six backends — they sh
 |---|---|
 | Auth (Google OAuth) | `client_id`, `client_secret` *(sensitive)*, `domain` (optional Workspace domain lock) |
 | User provider (Workspace directory) | `sa_json` *(sensitive, service-account JSON)*, `delegated_user`, `domain` |
-| Inbox (Gmail) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
-| Knowledge (Drive) | `service_account_json` *(sensitive)*, `delegated_user`, `folder_id` |
-| Calendar (Google Calendar) | `service_account_json` *(sensitive)*, `delegated_user`, `email_address` |
-| Tasks (Google Tasks) | `service_account_json` *(sensitive)*, `delegated_user`, `tasklist_id` |
+| Inbox (Gmail) | `credential_mode`, `email_address`, OAuth fields (`oauth_client_id`, `oauth_client_secret`, `oauth_redirect_uri`, `oauth_refresh_token`, `oauth_auth_code`), legacy `service_account_json` + `delegated_user` |
+| Knowledge (Drive) | `credential_mode`, `folder_id`, OAuth fields, or `service_account_json` for shared / delegated service-account modes |
+| Calendar (Google Calendar) | `credential_mode`, `email_address`, OAuth fields, or `service_account_json` for shared / delegated service-account modes |
+| Tasks (Google Tasks) | `credential_mode`, `tasklist_id`, OAuth fields, or legacy `service_account_json` + `delegated_user` |
 
-Each backend exposes a `test_connection` config action that verifies credentials by making a one-off read call.
+For new personal Google-account setup, use `credential_mode = oauth_bot` and the backend's `connect_google` / `connect_google_complete` actions. Existing Workspace domain-wide-delegation configs continue to work. `shared_service_account` is supported only for Calendar and Drive, where Google sharing can grant the service-account email access to a calendar or folder; Gmail and Tasks do not support that mode.
+
+Each backend exposes a `test_connection` config action that verifies credentials by making a one-off read call or validating the share target for shared service-account setup.
 
 **OAuth scopes required for the Calendar backend** (added to the existing service-account's domain-wide delegation in the Google Workspace admin console):
 
