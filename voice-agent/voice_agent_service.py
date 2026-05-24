@@ -954,10 +954,22 @@ class VoiceAgentService(Service):
         # drop back to dormant cleanly.
         active.responding = False
         active.last_user_activity_ts = asyncio.get_event_loop().time()
+        # Reset the audio_in iterator BEFORE clearing the pause
+        # event. ``_audio_in_iter`` is an async generator; the
+        # engine's previous pump task was cancelled when we went
+        # dormant, which raised GeneratorExit inside the generator
+        # and closed it. A fresh pump task using the same closed
+        # generator would exit after 0 chunks ("audio_in iterator
+        # exhausted") and Gilbert would silently stop responding.
+        # Swap in a new generator first so the engine's new pump
+        # has something to iterate. We MUST do this before clearing
+        # ``listening_paused`` because the engine reads
+        # ``session.audio_in`` immediately on resume.
+        active.session.audio_in = (
+            active.session._audio_in_iter()  # type: ignore[assignment]
+        )
         # Tell the engine to reopen STT — the listen loop is sitting
         # in its outer pause-await waiting for this Event to clear.
-        # The next chunk through ``push_audio_in`` will flow to the
-        # freshly-opened Scribe stream.
         if active.listening_paused is not None:
             active.listening_paused.clear()
         logger.info(
