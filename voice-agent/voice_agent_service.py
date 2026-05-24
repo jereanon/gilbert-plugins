@@ -1201,6 +1201,7 @@ class VoiceAgentService(Service):
                     "TranscriptionService selected as default."
                 ),
                 default="",
+                choices_from="transcription.wake_word_backends",
                 restart_required=True,
             ),
             ConfigParam(
