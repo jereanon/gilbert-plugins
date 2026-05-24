@@ -1423,6 +1423,11 @@ class VoiceAgentService(Service):
             # ``ctx.outcome["end_requested"]`` and the engine notices
             # after each chat() round.
             use_full_ai_service=True,
+            # Tag the underlying ai.chat() conversation so it doesn't
+            # clutter the chat sidebar. Voice-agent already persists
+            # its own _VoiceConversationRecord (visible at /voice);
+            # the chat() history entity is internal bookkeeping.
+            source="voice_agent",
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
                 sample_rate=16000,

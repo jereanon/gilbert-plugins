@@ -1234,6 +1234,11 @@ class PhoneCallService(Service):
             # the remote asks "what's our address?" Gilbert can
             # actually look it up instead of saying "I don't know."
             use_full_ai_service=True,
+            # Tag the underlying ai.chat() conversation so it doesn't
+            # clutter the chat sidebar. Phone already persists its own
+            # _CallRecord (visible at /calls); the chat() history is
+            # internal bookkeeping for the agentic loop.
+            source="phone_call",
             # Filler ("hmm, let me check…") while a slow tool
             # lookup is in flight. Same threshold + phrase list as
             # voice-agent — calibrated to skip the filler for
@@ -1541,11 +1546,13 @@ def _now_iso() -> str:
 def _format_call_ended_summary(record: _CallRecord) -> str:
     """Render the "call ended" follow-up the originating chat sees.
 
-    Keep this in plain markdown — the chat renderer handles it the
-    same way as any other assistant message. The leading
-    "(call ended)" marker makes it obvious to both the user (visual
-    cue) and the LLM (on the next turn) that this is an out-of-band
-    insertion, not a real assistant response in the conversation.
+    Short by design — one line with a link to the full record on the
+    Calls page. Earlier versions dumped the whole transcript +
+    outcome dict into the chat thread which was overwhelming; the
+    Calls page is the right place to drill in. The leading
+    "(call ended)" marker tags this as an out-of-band insertion so
+    the LLM doesn't treat it as a real assistant response on the
+    next turn.
     """
     duration = ""
     if record.duration_seconds and record.duration_seconds > 0:
@@ -1555,36 +1562,16 @@ def _format_call_ended_summary(record: _CallRecord) -> str:
             f"{mins}m {secs}s" if mins else f"{secs}s"
         )
 
-    parts: list[str] = []
-    parts.append(
-        f"(call ended) The phone call I started to {record.to_number} has "
-        f"ended (status: `{record.status}`"
-        + (f", duration: {duration}" if duration else "")
-        + f", call id: `{record.call_id}`)."
-    )
+    bits: list[str] = [f"status: `{record.status}`"]
+    if duration:
+        bits.append(duration)
     if record.failure_reason:
-        parts.append(f"\nFailure reason: `{record.failure_reason}`.")
-    if record.outcome:
-        # Keep the structured outcome readable but compact. Skip the
-        # internal-only flags the brain stamps for debugging.
-        outcome = {
-            k: v
-            for k, v in record.outcome.items()
-            if not k.startswith("transcription_")
-        }
-        if outcome:
-            parts.append(f"\nOutcome:\n```\n{outcome}\n```")
-    # Brief transcript preview — at most the last 6 turns so the
-    # follow-up message doesn't bloat the conversation.
-    if record.transcript:
-        tail = record.transcript[-6:]
-        lines = [f"- **{t.get('who', '?')}**: {t.get('text', '')}" for t in tail]
-        parts.append("\nRecent transcript:\n" + "\n".join(lines))
-    parts.append(
-        "\nThe call is no longer active. Full transcript + recording "
-        "(when available) is on the Calls page."
+        bits.append(f"failure: `{record.failure_reason}`")
+    detail = " · ".join(bits)
+    return (
+        f"(call ended) Call to {record.to_number} — {detail}. "
+        f"[View transcript](/calls/{record.call_id})"
     )
-    return "\n".join(parts)
 
 
 # (``_MonotonicClock`` and ``_pump_audio_to_stt`` moved into the
