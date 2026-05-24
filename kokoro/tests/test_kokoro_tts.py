@@ -61,3 +61,63 @@ def test_voice_id_first_char_encodes_lang_code(voice_id: str, expected_lang_code
     from gilbert_plugin_kokoro.kokoro_tts import _lang_code_for_voice
 
     assert _lang_code_for_voice(voice_id) == expected_lang_code
+
+
+from gilbert.interfaces.tts import TTSBackend
+
+
+def test_backend_registered() -> None:
+    """Importing the module registers the backend in the ABC's registry."""
+    import gilbert_plugin_kokoro.kokoro_tts  # noqa: F401
+    backends = TTSBackend.registered_backends()
+    assert "kokoro" in backends
+
+
+def test_backend_config_params_keys() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    params = KokoroTTSBackend.backend_config_params()
+    keys = [p.key for p in params]
+    assert keys == ["device", "default_voice", "speed", "preload"]
+
+
+def test_backend_config_param_defaults() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    by_key = {p.key: p for p in KokoroTTSBackend.backend_config_params()}
+    assert by_key["device"].default == "cpu"
+    assert by_key["device"].choices == ("cpu", "cuda", "mps", "auto")
+    assert by_key["device"].restart_required is True
+    assert by_key["default_voice"].default == "af_heart"
+    assert by_key["default_voice"].choices is not None
+    assert "af_heart" in by_key["default_voice"].choices
+    assert "jf_alpha" in by_key["default_voice"].choices
+    assert by_key["speed"].default == 1.0
+    assert by_key["preload"].default is False
+    assert by_key["preload"].restart_required is True
+
+
+async def test_list_voices_returns_catalog() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend, _VOICES
+
+    backend = KokoroTTSBackend()
+    voices = await backend.list_voices()
+    assert voices == _VOICES
+
+
+async def test_get_voice_known() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    v = await backend.get_voice("af_heart")
+    assert v is not None
+    assert v.voice_id == "af_heart"
+    assert v.labels["gender"] == "female"
+
+
+async def test_get_voice_unknown() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    v = await backend.get_voice("nope")
+    assert v is None

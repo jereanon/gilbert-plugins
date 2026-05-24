@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from gilbert.interfaces.tts import Voice
+import logging
+from typing import Any
+
+from gilbert.interfaces.configuration import ConfigParam
+from gilbert.interfaces.tools import ToolParameterType
+from gilbert.interfaces.tts import (
+    SynthesisRequest,
+    SynthesisResult,
+    TTSBackend,
+    Voice,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _v(voice_id: str, name: str, language: str, region: str, gender: str) -> Voice:
@@ -96,3 +108,82 @@ def _lang_code_for_voice(voice_id: str) -> str:
     if not voice_id:
         raise ValueError("voice_id is empty")
     return voice_id[0]
+
+
+class KokoroTTSBackend(TTSBackend):
+    """Local TTS via the open-weights Kokoro-82M model.
+
+    Lazily instantiates one ``kokoro.KPipeline`` per language code on
+    first use and caches them. Synthesis runs in a thread executor
+    because kokoro is sync/blocking. Output is always resampled to
+    44.1 kHz mono int16 before encoding to the caller's requested
+    AudioFormat via PyAV.
+    """
+
+    backend_name = "kokoro"
+
+    @classmethod
+    def backend_config_params(cls) -> list[ConfigParam]:
+        return [
+            ConfigParam(
+                key="device",
+                type=ToolParameterType.STRING,
+                description="Inference device.",
+                default="cpu",
+                choices=("cpu", "cuda", "mps", "auto"),
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="default_voice",
+                type=ToolParameterType.STRING,
+                description="Voice ID used when the caller does not specify one.",
+                default="af_heart",
+                choices=tuple(v.voice_id for v in _VOICES),
+            ),
+            ConfigParam(
+                key="speed",
+                type=ToolParameterType.NUMBER,
+                description="Default speech rate multiplier (0.5 = slow, 2.0 = fast).",
+                default=1.0,
+            ),
+            ConfigParam(
+                key="preload",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "Load the default-language Kokoro pipeline at startup. "
+                    "When false (default), the model loads on the first "
+                    "synthesis request, which adds ~5-10 s to that call."
+                ),
+                default=False,
+                restart_required=True,
+            ),
+        ]
+
+    def __init__(self) -> None:
+        self._device: str = "cpu"
+        self._default_voice: str = "af_heart"
+        self._speed: float = 1.0
+        self._preload: bool = False
+        self._pipelines: dict[str, Any] = {}
+
+    async def initialize(self, config: dict[str, object]) -> None:
+        self._device = str(config.get("device", "cpu"))
+        self._default_voice = str(config.get("default_voice", "af_heart"))
+        self._speed = float(config.get("speed", 1.0))  # type: ignore[arg-type]
+        self._preload = bool(config.get("preload", False))
+        logger.info(
+            "KokoroTTSBackend initialized: device=%s default_voice=%s speed=%s preload=%s",
+            self._device, self._default_voice, self._speed, self._preload,
+        )
+
+    async def close(self) -> None:
+        self._pipelines.clear()
+
+    async def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        raise NotImplementedError("Task 7 implements this")
+
+    async def list_voices(self) -> list[Voice]:
+        return list(_VOICES)
+
+    async def get_voice(self, voice_id: str) -> Voice | None:
+        return _VOICES_BY_ID.get(voice_id)
