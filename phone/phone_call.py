@@ -1162,6 +1162,52 @@ class PhoneCallService(Service):
                 },
             )
 
+        # ── intervention hook ────────────────────────────────────────
+
+        async def _drain_interventions(user_text: str) -> str:
+            """Pull every queued operator directive and prepend them
+            as system notes to the LLM's next user_message. The SPA's
+            'Direct Gilbert' textbox lands directives on
+            ``interventions`` via the ``phone.call.intervene_text``
+            WS handler — without this hook the queue filled up and
+            nothing ever read from it.
+            """
+            directives: list[str] = []
+            while True:
+                try:
+                    directives.append(interventions.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if not directives:
+                return user_text
+            log.info(
+                "draining %d operator directive(s) into next LLM "
+                "turn for call %s",
+                len(directives),
+                record.call_id,
+            )
+            # Record each directive on the transcript as a "system"
+            # turn so the SPA's transcript pane shows what was
+            # injected and when.
+            for d in directives:
+                await _on_transcript_turn(
+                    "system", f"(operator directive: {d})", 0.0
+                )
+            joined = "\n".join(
+                f"(OPERATOR DIRECTIVE from the user you're calling "
+                f"on behalf of: {d})"
+                for d in directives
+            )
+            # The remote said user_text (possibly empty if this is
+            # the opener turn). Prepend the directives so the brain
+            # sees them before deciding how to respond. The brain
+            # should ACT on the directive — change tactic, ask a
+            # specific question, agree/disagree — not just narrate
+            # that it received one.
+            if user_text:
+                return f"{joined}\n\n{user_text}"
+            return joined
+
         # ── drive the engine ──────────────────────────────────────────
 
         engine_config = ConversationConfig(
@@ -1202,6 +1248,9 @@ class PhoneCallService(Service):
                 self._config.get("filler_phrases")
                 or _DEFAULT_PHONE_FILLER_PHRASES
             ),
+            # Operator-directive hook — see _drain_interventions
+            # above for the "Direct Gilbert" text-box wiring.
+            mutate_user_text=_drain_interventions,
         )
 
         outcome: ConversationOutcome | None = None
