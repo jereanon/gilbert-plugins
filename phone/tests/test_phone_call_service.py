@@ -230,10 +230,10 @@ def test_call_record_roundtrips_through_dict() -> None:
     page and break the callback-routing lookup."""
     record = _CallRecord(
         call_id="call_x",
-        user_id="usr_jeremy",
+        user_id="usr_example",
         to_number="+13035550100",
-        from_number="+17046411948",
-        callback_number="+17046411948",
+        from_number="+15551234567",
+        callback_number="+15551234567",
         brief="schedule audi service",
         status=CallStatus.CONNECTED.value,
         webhook_token="tok_secret",

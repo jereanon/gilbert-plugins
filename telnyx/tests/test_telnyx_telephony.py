@@ -3,8 +3,8 @@
 These cover the pure-logic bits — webhook dispatch into session
 queues, session bookkeeping, custom-state encoding — without hitting
 the real Telnyx API. Anything that requires a real outbound call
-(``place_call``, the actual HTTP request) is exercised manually on
-meridian once the operator provisions a Telnyx number.
+(``place_call``, the actual HTTP request) is exercised manually
+once the operator provisions a Telnyx number.
 """
 
 from __future__ import annotations

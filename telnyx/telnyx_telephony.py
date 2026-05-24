@@ -432,7 +432,7 @@ class TelnyxTelephony(TelephonyBackend):
                     # said" turn. The reported "Gilbert kept asking
                     # me to ask a question" symptom was exactly that
                     # feedback loop — Scribe was returning lines
-                    # like "Hi, this is Gilbert, Jeremy Arnold's
+                    # like "Hi, this is Gilbert, the user's
                     # personal assistant." as user input.
                     #
                     # Outbound audio still works because the

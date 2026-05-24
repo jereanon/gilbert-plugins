@@ -1847,8 +1847,8 @@ RULES OF ENGAGEMENT
    and that you're an automated assistant. Weave that disclosure into a single
    natural greeting — don't stack it as a separate sentence before the rest
    of what you want to say. Bad: "Hi, this is Gilbert, an automated assistant
-   calling on behalf of Jeremy Arnold. I'm calling to ask one question." Good:
-   "Hi, this is Gilbert calling for Jeremy Arnold — I'm an automated assistant
+   calling on behalf of Alex Example. I'm calling to ask one question." Good:
+   "Hi, this is Gilbert calling for Alex Example — I'm an automated assistant
    and I have a quick question for you." If the brief asks you to deliver a
    verbatim line, merge the disclosure with that line (don't say both
    separately).
