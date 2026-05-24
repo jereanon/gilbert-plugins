@@ -764,16 +764,30 @@ class VoiceAgentService(Service):
 
         # Conversational mode: ALWAYS feed the wake detector (cheap,
         # local) so "Hey Gilbert" can recover from dormant state.
-        # In DORMANT, don't feed the engine — that's the whole point;
-        # the engine pauses, no STT cost, no LLM calls.
+        # In DORMANT, the user's REAL audio should NOT reach the
+        # brain — that's the whole point of dormancy. BUT we still
+        # have to keep the engine's STT stream alive, because
+        # ElevenLabs Scribe Realtime closes its WebSocket after
+        # ~15s of no audio. Once that closes, the engine's listen
+        # loop exits and even after wake recovery, no transcripts
+        # ever reach the brain again. Symptom: "Gilbert came alive
+        # one time, then stops responding to subsequent wake words."
+        #
+        # Solution: in dormant, swap the real audio for an
+        # equivalently-sized silent buffer before pushing to the
+        # engine. Scribe sees a steady stream of (silent) frames
+        # and keeps the WS open. The wake detector still gets the
+        # REAL audio so "Hey Gilbert" still wakes us. On wake →
+        # active, real audio resumes flowing and Scribe is still
+        # warm and ready to transcribe.
         if active.mode == "conversational" and active.wake_detector is not None:
             try:
                 await active.wake_detector.send(chunk)
             except Exception:
                 logger.debug("wake detector send failed", exc_info=True)
             if active.state == "dormant":
-                # Audio still flows through us (for the wake detector)
-                # but the engine doesn't see it.
+                silent = b"\x00" * len(chunk)
+                await active.session.push_audio_in(silent)
                 return {"ref": ref, "ok": True}
 
         await active.session.push_audio_in(chunk)
