@@ -463,6 +463,10 @@ class VoiceAgentService(Service):
         self._message_poster: ConversationMessagePoster | None = None
         self._storage: StorageProvider | None = None
         self._bus: Any = None
+        # TTSProvider — used by ``_transition_to_dormant`` to
+        # synthesize a yawn before sleeping. Falls back gracefully
+        # if not available (yawn just gets skipped).
+        self._tts: Any = None
         # Active session task. None when in wake-listen mode.
         self._session_task: asyncio.Task[None] | None = None
         # Per-WS-connection active session. Keyed by conn.connection_id.
@@ -924,6 +928,16 @@ class VoiceAgentService(Service):
             active.conversation_id,
             reason,
         )
+        # Yawn first (while STT is still open and audio_out works
+        # cleanly), THEN signal the engine to close. The yawn is
+        # a sleepy-sounding TTS clip, and we also drop a "system"
+        # transcript turn so the SPA shows a timestamped marker
+        # like "💤 Going dormant — say 'Hey Gilbert' to wake me".
+        await self._speak_dormant_yawn(active)
+        await self._publish_system_turn(
+            active,
+            "💤 Going dormant — say 'Hey Gilbert' to wake me back up.",
+        )
         # Signal the engine to close its STT stream (no more
         # Scribe-per-second charges while we're just listening
         # for the wake word locally). The engine's listen loop
@@ -940,6 +954,74 @@ class VoiceAgentService(Service):
         except asyncio.QueueEmpty:
             pass
         await self._publish_state_change(active, "dormant", reason)
+
+    async def _speak_dormant_yawn(self, active: _ActiveSession) -> None:
+        """Synthesize a sleepy "yawn" clip and write it to the
+        session's audio_out so the user hears Gilbert nodding off
+        before the line goes quiet.
+
+        Uses the configured TTS provider. ElevenLabs Conversational
+        voices interpret asterisk-bracketed cues like ``*yawn*``
+        as non-verbal vocalizations, so we lean on that — falls
+        back to a written phrase if the voice doesn't honour the
+        cue. Failures are swallowed: a missing TTS provider or
+        synth error shouldn't block dormancy itself.
+        """
+        if self._tts is None:
+            return
+        try:
+            from gilbert.interfaces.tts import (
+                AudioFormat as _TTSAudioFormat,
+            )
+            from gilbert.interfaces.tts import (
+                SynthesisRequest as _SynthesisRequest,
+            )
+
+            synth = await self._tts.synthesize(
+                _SynthesisRequest(
+                    text="*yawn* mmm, getting sleepy.",
+                    voice_id="",
+                    output_format=_TTSAudioFormat.MP3,
+                )
+            )
+            await active.session.audio_out.write(synth.audio)
+            await active.session.audio_out.flush()
+        except Exception:
+            logger.debug(
+                "voice-agent: dormant yawn synth/play failed",
+                exc_info=True,
+            )
+
+    async def _publish_system_turn(
+        self, active: _ActiveSession, text: str
+    ) -> None:
+        """Publish a synthetic ``who="system"`` transcript turn so
+        the SPA can render a timestamped marker in the live
+        transcript pane (e.g. "💤 Going dormant…"). Uses the same
+        ``voice_agent.transcript_turn`` event the engine emits for
+        real turns, just with ``who="system"``.
+        """
+        if self._bus is None:
+            return
+        from gilbert.interfaces.events import Event
+
+        # ts seconds-since-session-start — we don't track that
+        # precisely on the wrapper side; the SPA also captures
+        # its own wall-clock receivedAt for the visible
+        # timestamp. Pass 0.0 here so the field exists.
+        await self._bus.publish(
+            Event(
+                event_type="voice_agent.transcript_turn",
+                data={
+                    "user_id": active.user_id,
+                    "session_id": active.conversation_id,
+                    "who": "system",
+                    "text": text,
+                    "ts": 0.0,
+                },
+                source="voice_agent",
+            )
+        )
 
     async def _transition_to_active(
         self, active: _ActiveSession, reason: str = "wake_word"
@@ -1062,6 +1144,14 @@ class VoiceAgentService(Service):
         ai = resolver.get_capability("ai_chat")
         if isinstance(ai, ConversationMessagePoster):
             self._message_poster = ai
+        # TTSProvider — for the going-dormant yawn. Late-narrow
+        # via isinstance so we don't have to import the protocol
+        # unless it's actually available at this resolver.
+        tts_svc = resolver.get_capability("text_to_speech")
+        from gilbert.interfaces.tts import TTSProvider as _TTSProvider
+
+        if isinstance(tts_svc, _TTSProvider):
+            self._tts = tts_svc
         # Event bus for ``speaker.browser.play`` (TTS playback) + any
         # future ``voice_agent.*`` server-initiated events.
         from gilbert.interfaces.events import EventBusProvider
