@@ -514,6 +514,12 @@ class VoiceAgentService(Service):
         self._tts: Any = None
         # Active session task. None when in wake-listen mode.
         self._session_task: asyncio.Task[None] | None = None
+        # Background wake-word listening task. Currently always None
+        # because the wake-listen loop is not yet kicked off (see the
+        # TODO at the end of ``start``); ``stop`` still references
+        # this attribute, so initialize it here to avoid an
+        # AttributeError on service shutdown.
+        self._wake_task: asyncio.Task[None] | None = None
         # Per-WS-connection active session. Keyed by conn.connection_id.
         # One voice-agent session at a time per browser tab.
         self._sessions: dict[str, _ActiveSession] = {}

@@ -113,3 +113,26 @@ async def test_session_end_pushes_terminal_event() -> None:
         and e.status == ConversationStatus.ENDED
         for e in events
     )
+
+
+@pytest.mark.asyncio
+async def test_stop_without_start_does_not_raise() -> None:
+    """``service_manager`` calls ``stop()`` on every service during a
+    graceful shutdown — including services that never had ``start()``
+    run, e.g. when an earlier service's startup raised and triggered
+    the rollback. ``stop()`` must therefore tolerate an
+    ``__init__``-only state.
+
+    Regression: ``_wake_task`` was referenced in ``stop()`` but never
+    initialized in ``__init__``. A shutdown after a port-bind failure
+    raised ``AttributeError: 'VoiceAgentService' object has no
+    attribute '_wake_task'`` and obscured the original error in the
+    journal.
+    """
+    from gilbert_plugin_voice_agent.voice_agent_service import (
+        VoiceAgentService,
+    )
+
+    svc = VoiceAgentService()
+    # No ``await svc.start(...)`` — this is the post-rollback path.
+    await svc.stop()
