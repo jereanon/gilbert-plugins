@@ -354,8 +354,16 @@ class _ActiveSession:
       ``"Hey Gilbert"`` wake-word firing.
 
     ``last_user_activity_ts`` is the timestamp of the most recent
-    user transcript turn — a silence-monitor task watches it to
-    decide when to drop ``active → dormant``.
+    moment we became "idle and waiting for the user." The silence
+    monitor watches it to decide when to drop ``active → dormant``.
+
+    ``responding`` is True while we're NOT idle — i.e. between the
+    moment the user finishes speaking and the moment Gilbert finishes
+    speaking. That covers LLM thinking time + TTS synthesis + TTS
+    playback. The silence monitor short-circuits while
+    ``responding`` is True, so a long answer can't trigger dormancy
+    mid-sentence. Default ``True`` so the SPEAK_FIRST opener can run
+    without the silence monitor racing against it.
     """
 
     conversation_id: str
@@ -369,6 +377,7 @@ class _ActiveSession:
     mode: str = "turn_based"                  # "turn_based" | "conversational"
     state: str = "active"                     # "active" | "dormant"
     last_user_activity_ts: float = 0.0
+    responding: bool = True                   # see docstring
     wake_detector: Any = None                 # WakeWordDetector | None
     wake_task: asyncio.Task[Any] | None = None
     silence_task: asyncio.Task[Any] | None = None
@@ -904,11 +913,16 @@ class VoiceAgentService(Service):
         if active.state == "active":
             return
         active.state = "active"
-        # Resetting the activity timestamp prevents the silence
-        # monitor from firing again immediately after a wake.
+        # Wake recovery: the user just signalled they want to talk
+        # (said "Hey Gilbert"). Clear ``responding`` and reset the
+        # idle timestamp so the silence monitor gives them the full
+        # threshold to start their question. If they don't, we'll
+        # drop back to dormant cleanly.
+        active.responding = False
         active.last_user_activity_ts = asyncio.get_event_loop().time()
         logger.info(
-            "voice-agent session %s → active (%s)",
+            "voice-agent session %s → active (%s) — "
+            "responding=False, timer reset",
             active.conversation_id,
             reason,
         )
@@ -928,10 +942,14 @@ class VoiceAgentService(Service):
                 await asyncio.sleep(1.0)
                 if active.state != "active":
                     continue
+                if active.responding:
+                    # LLM is thinking or Gilbert is mid-response.
+                    # We're not idle. Don't count toward dormancy.
+                    continue
                 if active.last_user_activity_ts == 0.0:
-                    # Conversation hasn't seen any user audio yet
-                    # (still in the opener). Don't switch to dormant
-                    # before the user has even spoken.
+                    # Haven't established a baseline yet (initial
+                    # opener still in flight). Wait for
+                    # ``on_speaking_done`` to arm the countdown.
                     continue
                 elapsed = (
                     asyncio.get_event_loop().time() - active.last_user_activity_ts
@@ -1078,26 +1096,39 @@ class VoiceAgentService(Service):
         async def _on_transcript_turn(
             who: str, text: str, ts_seconds: float
         ) -> None:
+            # Diagnostic: confirms STT is still committing turns after
+            # a wake recovery. If "them" transcripts stop arriving
+            # post-wake, this log goes silent and we know to look at
+            # the STT stream / engine pump rather than the brain.
+            logger.info(
+                "voice-agent transcript: session=%s who=%s "
+                "state=%s mode=%s responding=%s chars=%d",
+                active.conversation_id,
+                who,
+                active.state,
+                active.mode,
+                active.responding,
+                len(text),
+            )
             record.transcript.append(
                 {"who": who, "text": text, "ts": ts_seconds}
             )
             await self._save_record(record)
-            # Conversational mode: ``them`` (user) transcripts reset
-            # the silence timer immediately because they're fired
-            # AFTER the STT commit (i.e. after the user actually
-            # finished speaking). For ``us`` (Gilbert) turns we
-            # DON'T reset here — the transcript event fires when
-            # Gilbert STARTS speaking, not when he finishes. If we
-            # reset here, a 12-second TTS playback would already
-            # have the timer 12s in the past by the time playback
-            # ends, and dormant would fire immediately even though
-            # Gilbert just finished. The ``on_speaking_done``
-            # callback below resets the timer at end-of-playback
-            # instead, so the 10-second silence is counted from the
-            # moment Gilbert quiets down.
+            # Conversational mode: the user finishing a turn marks
+            # the start of "Gilbert is responding" — LLM is about
+            # to think, then TTS will synthesize and play back. The
+            # silence monitor skips the countdown while
+            # ``responding`` is True, so long thinking time +
+            # long TTS playback can't trigger dormancy mid-answer.
+            # ``on_speaking_done`` flips this back to False at
+            # end-of-playback. ``us`` transcripts fire when Gilbert
+            # STARTS speaking, so they're inside the responding
+            # window — no separate handling needed.
             if who == "them" and active.mode == "conversational":
-                active.last_user_activity_ts = (
-                    asyncio.get_event_loop().time()
+                active.responding = True
+                logger.debug(
+                    "voice-agent session %s → responding=True (user turn done)",
+                    active.conversation_id,
                 )
             # Live-mirror the turn back to the user's voice-agent
             # browser tab. Publishing via the bus instead of holding
@@ -1126,12 +1157,19 @@ class VoiceAgentService(Service):
 
         async def _on_speaking_done() -> None:
             """Fired by the engine after each TTS playback completes.
-            Resets the dormant-silence timer so the 10-second
-            countdown only starts when Gilbert has finished talking.
+            Marks the start of an idle "user's turn" window — the
+            silence countdown begins from now, and ``responding``
+            flips back to False so the monitor will actually run.
             """
             if active.mode == "conversational":
+                active.responding = False
                 active.last_user_activity_ts = (
                     asyncio.get_event_loop().time()
+                )
+                logger.debug(
+                    "voice-agent session %s → responding=False "
+                    "(Gilbert done speaking, silence countdown armed)",
+                    active.conversation_id,
                 )
 
         async def _on_status_change(
