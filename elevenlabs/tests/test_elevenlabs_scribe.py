@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -137,11 +138,14 @@ async def test_streaming_open_returns_stream_and_drains_events(live):
         events: list = []
 
         async def _drain():
+            # The parser yields SpeechStarted + PartialTranscript per
+            # non-empty partial frame, plus FinalTranscript for the
+            # final frame — three events total for this fixture.
             count = 0
             async for ev in stream.events():
                 events.append(ev)
                 count += 1
-                if count >= 2:
+                if count >= 3:
                     break
 
         await asyncio.wait_for(_drain(), timeout=1.0)
@@ -171,5 +175,10 @@ async def test_streaming_send_forwards_to_ws(live):
         await stream.send(b"\x00\x00chunk2")
         await stream.close()
 
-    assert fake_ws.sent[0] == b"\x00\x00chunk1"
-    assert fake_ws.sent[1] == b"\x00\x00chunk2"
+    # Audio chunks are wrapped in a Scribe Realtime
+    # ``input_audio_chunk`` JSON envelope with base64 payload.
+    msg0 = json.loads(fake_ws.sent[0])
+    msg1 = json.loads(fake_ws.sent[1])
+    assert msg0["message_type"] == "input_audio_chunk"
+    assert base64.b64decode(msg0["audio_base_64"]) == b"\x00\x00chunk1"
+    assert base64.b64decode(msg1["audio_base_64"]) == b"\x00\x00chunk2"
