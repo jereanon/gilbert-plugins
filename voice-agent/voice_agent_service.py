@@ -241,7 +241,35 @@ class _BrowserAudioSink:
         self._buffer.extend(chunk)
 
     async def clear(self) -> None:
+        """Drop anything we haven't flushed yet AND tell the browser
+        to stop any in-flight playback. The engine calls clear()
+        from its barge-in handlers — without the bus-side stop,
+        clearing only affects bytes we haven't shipped, but the
+        browser already has the previous utterance's MP3 loaded
+        as a data URL and keeps playing it. The user hears Gilbert
+        complete his sentence after they interrupted.
+        """
         self._buffer.clear()
+        if self._bus is None:
+            return
+        from gilbert.interfaces.events import Event
+
+        try:
+            await self._bus.publish(
+                Event(
+                    event_type="speaker.browser.stop",
+                    data={
+                        "user_id": self._user_id,
+                        "reason": "voice_agent_barge_in",
+                    },
+                    source="voice_agent",
+                )
+            )
+        except Exception:
+            logger.debug(
+                "BrowserAudioSink.clear: bus publish failed",
+                exc_info=True,
+            )
 
     async def flush(self) -> None:
         if not self._buffer:
@@ -933,6 +961,14 @@ class VoiceAgentService(Service):
     ) -> None:
         if active.state == "dormant":
             return
+        # If the conversation has already ended we MUST NOT publish
+        # the dormancy yawn / system note — the session is over,
+        # the SPA's already flipped to idle, and the user would see
+        # a spurious "💤 Going dormant" message ~10 seconds after
+        # they said goodbye. The status-change handler nulls out
+        # wake_task on terminal status; use that as the signal.
+        if active.session.closed or active.wake_task is None:
+            return
         active.state = "dormant"
         logger.info(
             "voice-agent session %s → dormant (%s) — "
@@ -1330,6 +1366,31 @@ class VoiceAgentService(Service):
             status: ConversationStatus, reason: str
         ) -> None:
             log.info("voice-agent status: %s (reason=%r)", status.value, reason)
+            # Conversation ended — cancel the conversational helpers
+            # right away so they don't fire AFTER the brain has
+            # already said goodbye. Without this the silence
+            # monitor (1s poll, 10s threshold) would still be
+            # running when ``end_conversation`` fires, and ~10s
+            # later it would publish a "💤 Going dormant" marker
+            # and yawn TTS to a session that's already over.
+            if status in (
+                ConversationStatus.ENDED,
+                ConversationStatus.FAILED,
+            ):
+                if active.wake_task is not None:
+                    active.wake_task.cancel()
+                    active.wake_task = None
+                if active.silence_task is not None:
+                    active.silence_task.cancel()
+                    active.silence_task = None
+                if active.wake_detector is not None:
+                    try:
+                        await active.wake_detector.close()
+                    except Exception:
+                        log.debug(
+                            "wake detector close failed", exc_info=True
+                        )
+                    active.wake_detector = None
 
         # Engine configuration tuned for browser audio:
         # - TTS: MP3 (browser can play via HTMLAudioElement data URL).

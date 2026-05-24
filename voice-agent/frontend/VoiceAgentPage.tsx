@@ -425,11 +425,18 @@ export function VoiceAgentPage(): ReactElement {
                       : "flex items-start gap-3 text-muted-foreground italic"
                 }
               >
+                {/* Trailing spaces on the timestamp + label spans
+                    are intentional — the visual ``flex gap-3``
+                    doesn't make it into clipboard text, so a copy
+                    would otherwise read "20:56:49GilbertHey there"
+                    with everything mashed together. The string-
+                    literal form ``{`…: `}`` ensures the trailing
+                    whitespace survives JSX tokenization. */}
                 <span
                   className="shrink-0 font-mono text-xs text-muted-foreground w-20 pt-0.5"
                   title={`Received ${new Date(t.receivedAt).toLocaleString()} · session t=${t.ts.toFixed(2)}s`}
                 >
-                  {formatWallClock(t.receivedAt)}
+                  {`${formatWallClock(t.receivedAt)} `}
                 </span>
                 <span
                   className={
@@ -441,11 +448,13 @@ export function VoiceAgentPage(): ReactElement {
                         : "text-muted-foreground")
                   }
                 >
-                  {t.who === "us"
-                    ? "Gilbert"
-                    : t.who === "them"
-                      ? "You"
-                      : "System"}
+                  {`${
+                    t.who === "us"
+                      ? "Gilbert"
+                      : t.who === "them"
+                        ? "You"
+                        : "System"
+                  }: `}
                 </span>
                 <span className="flex-1 break-words">{t.text}</span>
               </div>
