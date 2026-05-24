@@ -1162,51 +1162,51 @@ class PhoneCallService(Service):
                 },
             )
 
-        # ── intervention hook ────────────────────────────────────────
+        # ── intervention bridge ──────────────────────────────────────
 
-        async def _drain_interventions(user_text: str) -> str:
-            """Pull every queued operator directive and prepend them
-            as system notes to the LLM's next user_message. The SPA's
-            'Direct Gilbert' textbox lands directives on
-            ``interventions`` via the ``phone.call.intervene_text``
-            WS handler — without this hook the queue filled up and
-            nothing ever read from it.
-            """
-            directives: list[str] = []
+        # Bridge the existing ``interventions`` queue (filled by
+        # the ``phone.call.intervene_text`` WS handler when the
+        # operator types into the SPA's 'Direct Gilbert' textbox)
+        # to the engine's new ``inject_synthetic_user_turn_queue``.
+        # The engine's synthetic-turn loop watches the latter,
+        # cancels any in-flight TTS (barge-in), and runs a fresh
+        # _think_and_speak with the directive — so directives
+        # interrupt mid-call instead of waiting for the remote
+        # next speaking.
+        synthetic_turns: asyncio.Queue[str] = asyncio.Queue()
+
+        async def _bridge_interventions() -> None:
             while True:
                 try:
-                    directives.append(interventions.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
-            if not directives:
-                return user_text
-            log.info(
-                "draining %d operator directive(s) into next LLM "
-                "turn for call %s",
-                len(directives),
-                record.call_id,
-            )
-            # Record each directive on the transcript as a "system"
-            # turn so the SPA's transcript pane shows what was
-            # injected and when.
-            for d in directives:
-                await _on_transcript_turn(
-                    "system", f"(operator directive: {d})", 0.0
+                    directive = await interventions.get()
+                except asyncio.CancelledError:
+                    return
+                log.info(
+                    "bridging operator directive into engine for call %s",
+                    record.call_id,
                 )
-            joined = "\n".join(
-                f"(OPERATOR DIRECTIVE from the user you're calling "
-                f"on behalf of: {d})"
-                for d in directives
-            )
-            # The remote said user_text (possibly empty if this is
-            # the opener turn). Prepend the directives so the brain
-            # sees them before deciding how to respond. The brain
-            # should ACT on the directive — change tactic, ask a
-            # specific question, agree/disagree — not just narrate
-            # that it received one.
-            if user_text:
-                return f"{joined}\n\n{user_text}"
-            return joined
+                # Record on the transcript so the SPA's transcript
+                # pane shows what was injected and when.
+                await _on_transcript_turn(
+                    "system",
+                    f"(operator directive: {directive})",
+                    0.0,
+                )
+                # Frame it so the LLM understands the directive
+                # came from the user we're calling on behalf of —
+                # not the remote on the line. Tells the brain to
+                # ACT on it (change tactic, ask a specific
+                # question, etc.) rather than acknowledge.
+                framed = (
+                    "(OPERATOR DIRECTIVE from the user you're calling "
+                    "on behalf of — this is NOT the remote talking; "
+                    "they haven't said anything new. Act on this "
+                    "directive in your next utterance: "
+                    f"{directive})"
+                )
+                await synthetic_turns.put(framed)
+
+        bridge_task = asyncio.create_task(_bridge_interventions())
 
         # ── drive the engine ──────────────────────────────────────────
 
@@ -1248,9 +1248,11 @@ class PhoneCallService(Service):
                 self._config.get("filler_phrases")
                 or _DEFAULT_PHONE_FILLER_PHRASES
             ),
-            # Operator-directive hook — see _drain_interventions
-            # above for the "Direct Gilbert" text-box wiring.
-            mutate_user_text=_drain_interventions,
+            # Operator-directive bridge — engine's synthetic-turn
+            # loop drains this queue and runs _think_and_speak for
+            # each entry, barging in on any in-flight TTS so
+            # directives interrupt mid-call.
+            inject_synthetic_user_turn_queue=synthetic_turns,
         )
 
         outcome: ConversationOutcome | None = None
@@ -1261,6 +1263,14 @@ class PhoneCallService(Service):
         except Exception:
             log.exception("voice_brain.run_conversation crashed")
         finally:
+            # Stop the interventions→synthetic-turns bridge. It's
+            # awaiting interventions.get() — cancel cleanly so it
+            # doesn't outlive the conversation.
+            bridge_task.cancel()
+            try:
+                await bridge_task
+            except (asyncio.CancelledError, Exception):
+                pass
             # Final cleanup — same shape as the old inline finally.
             record.ended_at = _now_iso()
             try:
