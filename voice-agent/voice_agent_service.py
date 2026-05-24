@@ -1082,11 +1082,30 @@ class VoiceAgentService(Service):
                 {"who": who, "text": text, "ts": ts_seconds}
             )
             await self._save_record(record)
-            # Conversational mode: user transcripts reset the silence
-            # timer that decides when to drop into dormant. We update
-            # on EVERY user turn (not just first), so the monitor
-            # only fires after a real gap.
+            # Conversational mode: ``them`` (user) transcripts reset
+            # the silence timer immediately because they're fired
+            # AFTER the STT commit (i.e. after the user actually
+            # finished speaking). For ``us`` (Gilbert) turns we
+            # DON'T reset here — the transcript event fires when
+            # Gilbert STARTS speaking, not when he finishes. If we
+            # reset here, a 12-second TTS playback would already
+            # have the timer 12s in the past by the time playback
+            # ends, and dormant would fire immediately even though
+            # Gilbert just finished. The ``on_speaking_done``
+            # callback below resets the timer at end-of-playback
+            # instead, so the 10-second silence is counted from the
+            # moment Gilbert quiets down.
             if who == "them" and active.mode == "conversational":
+                active.last_user_activity_ts = (
+                    asyncio.get_event_loop().time()
+                )
+
+        async def _on_speaking_done() -> None:
+            """Fired by the engine after each TTS playback completes.
+            Resets the dormant-silence timer so the 10-second
+            countdown only starts when Gilbert has finished talking.
+            """
+            if active.mode == "conversational":
                 active.last_user_activity_ts = (
                     asyncio.get_event_loop().time()
                 )
@@ -1175,6 +1194,7 @@ class VoiceAgentService(Service):
             priming_messages=priming,
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
+            on_speaking_done=_on_speaking_done,
             tts_output_format=_TTSAudioFormat.MP3,
             tts_output_mime="audio/mpeg",
             # Browser plays the whole MP3 in one shot from a data URL,
