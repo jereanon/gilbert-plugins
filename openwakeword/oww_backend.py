@@ -168,6 +168,39 @@ class OpenWakeWordBackend(WakeWordBackend):
 
     async def open_detector(self, config: WakeWordConfig) -> WakeWordDetector:
         from openwakeword.model import Model  # deferred — only at detector-open time
+        from openwakeword.utils import download_models
+
+        # The library ships its custom wake-word ONNX models but NOT
+        # the feature-extraction ones it needs to actually run
+        # (``melspectrogram.onnx``, ``embedding_model.onnx``,
+        # ``silero_vad.onnx``). They're downloaded on demand into the
+        # package's resources/models directory. On a fresh deploy
+        # that directory is empty, so ``Model(...)`` crashes with
+        # ``NoSuchFile``. Trigger the download up front if any of
+        # the expected files are missing. ``download_models`` is
+        # idempotent and a no-op when everything's already present,
+        # so it's cheap to call every time.
+        import openwakeword
+
+        resources_dir = (
+            Path(openwakeword.__file__).parent / "resources" / "models"
+        )
+        feature_files = (
+            "melspectrogram.onnx",
+            "embedding_model.onnx",
+            "silero_vad.onnx",
+        )
+        missing = [
+            f for f in feature_files if not (resources_dir / f).exists()
+        ]
+        if missing:
+            logger.info(
+                "openWakeWord feature models missing %s — running "
+                "download_models() (one-time, ~10 MB)",
+                missing,
+            )
+            await asyncio.to_thread(download_models)
+            logger.info("openWakeWord feature models downloaded")
 
         kwargs: dict[str, Any] = {"inference_framework": self._inference_framework}
         if self._model_paths:
