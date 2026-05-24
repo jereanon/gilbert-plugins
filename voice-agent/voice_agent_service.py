@@ -49,13 +49,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gilbert.interfaces.ai import ConversationMessagePoster
+from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.conversation import (
-    AudioSink,
     BrainToolResult,
     ConversationConfig,
     ConversationContext,
     ConversationEngine,
-    ConversationErrorEvent,
     ConversationOutcome,
     ConversationSession,
     ConversationStatus,
@@ -72,11 +71,12 @@ from gilbert.interfaces.tools import (
     ToolParameterType,
 )
 from gilbert.interfaces.transcription import (
-    AudioFormat as TranscriptionAudioFormat,
     AudioEncoding,
-    WakeEvent,
     WakeWordConfig,
     WakeWordListener,
+)
+from gilbert.interfaces.transcription import (
+    AudioFormat as TranscriptionAudioFormat,
 )
 
 logger = logging.getLogger(__name__)
@@ -417,7 +417,7 @@ class _ActiveSession:
     conversation_id: str
     user_id: str
     conn_id: str
-    session: "_VoiceAgentSession"
+    session: _VoiceAgentSession
     task: asyncio.Task[Any] | None = None
 
     # Conversational-mode wiring. ``turn_based`` sessions leave these
@@ -1180,6 +1180,62 @@ class VoiceAgentService(Service):
     def config_category(self) -> str:
         return "speech"
 
+    def config_params(self) -> list[ConfigParam]:
+        return [
+            ConfigParam(
+                key="wake_keywords",
+                type=ToolParameterType.ARRAY,
+                description=(
+                    "Wake-word keywords. Which strings are valid depends "
+                    "on the active wake-word backend (porcupine / "
+                    "openwakeword)."
+                ),
+                default=["hey gilbert"],
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="wake_word_backend",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Wake-word backend name. Leave blank to use whatever "
+                    "TranscriptionService selected as default."
+                ),
+                default="",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="sensitivity",
+                type=ToolParameterType.NUMBER,
+                description="Wake-word sensitivity, 0..1. Higher fires more.",
+                default=0.5,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="idle_timeout_seconds",
+                type=ToolParameterType.NUMBER,
+                description=(
+                    "Close the active conversation after this many seconds "
+                    "of silence and return to wake-word-only listening."
+                ),
+                default=12.0,
+            ),
+            ConfigParam(
+                key="system_prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "System prompt the brain runs with during an active "
+                    "voice session. Different register from phone calls "
+                    "— short, conversational, smart-speaker style."
+                ),
+                default=_DEFAULT_SYSTEM_PROMPT,
+                multiline=True,
+                ai_prompt=True,
+            ),
+        ]
+
+    async def on_config_changed(self, config: dict[str, Any]) -> None:
+        self._config = dict(config)
+
     # --- Lifecycle ---------------------------------------------------
 
     async def start(self, resolver: ServiceResolver) -> None:
@@ -1398,14 +1454,6 @@ class VoiceAgentService(Service):
         # - TTS: MP3 (browser can play via HTMLAudioElement data URL).
         # - STT: 16 kHz PCM (what the SPA's mic captures cleanly).
         # - Audio input format: PCM_S16LE 16 kHz (skip ulaw decode).
-        from gilbert.interfaces.transcription import (
-            AudioEncoding as _STTAudioEncoding,
-        )
-        from gilbert.interfaces.transcription import (
-            AudioFormat as _STTAudioFormat,
-        )
-        from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
-
         # Priming message so the SPEAK_FIRST opener has something to
         # respond to. The Anthropic Messages API rejects requests with
         # ``messages=[]`` (400 "at least one message is required"), so
@@ -1416,6 +1464,13 @@ class VoiceAgentService(Service):
         # talk" rather than as an instruction.
         from gilbert.interfaces.ai import Message as _Message
         from gilbert.interfaces.ai import MessageRole as _MessageRole
+        from gilbert.interfaces.transcription import (
+            AudioEncoding as _STTAudioEncoding,
+        )
+        from gilbert.interfaces.transcription import (
+            AudioFormat as _STTAudioFormat,
+        )
+        from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
 
         priming = [
             _Message(
