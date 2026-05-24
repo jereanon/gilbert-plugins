@@ -10,10 +10,6 @@ depends_on:
   - voice_brain  # core service — engine that drives the conversation loop
 
 config:
-  # Whether the service is enabled. v1 — browser-mic via the SPA's
-  # /voice page is the audio source; wake-word gating comes in v2.
-  # Default ON now that there's a working button-activated path.
-  enabled: true
   # Comma-separated list of wake-word keywords. Maps to
   # ``WakeWordConfig.keywords``. The active wake-word backend
   # (porcupine, openwakeword) determines which keywords are available.
