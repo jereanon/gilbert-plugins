@@ -329,3 +329,32 @@ async def test_synthesize_preload_builds_default_lang_pipeline() -> None:
         await backend.initialize({"preload": True, "default_voice": "jf_alpha"})
     build.assert_called_once_with("j", "cpu")
     assert "j" in backend._pipelines
+
+
+def test_plugin_metadata() -> None:
+    from gilbert_plugin_kokoro.plugin import KokoroPlugin
+
+    meta = KokoroPlugin().metadata()
+    assert meta.name == "kokoro"
+    assert "kokoro_tts" in meta.provides
+    assert meta.requires == []
+
+
+def test_plugin_runtime_dependencies() -> None:
+    from gilbert_plugin_kokoro.plugin import KokoroPlugin
+
+    deps = KokoroPlugin().runtime_dependencies()
+    assert len(deps) == 1
+    dep = deps[0]
+    assert "kokoro" in dep.name.lower() or "tts" in dep.name.lower()
+    # The check actually exercises kokoro+av, not just `which python`.
+    assert "kokoro" in dep.check_cmd
+    assert "av" in dep.check_cmd
+    assert dep.install_hint  # non-empty hint
+
+
+def test_create_plugin_returns_kokoro_plugin() -> None:
+    from gilbert_plugin_kokoro.plugin import KokoroPlugin, create_plugin
+
+    p = create_plugin()
+    assert isinstance(p, KokoroPlugin)
