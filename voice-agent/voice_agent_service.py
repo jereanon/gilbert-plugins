@@ -625,7 +625,7 @@ class VoiceAgentService(Service):
         # two helper tasks (wake-event consumer + silence monitor).
         # Failure to open the wake detector is logged but doesn't fail
         # the session — degrade to turn_based behaviour.
-        if mode == "conversational" and self._wake_listener is not None:
+        if mode == "conversational":
             try:
                 wake_cfg = WakeWordConfig(
                     keywords=["hey_gilbert"],
@@ -636,9 +636,14 @@ class VoiceAgentService(Service):
                     ),
                     sensitivity=0.5,
                 )
-                active.wake_detector = await self._wake_listener.open_detector(
-                    wake_cfg
-                )
+                # Try the TranscriptionService capability first (the
+                # "right" path — uses the user's configured default).
+                # When the user hasn't set ``transcription.wake_word_backend``
+                # in Settings, that fails with "no backend available";
+                # fall back to instantiating ``openwakeword`` directly
+                # from the registered-backend registry so the voice-
+                # agent works out of the box.
+                active.wake_detector = await self._open_wake_detector(wake_cfg)
                 active.wake_task = asyncio.create_task(
                     self._consume_wake_events(active),
                     name=f"voice-agent-wake:{conversation_id}",
@@ -752,6 +757,59 @@ class VoiceAgentService(Service):
         await active.session.end_session()
 
     # --- Conversational-mode helpers ---------------------------------
+
+    async def _open_wake_detector(self, config: WakeWordConfig) -> Any:
+        """Open a wake-word detector, preferring the user's configured
+        default but falling back to a direct ``openwakeword`` instance
+        from the backend registry so conversational mode works out of
+        the box without a separate Settings configuration step.
+
+        Both paths return a ``WakeWordDetector`` the caller drives
+        via ``send()`` / ``events()`` / ``close()``.
+        """
+        # Path 1: TranscriptionService default (respects whatever the
+        # user has wired up in Settings).
+        if self._wake_listener is not None:
+            try:
+                return await self._wake_listener.open_detector(config)
+            except RuntimeError as exc:
+                # The TranscriptionService raises ``no transcription
+                # backend available for wake_word`` when no default is
+                # configured. Anything else is a real error we don't
+                # want to swallow.
+                if "wake_word" not in str(exc).lower():
+                    raise
+                logger.info(
+                    "TranscriptionService has no default wake-word backend; "
+                    "trying registered backends directly"
+                )
+
+        # Path 2: walk the WakeWordBackend registry and use openwakeword
+        # if it's loaded. The plugin registers via ``__init_subclass__``
+        # at import time, so all that's needed is that the openwakeword
+        # plugin loaded (which we already log on startup).
+        from gilbert.interfaces.transcription import WakeWordBackend
+
+        registered = WakeWordBackend.registered_backends()
+        # Prefer "openwakeword" specifically since that's the one with
+        # the ``hey_gilbert.onnx`` model bundled. Fall through to
+        # whatever's available.
+        for name in ("openwakeword", *registered.keys()):
+            backend_cls = registered.get(name)
+            if backend_cls is None:
+                continue
+            backend = backend_cls()
+            await backend.initialize({})
+            logger.info(
+                "voice-agent: opened wake-word detector via direct %r backend",
+                name,
+            )
+            return await backend.open_detector(config)
+
+        raise RuntimeError(
+            "no wake-word backend registered (is the openwakeword "
+            "plugin loaded?)"
+        )
 
     _SILENCE_THRESHOLD_SECONDS = 10.0
     """How long without a user transcript before we drop ``active``
