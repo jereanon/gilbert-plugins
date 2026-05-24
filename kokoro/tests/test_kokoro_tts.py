@@ -215,3 +215,117 @@ def test_encode_empty_input_returns_short_output() -> None:
     out = _encode(np.zeros(0, dtype=np.float32), AudioFormat.WAV)
     # Header-only WAV is OK; just don't crash.
     assert out[:4] == b"RIFF"
+
+
+from unittest.mock import MagicMock, patch
+
+from gilbert.interfaces.tts import SynthesisRequest
+
+
+def _mock_pipeline_yielding(samples_per_chunk: list[int]):
+    """Build a mock KPipeline whose call returns float32 chunks."""
+    rng = np.random.default_rng(0)
+    chunks = [
+        (None, None, rng.standard_normal(n).astype(np.float32) * 0.1)
+        for n in samples_per_chunk
+    ]
+    pipeline = MagicMock()
+    pipeline.return_value = iter(chunks)
+    return pipeline
+
+
+async def test_synthesize_uses_pipeline_for_voice_lang() -> None:
+    from gilbert_plugin_kokoro import kokoro_tts as kt
+
+    backend = kt.KokoroTTSBackend()
+    await backend.initialize({})
+    fake_pipeline = _mock_pipeline_yielding([2400, 2400])  # 0.2s of audio
+
+    with patch.object(kt, "_build_pipeline", return_value=fake_pipeline) as build:
+        request = SynthesisRequest(
+            text="Hello world.",
+            voice_id="af_heart",
+            output_format=AudioFormat.MP3,
+        )
+        result = await backend.synthesize(request)
+
+    build.assert_called_once_with("a", "cpu")
+    fake_pipeline.assert_called_once()
+    call_kwargs = fake_pipeline.call_args.kwargs
+    call_args = fake_pipeline.call_args.args
+    assert "Hello world." in (call_args + tuple(call_kwargs.values()))
+    assert call_kwargs.get("voice") == "af_heart"
+    assert call_kwargs.get("speed") == 1.0
+
+    assert result.format == AudioFormat.MP3
+    assert result.audio[:3] == b"ID3" or result.audio[0] == 0xFF
+    assert result.characters_used == len("Hello world.")
+
+
+async def test_synthesize_caches_pipeline_per_language() -> None:
+    from gilbert_plugin_kokoro import kokoro_tts as kt
+
+    backend = kt.KokoroTTSBackend()
+    await backend.initialize({})
+    pipeline_a = _mock_pipeline_yielding([2400])
+    pipeline_b = _mock_pipeline_yielding([2400])
+
+    def _build(lang_code: str, device: str):
+        return pipeline_a if lang_code == "a" else pipeline_b
+
+    pipeline_a.return_value = iter(
+        [(None, None, np.zeros(2400, dtype=np.float32))]
+    )
+    with patch.object(kt, "_build_pipeline", side_effect=_build) as build:
+        await backend.synthesize(SynthesisRequest(text="hi", voice_id="af_heart"))
+        pipeline_a.return_value = iter(
+            [(None, None, np.zeros(2400, dtype=np.float32))]
+        )
+        await backend.synthesize(SynthesisRequest(text="hi", voice_id="am_adam"))
+        await backend.synthesize(SynthesisRequest(text="hi", voice_id="bf_emma"))
+
+    assert build.call_count == 2
+    assert {c.args[0] for c in build.call_args_list} == {"a", "b"}
+
+
+async def test_synthesize_uses_request_voice_speed_format() -> None:
+    from gilbert_plugin_kokoro import kokoro_tts as kt
+
+    backend = kt.KokoroTTSBackend()
+    await backend.initialize({"speed": 1.5})
+    fake_pipeline = _mock_pipeline_yielding([2400])
+
+    with patch.object(kt, "_build_pipeline", return_value=fake_pipeline):
+        request = SynthesisRequest(
+            text="x",
+            voice_id="bm_george",
+            output_format=AudioFormat.WAV,
+            speed=0.75,
+        )
+        result = await backend.synthesize(request)
+
+    assert fake_pipeline.call_args.kwargs.get("speed") == 0.75
+    assert result.format == AudioFormat.WAV
+    assert result.audio[:4] == b"RIFF"
+
+
+async def test_synthesize_unknown_voice_raises_valueerror() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    await backend.initialize({})
+    with pytest.raises(ValueError, match="Unknown Kokoro voice"):
+        await backend.synthesize(
+            SynthesisRequest(text="x", voice_id="xx_nope")
+        )
+
+
+async def test_synthesize_preload_builds_default_lang_pipeline() -> None:
+    """preload=True should build the default-voice's pipeline in initialize()."""
+    from gilbert_plugin_kokoro import kokoro_tts as kt
+
+    backend = kt.KokoroTTSBackend()
+    with patch.object(kt, "_build_pipeline", return_value=MagicMock()) as build:
+        await backend.initialize({"preload": True, "default_voice": "jf_alpha"})
+    build.assert_called_once_with("j", "cpu")
+    assert "j" in backend._pipelines

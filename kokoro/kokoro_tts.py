@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 from typing import Any
@@ -188,6 +189,16 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
     return buf.getvalue()
 
 
+def _build_pipeline(lang_code: str, device: str) -> Any:
+    """Construct a kokoro.KPipeline. Isolated so tests can patch it."""
+    from kokoro import KPipeline  # type: ignore[import-untyped]
+
+    # device="auto" lets kokoro pick — pass-through otherwise.
+    if device == "auto":
+        return KPipeline(lang_code=lang_code)
+    return KPipeline(lang_code=lang_code, device=device)
+
+
 class KokoroTTSBackend(TTSBackend):
     """Local TTS via the open-weights Kokoro-82M model.
 
@@ -253,12 +264,49 @@ class KokoroTTSBackend(TTSBackend):
             "KokoroTTSBackend initialized: device=%s default_voice=%s speed=%s preload=%s",
             self._device, self._default_voice, self._speed, self._preload,
         )
+        if self._preload:
+            lang = _lang_code_for_voice(self._default_voice)
+            self._pipelines[lang] = _build_pipeline(lang, self._device)
 
     async def close(self) -> None:
         self._pipelines.clear()
 
+    def _get_pipeline(self, lang_code: str) -> Any:
+        pipeline = self._pipelines.get(lang_code)
+        if pipeline is None:
+            pipeline = _build_pipeline(lang_code, self._device)
+            self._pipelines[lang_code] = pipeline
+        return pipeline
+
     async def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
-        raise NotImplementedError("Task 7 implements this")
+        if request.voice_id not in _VOICES_BY_ID:
+            raise ValueError(f"Unknown Kokoro voice: {request.voice_id!r}")
+        lang = _lang_code_for_voice(request.voice_id)
+        pipeline = self._get_pipeline(lang)
+        speed = float(request.speed) if request.speed else self._speed
+
+        loop = asyncio.get_running_loop()
+
+        def _run_sync() -> np.ndarray:
+            chunks: list[np.ndarray] = []
+            for _g, _p, audio in pipeline(
+                request.text, voice=request.voice_id, speed=speed
+            ):
+                arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+                chunks.append(arr)
+            if not chunks:
+                return np.zeros(0, dtype=np.float32)
+            return np.concatenate(chunks)
+
+        samples = await loop.run_in_executor(None, _run_sync)
+        audio_bytes = _encode(samples, request.output_format)
+        duration = float(samples.size) / 24000.0 if samples.size else 0.0
+        return SynthesisResult(
+            audio=audio_bytes,
+            format=request.output_format,
+            duration_seconds=duration,
+            characters_used=len(request.text),
+        )
 
     async def list_voices(self) -> list[Voice]:
         return list(_VOICES)
