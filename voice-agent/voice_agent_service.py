@@ -1248,12 +1248,19 @@ class VoiceAgentService(Service):
             # were heard. The engine plays one of these phrases at
             # the threshold so the user knows we're working on it.
             #
-            # Threshold tuned to 1.5s: long enough that fast answers
-            # (no tools, sub-second LLM) skip the filler entirely;
-            # short enough that any tool-using answer hits it.
+            # 3.0s is calibrated against real-world Anthropic Sonnet
+            # latency: a tool-free Q&A ("is the sky blue") tends to
+            # finish in 1.5-2.5s end-to-end (system-prompt processing
+            # + TTFB + 30-50 tokens of generation), so 3.0s skips the
+            # filler for those. Tool-using turns blow past 3s the
+            # moment knowledge.search or any MCP tool is involved,
+            # so they DO get a filler. The engine also suppresses
+            # the filler on the opener (first turn) entirely — no
+            # user is waiting for it and the cold-cache first call
+            # almost always exceeds the threshold.
             filler_threshold_seconds=float(
-                self._config.get("filler_threshold_seconds", 1.5)
-                or 1.5
+                self._config.get("filler_threshold_seconds", 3.0)
+                or 3.0
             ),
             filler_phrases=list(
                 self._config.get("filler_phrases")
