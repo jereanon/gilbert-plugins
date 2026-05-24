@@ -947,6 +947,12 @@ class PhoneCallService(Service):
                 "system",
                 f"(Gilbert recorded outcome: {summary})",
             )
+            # Hint to the engine: don't fire a filler if this chat()
+            # call goes a touch over the threshold. confirm_and_end
+            # is almost always followed by a quick hang_up on the
+            # next round, and the user really doesn't want to hear
+            # "One sec, let me check." right before "Goodbye."
+            ctx.outcome["_skip_filler"] = True
             return f"Outcome recorded: {summary}"
 
         if name == "escalate_to_user":
