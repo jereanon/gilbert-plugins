@@ -78,6 +78,10 @@ def _ntfy_tag_for_source(source: str) -> str:
     }.get(source, "bell")
 
 
+def _header_value(value: str) -> str:
+    return value.replace("·", "-").encode("ascii", "replace").decode("ascii")
+
+
 class NtfyPush(PushNotificationBackend):
     backend_name = "ntfy"
 
@@ -184,7 +188,7 @@ class NtfyPush(PushNotificationBackend):
             resp = await self._client.post(
                 f"{self._default_server.rstrip('/')}/{topic}",
                 content=b"Gilbert ntfy connectivity test",
-                headers=self._headers({"Title": "Gilbert · Test"}),
+                headers=self._headers({"Title": "Gilbert - Test"}),
             )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -240,7 +244,7 @@ class NtfyPush(PushNotificationBackend):
         priority = _ntfy_priority(message.urgency)
         headers = self._headers(
             {
-                "Title": message.title,
+                "Title": _header_value(message.title),
                 "Priority": priority,
                 "Tags": _ntfy_tag_for_source(message.source),
             }
@@ -291,4 +295,3 @@ class NtfyPush(PushNotificationBackend):
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
         return headers
-
