@@ -890,6 +890,42 @@ class PhoneCallService(Service):
         observes ``ctx.outcome["end_requested"]`` after each chat
         round to decide whether to terminate the call.
         """
+        # Premature-end guard. Real-world repro: the brief was "tell
+        # the remote goodnight" — on turn 1 (responding to "Hello?")
+        # the LLM called confirm_and_end / hang_up with no text
+        # content, "delivering" a message it hadn't actually
+        # delivered. The remote heard nothing for 5+ seconds while
+        # the agentic loop processed the inappropriate tool call,
+        # then Gilbert finally said the disclosure. Refuse the
+        # wrap-up tools until Gilbert has actually spoken at least
+        # once — the LLM sees the error in tool_result and adjusts
+        # in the next round of the SAME chat() call.
+        if name in ("confirm_and_end", "hang_up", "escalate_to_user"):
+            call_id = ctx.session.session_id
+            active = self._find_active_by_call(call_id)
+            if active is not None:
+                us_turn_count = sum(
+                    1
+                    for t in active.record.transcript
+                    if t.get("who") == "us"
+                )
+                if us_turn_count == 0:
+                    logger.info(
+                        "phone-call: refusing %r on call %s — "
+                        "Gilbert hasn't spoken yet",
+                        name,
+                        call_id,
+                    )
+                    return (
+                        f"ERROR: cannot call {name} before saying "
+                        "anything. The remote hasn't heard from you "
+                        "yet. Speak the required disclosure line and "
+                        "deliver the message first (in this same "
+                        "turn's message content) — then on a later "
+                        "turn, after the remote responds, you can "
+                        "call this tool."
+                    )
+
         if name == "hang_up":
             reason = str(arguments.get("reason") or "")
             ctx.outcome["hang_up_reason"] = reason
@@ -1840,6 +1876,19 @@ RULES OF ENGAGEMENT
      comes from your message content.
    Never call ``confirm_and_end`` or ``hang_up`` with empty content —
    that's dead air on the remote's phone followed by a dial tone.
+   IMPORTANT — your VERY FIRST turn must produce spoken text. Do NOT
+   call any of ``confirm_and_end`` / ``hang_up`` / ``escalate_to_user``
+   on the first turn — the remote hasn't heard the disclosure yet.
+   The server will refuse those tools until you've actually spoken
+   once, and you'll waste a chat round on the error.
+6b. Simple one-shot messages ("tell them X"): a SHORT call. Deliver
+   the message in ONE spoken turn. When the remote acknowledges,
+   respond with a brief goodbye + ``hang_up`` IN THE SAME turn. No
+   need for ``confirm_and_end`` on a simple goodnight-delivery —
+   that's overkill and wastes a round (each tool call adds latency,
+   the remote hears dead air or a filler while you process). Two
+   rounds = ``confirm_and_end`` then ``hang_up`` is for actual
+   appointment-confirming flows, not "say goodnight."
 7. If the situation is beyond your authority (legal questions, payment
    information, etc), call ``escalate_to_user`` with a reason.
 8. If the receptionist needs to transfer you and asks to put you on hold,
