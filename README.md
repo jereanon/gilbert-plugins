@@ -54,6 +54,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [openai-compatible](#openai-compatible) | `AIBackend "openai_compatible"` | — (uses `httpx`) | Intelligence |
 | [openrouter](#openrouter) | `AIBackend "openrouter"` | — (uses `httpx`) | Intelligence |
 | [openwakeword](#openwakeword) | `WakeWordBackend "openwakeword"` | `openwakeword` | Speech |
+| [phone](#phone) | `phone_calls` service (`PhoneCallService` + `make_phone_call` AI tool, `/calls` SPA page) | — (pure stdlib) | Telephony |
 | [plex](#plex) | `MediaLibraryBackend "plex"` | `plexapi`, `httpx` | Media |
 | [porcupine](#porcupine) | `WakeWordBackend "porcupine"` | `pvporcupine` | Speech |
 | [pushover](#pushover) | `PushNotificationBackend "pushover"` | — (uses `httpx`) | Notifications |
@@ -65,6 +66,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [telnyx](#telnyx) | `TelephonyBackend "telnyx"` (drives `PhoneCallService`) | — (uses `httpx`, `websockets`) | Telephony |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
+| [voice-agent](#voice-agent) | `voice_agent` service (wake-word-activated voice conversation, `/voice` SPA page) | — (pure stdlib) | Speech |
 | [withings](#withings) | `HealthBackend "withings"` | `httpx` | Health |
 | [xai](#xai) | `AIBackend "xai"` | — (uses `httpx`) | Intelligence |
 
@@ -999,6 +1001,31 @@ OpenRouter chat backend — a meta-provider that fronts ~200 models from Anthrop
 
 ---
 
+### phone
+
+Outbound phone calls — Gilbert places PSTN calls on the user's behalf and drives the live conversation through the core `voice_brain` engine (STT → LLM → TTS, barge-in, opening disclosure, transcript). This plugin owns `PhoneCallService` and the `/calls` SPA page; the actual carrier is a separate backend chosen at runtime (`telnyx` ships in std-plugins).
+
+Concurrency cap: at most one active call per user. A second `make_phone_call` while one is live returns a 409-style error — the user must hang up first.
+
+**Service registered** — `PhoneCallService`, capabilities `phone_calls`, `ai_tools`, `ws_handlers`. Requires `entity_storage`, `event_bus`, `ai_chat`, `text_to_speech`, `speech_to_text`, `voice_brain`. Toggleable.
+
+**SPA page** — `/calls` (and deep-links at `/calls/:callId`), gated on the `phone_calls` capability. Two-pane view: recent calls on the left, live transcript + "intervene with a directive" textbox on the right. Subscribes to `phone.call.transcript_delta` / `phone.call.status_changed` for live updates.
+
+**Slash command** — `/call <number> <brief>`, routed through `slash_namespace = "call"`. The AI tool name is `make_phone_call`.
+
+**Configure** (Settings → Phone)
+
+- `backend` — Telephony backend; choices come from `TelephonyBackend.registered_backends()` (e.g. `telnyx`).
+- `from_number` — Shared E.164 caller-ID for outbound calls (e.g. `"+13035550100"`). Must be a number you control on the chosen provider.
+- `max_call_seconds` — Hard cap on a single call's duration (default 600). Brain hangs up at this many seconds even mid-sentence.
+- `opening_disclosure_prompt` — AI prompt for the very first line Gilbert speaks on every outbound call (use `{display_name}` for the user's name). Required by federal AI-call disclosure rules.
+- `call_system_prompt` — AI prompt the LLM uses while driving a call. Receives the user's brief + the running transcript per turn. Keep it tight — phone latency is sensitive to long contexts.
+- Backend-specific keys (e.g. Telnyx `api_key`, `connection_id`, `public_url`) are flattened into the same Phone section once a backend is chosen — see the `telnyx` plugin entry for those.
+
+**No third-party Python dependencies** — pure stdlib at this layer; the carrier plugin pulls in `httpx` / `websockets`.
+
+---
+
 ### plex
 
 Plex Media Server backend for the core `MediaLibraryService`. Wraps
@@ -1303,6 +1330,24 @@ The doorbell backend uses a flat config pointing at Protect:
 **Config action** — `test_connection`: pings each configured subsystem and reports status.
 
 **No third-party Python dependencies** — all UniFi APIs are spoken via `httpx`/`aiohttp`.
+
+---
+
+### voice-agent
+
+Wake-word-activated voice conversations in the browser. Press "Start Conversation" on the `/voice` page (or trigger the configured wake-word), Gilbert listens through the browser microphone, runs the audio through STT, drives the response through the core `voice_brain` engine, and plays the synthesized speech back through the page's audio output. v1 is turn-taking; barge-in is on the roadmap.
+
+The full Gilbert tool ecosystem is available during a session — knowledge search, MCP tools, agent dispatch, scheduler, … — because the engine runs in `use_full_ai_service` mode and hands the LLM whatever the AI service currently exposes.
+
+**Service registered** — `VoiceAgentService`, capabilities `voice_agent`, `ws_handlers`, `ai_tools`. Requires `voice_brain`, `speech_to_text` (specifically `WakeWordListener`), `ai_chat` (specifically `ConversationMessagePoster`), `entity_storage`, `event_bus`. Toggleable; disabled by default — needs a mic source to actually run a session.
+
+**SPA page** — `/voice`, gated on the `voice_agent` capability so disabling the service hides both the nav entry and the route.
+
+**AI tool exposed only inside a voice session** — `end_conversation` (brain-mediated; not a slash command). The provider's `slash_namespace = "voice"`, kept defensive in case future tools expose user-facing commands.
+
+**No user-facing configuration** beyond the standard service on/off toggle and per-session opening policy (which lives on the engine config, not the service).
+
+**No third-party Python dependencies** — relies entirely on capabilities already resolved through the core service manager.
 
 ---
 

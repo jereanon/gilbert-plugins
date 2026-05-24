@@ -10,17 +10,19 @@ The Telnyx carrier integration is a SEPARATE plugin
 directly — it resolves whatever ``TelephonyBackend`` is registered
 through the standard backend registry pattern.
 
-The webhook/Media-WS routes Telnyx talks to still live at
-``gilbert.web.routes.telnyx_webhooks`` in core. The routes get
-mounted at fixed paths during app startup regardless of plugin
-load order (Telnyx may POST before the plugin finishes loading on
-a restart). The routes do a lazy ``importlib.import_module`` for
-the plugin module so the layering stays clean.
+The carrier-side webhook routes (``/api/telnyx/*``) live in core's
+``gilbert.web.routes.telnyx_webhooks`` and dispatch through the
+``telnyx_webhook`` capability the Telnyx plugin advertises.
 """
 
 from __future__ import annotations
 
-from gilbert.interfaces.plugin import Plugin, PluginContext, PluginMeta
+from gilbert.interfaces.plugin import (
+    Plugin,
+    PluginContext,
+    PluginMeta,
+    UIRoute,
+)
 
 
 class PhonePlugin(Plugin):
@@ -43,6 +45,38 @@ class PhonePlugin(Plugin):
 
     async def teardown(self) -> None:
         pass
+
+    def ui_routes(self) -> list[UIRoute]:
+        # Two paths, one component: the list view at ``/calls`` and
+        # the per-call detail view at ``/calls/:callId``. The
+        # component reads the optional ``callId`` route param via
+        # ``useParams()`` so we register one panel for both routes.
+        # ``requires_capability="phone_calls"`` gates the route on
+        # the service being live, so disabling phone under Settings
+        # → Services hides both the nav entry and the SPA route.
+        return [
+            UIRoute(
+                path="/calls",
+                panel_id="phone.calls-page",
+                label="Calls",
+                description=(
+                    "Outbound calls Gilbert places on your behalf"
+                ),
+                icon="phone",
+                required_role="user",
+                requires_capability="phone_calls",
+                add_to_nav=True,
+                show_in_dashboard=True,
+            ),
+            UIRoute(
+                # The :callId variant doesn't add a nav entry — same
+                # page, just deep-linked to a specific call.
+                path="/calls/:callId",
+                panel_id="phone.calls-page",
+                required_role="user",
+                requires_capability="phone_calls",
+            ),
+        ]
 
 
 def create_plugin() -> Plugin:

@@ -38,6 +38,7 @@ from urllib.parse import urljoin
 import httpx
 
 from gilbert.interfaces.configuration import ConfigParam
+from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.telephony import (
     CallErrorEvent,
     CallEvent,
@@ -46,6 +47,7 @@ from gilbert.interfaces.telephony import (
     CallStatusEvent,
     DtmfEvent,
     TelephonyBackend,
+    TelnyxMediaSession,
 )
 from gilbert.interfaces.tools import ToolParameterType
 
@@ -654,3 +656,52 @@ def _encode_client_state(state: dict[str, Any]) -> str:
     """
     raw = json.dumps(state).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
+
+
+# ── Capability shim — the core ``/api/telnyx/*`` routes resolve this ──
+#
+# The core route handlers used to ``importlib.import_module`` this
+# module directly to call ``deliver_webhook_event`` /
+# ``find_session_by_*`` — a hard cross-layer dependency from
+# ``web/`` on a std-plugin. This Service satisfies the
+# ``TelnyxWebhookEndpoint`` protocol from ``interfaces/telephony``
+# and is discovered by capability, so the route stays plugin-agnostic.
+
+
+class TelnyxWebhookService(Service):
+    """Capability adapter — exposes the module-level webhook/session
+    registry through a Protocol so core's web route doesn't import
+    this plugin's module directly.
+    """
+
+    # Pure adapter — no slash commands to expose.
+
+    def service_info(self) -> ServiceInfo:
+        return ServiceInfo(
+            name="telnyx_webhook",
+            capabilities=frozenset({"telnyx_webhook"}),
+            requires=frozenset(),
+            optional=frozenset(),
+        )
+
+    async def start(self, resolver: ServiceResolver) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def deliver_webhook_event(self, payload: dict[str, object]) -> None:
+        await deliver_webhook_event(dict(payload))
+
+    def find_session_by_call_control_id(
+        self, cc_id: str
+    ) -> TelnyxMediaSession | None:
+        return find_session_by_call_control_id(cc_id)
+
+    def find_session_by_token(self, token: str) -> TelnyxMediaSession | None:
+        return find_session_by_token(token)
+
+    def find_session_by_gilbert_id(
+        self, call_id: str
+    ) -> TelnyxMediaSession | None:
+        return find_session_by_gilbert_id(call_id)
