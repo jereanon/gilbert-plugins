@@ -389,6 +389,13 @@ class _ActiveSession:
     wake_detector: Any = None                 # WakeWordDetector | None
     wake_task: asyncio.Task[Any] | None = None
     silence_task: asyncio.Task[Any] | None = None
+    # Conversational mode: handed to the engine via
+    # ConversationConfig.listening_paused. We SET it when going
+    # dormant so the engine closes its STT stream (no more
+    # ElevenLabs Scribe per-second charges while we're just
+    # listening for "Hey Gilbert"). We CLEAR it on wake so the
+    # engine opens a fresh STT stream.
+    listening_paused: asyncio.Event | None = None
 
 
 # ── Persisted record shape ───────────────────────────────────────────
@@ -646,6 +653,14 @@ class VoiceAgentService(Service):
             conn_id=conn.connection_id,
             session=session,
             mode=mode,
+            # Conversational mode: hand this Event to the engine so
+            # dormant transitions can close STT and wake transitions
+            # can reopen it. Turn-based sessions don't need the
+            # mechanism — leave it None and the engine treats STT
+            # as a single open-for-conversation-lifetime stream.
+            listening_paused=(
+                asyncio.Event() if mode == "conversational" else None
+            ),
         )
         self._sessions[conn.connection_id] = active
 
@@ -764,30 +779,20 @@ class VoiceAgentService(Service):
 
         # Conversational mode: ALWAYS feed the wake detector (cheap,
         # local) so "Hey Gilbert" can recover from dormant state.
-        # In DORMANT, the user's REAL audio should NOT reach the
-        # brain — that's the whole point of dormancy. BUT we still
-        # have to keep the engine's STT stream alive, because
-        # ElevenLabs Scribe Realtime closes its WebSocket after
-        # ~15s of no audio. Once that closes, the engine's listen
-        # loop exits and even after wake recovery, no transcripts
-        # ever reach the brain again. Symptom: "Gilbert came alive
-        # one time, then stops responding to subsequent wake words."
-        #
-        # Solution: in dormant, swap the real audio for an
-        # equivalently-sized silent buffer before pushing to the
-        # engine. Scribe sees a steady stream of (silent) frames
-        # and keeps the WS open. The wake detector still gets the
-        # REAL audio so "Hey Gilbert" still wakes us. On wake →
-        # active, real audio resumes flowing and Scribe is still
-        # warm and ready to transcribe.
+        # In DORMANT we drop the engine-bound chunk entirely — the
+        # engine has already closed its STT stream (we set
+        # ``listening_paused`` on the dormant transition; the
+        # voice_brain listen loop reacts by closing Scribe so we
+        # aren't charged per-second while idle), so there'd be
+        # nowhere to push these chunks anyway. On wake, the
+        # transition clears the pause event, the engine reopens
+        # STT, and the next chunk flows through normally.
         if active.mode == "conversational" and active.wake_detector is not None:
             try:
                 await active.wake_detector.send(chunk)
             except Exception:
                 logger.debug("wake detector send failed", exc_info=True)
             if active.state == "dormant":
-                silent = b"\x00" * len(chunk)
-                await active.session.push_audio_in(silent)
                 return {"ref": ref, "ok": True}
 
         await active.session.push_audio_in(chunk)
@@ -914,10 +919,17 @@ class VoiceAgentService(Service):
             return
         active.state = "dormant"
         logger.info(
-            "voice-agent session %s → dormant (%s)",
+            "voice-agent session %s → dormant (%s) — "
+            "signalling engine to close STT stream",
             active.conversation_id,
             reason,
         )
+        # Signal the engine to close its STT stream (no more
+        # Scribe-per-second charges while we're just listening
+        # for the wake word locally). The engine's listen loop
+        # watches this Event and reacts.
+        if active.listening_paused is not None:
+            active.listening_paused.set()
         # Drain any half-buffered audio toward STT so the engine
         # doesn't accidentally process leftover speech after we go
         # dormant. The audio_in queue's bounded size keeps this from
@@ -942,9 +954,15 @@ class VoiceAgentService(Service):
         # drop back to dormant cleanly.
         active.responding = False
         active.last_user_activity_ts = asyncio.get_event_loop().time()
+        # Tell the engine to reopen STT — the listen loop is sitting
+        # in its outer pause-await waiting for this Event to clear.
+        # The next chunk through ``push_audio_in`` will flow to the
+        # freshly-opened Scribe stream.
+        if active.listening_paused is not None:
+            active.listening_paused.clear()
         logger.info(
             "voice-agent session %s → active (%s) — "
-            "responding=False, timer reset",
+            "responding=False, timer reset, STT reopen requested",
             active.conversation_id,
             reason,
         )
@@ -1280,6 +1298,11 @@ class VoiceAgentService(Service):
                 self._config.get("filler_phrases")
                 or _DEFAULT_FILLER_PHRASES
             ),
+            # Conversational mode: the engine watches this Event
+            # and closes/reopens its STT stream on set/clear, so
+            # we aren't paying Scribe per-second while dormant
+            # waiting for "Hey Gilbert".
+            listening_paused=active.listening_paused,
             tts_output_format=_TTSAudioFormat.MP3,
             tts_output_mime="audio/mpeg",
             # Browser plays the whole MP3 in one shot from a data URL,
