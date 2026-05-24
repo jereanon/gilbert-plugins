@@ -87,8 +87,19 @@ _COLLECTION = "voice_conversations"
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Gilbert, the user's personal AI assistant, responding to a "
     "voice interaction. Keep replies short — one or two sentences max. "
-    "No markdown, no lists. Skip filler ('I can help with that!', "
-    "'great question', 'happy to'); just answer. "
+    "No markdown, no lists. Skip filler in your final answer ('great "
+    "question', 'happy to') and just answer. "
+    "\n\n"
+    "HOWEVER — when the user asks something you'll need to research "
+    "(searching the knowledge base, checking the calendar, calling any "
+    "tool that takes more than a second), START your reply with a "
+    "natural-sounding 'hmm' or 'let me check' or 'one sec' so the user "
+    "knows you heard them and are working. Examples: "
+    "\n  Q: 'What temperature do we cure concrete cylinders at?' "
+    "\n  A: 'Hmm, let me check the procedures… [tool call → result] "
+    "60 to 80 Fahrenheit.' "
+    "\n  Q: 'Is the sky blue?' (no tools needed) "
+    "\n  A: 'Yeah, generally.' (no filler — answer's instant) "
     "\n\n"
     "The conversation stays OPEN by default. Acknowledgements like "
     "'okay', 'thanks', 'got it', 'that makes sense' mean the user "
@@ -710,6 +721,29 @@ class VoiceAgentService(Service):
             chunk = base64.b64decode(b64)
         except Exception:
             return {"ref": ref, "ok": False, "error": "invalid base64"}
+
+        # Diagnostic: log every 100th chunk with the current routing
+        # decision so we can tell at a glance whether the SPA is
+        # still sending audio, whether the wake detector is being
+        # fed, and whether the engine is. A 100-chunk cadence ≈ 1
+        # log line every 8.5 seconds (chunks are ~85 ms at the SPA's
+        # downsample rate).
+        active.session._inbound_count = (  # type: ignore[attr-defined]
+            getattr(active.session, "_inbound_count", 0) + 1
+        )
+        inbound_count = active.session._inbound_count  # type: ignore[attr-defined]
+        if inbound_count % 100 == 0:
+            logger.info(
+                "voice-agent WS in: session=%s count=%d state=%s mode=%s "
+                "bytes=%d → wake=%s engine=%s",
+                sid,
+                inbound_count,
+                active.state,
+                active.mode,
+                len(chunk),
+                "yes" if (active.mode == "conversational" and active.wake_detector) else "no",
+                "no (dormant)" if (active.mode == "conversational" and active.state == "dormant") else "yes",
+            )
 
         # Conversational mode: ALWAYS feed the wake detector (cheap,
         # local) so "Hey Gilbert" can recover from dormant state.
