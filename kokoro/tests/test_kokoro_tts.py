@@ -158,3 +158,60 @@ async def test_close_clears_pipelines() -> None:
     backend._pipelines["a"] = object()  # simulate a cached pipeline
     await backend.close()
     assert backend._pipelines == {}
+
+
+import numpy as np
+
+from gilbert.interfaces.tts import AudioFormat
+
+
+def _fake_pcm(seconds: float = 0.25, freq: float = 440.0, sr: int = 24000) -> np.ndarray:
+    """Generate a short float32 sine wave for encoder testing."""
+    t = np.arange(int(seconds * sr)) / sr
+    return (0.2 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def test_encode_wav_starts_with_riff() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import _encode
+
+    out = _encode(_fake_pcm(), AudioFormat.WAV)
+    assert out[:4] == b"RIFF"
+    assert out[8:12] == b"WAVE"
+
+
+def test_encode_mp3_has_mp3_magic() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import _encode
+
+    out = _encode(_fake_pcm(), AudioFormat.MP3)
+    # MP3 streams start with either an ID3 tag (b"ID3") or an MPEG
+    # frame sync (b"\xff\xfb" / b"\xff\xfa" / b"\xff\xf3" / b"\xff\xf2").
+    assert out[:3] == b"ID3" or (out[0] == 0xFF and (out[1] & 0xE0) == 0xE0)
+    assert len(out) > 100
+
+
+def test_encode_ogg_starts_with_oggs() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import _encode
+
+    out = _encode(_fake_pcm(), AudioFormat.OGG)
+    assert out[:4] == b"OggS"
+
+
+def test_encode_pcm_is_int16_at_44100() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import _encode
+
+    out = _encode(_fake_pcm(seconds=1.0), AudioFormat.PCM)
+    # 1 second of mono int16 at 44100 Hz = 88200 bytes.
+    # PyAV resampling may produce slight off-by-one due to fractional
+    # rates, so allow a few samples of slack.
+    assert 88000 <= len(out) <= 88400
+    samples = np.frombuffer(out, dtype="<i2")
+    # Non-silent — at least one sample is well above zero.
+    assert int(np.max(np.abs(samples))) > 1000
+
+
+def test_encode_empty_input_returns_short_output() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import _encode
+
+    out = _encode(np.zeros(0, dtype=np.float32), AudioFormat.WAV)
+    # Header-only WAV is OK; just don't crash.
+    assert out[:4] == b"RIFF"

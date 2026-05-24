@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from typing import Any
+
+import numpy as np
 
 from gilbert.interfaces.configuration import ConfigParam
 from gilbert.interfaces.tools import ToolParameterType
 from gilbert.interfaces.tts import (
+    AudioFormat,
     SynthesisRequest,
     SynthesisResult,
     TTSBackend,
@@ -108,6 +112,80 @@ def _lang_code_for_voice(voice_id: str) -> str:
     if not voice_id:
         raise ValueError("voice_id is empty")
     return voice_id[0]
+
+
+_OUT_SAMPLE_RATE = 44100  # matches interfaces/tts.py _PCM_SAMPLE_RATE
+
+
+def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
+    """Resample float32 24kHz mono to 44.1kHz mono int16 and encode.
+
+    PCM returns raw little-endian int16 bytes. WAV/MP3/OGG are produced
+    by PyAV's in-memory muxer. All output is mono.
+    """
+    import av  # local import: heavy dep, only needed at synthesis time
+
+    # Resample 24000 -> 44100 in float32 using PyAV's audio resampler.
+    src_layout = "mono"
+    src_format = "flt"
+
+    if samples_24k_f32.size == 0:
+        resampled = np.zeros(0, dtype=np.int16)
+    else:
+        in_frame = av.AudioFrame.from_ndarray(
+            samples_24k_f32.reshape(1, -1),
+            format=src_format,
+            layout=src_layout,
+        )
+        in_frame.sample_rate = 24000
+        resampler = av.AudioResampler(format="s16", layout=src_layout, rate=_OUT_SAMPLE_RATE)
+        chunks: list[np.ndarray] = []
+        for out_frame in resampler.resample(in_frame):
+            chunks.append(out_frame.to_ndarray().reshape(-1))
+        # Flush.
+        for out_frame in resampler.resample(None):
+            chunks.append(out_frame.to_ndarray().reshape(-1))
+        resampled = (
+            np.concatenate(chunks).astype(np.int16)
+            if chunks
+            else np.zeros(0, dtype=np.int16)
+        )
+
+    if fmt == AudioFormat.PCM:
+        return resampled.tobytes()
+
+    # Mux to MP3 / WAV / OGG via PyAV.
+    codec_for_format = {
+        AudioFormat.MP3: ("mp3", "libmp3lame"),
+        AudioFormat.WAV: ("wav", "pcm_s16le"),
+        AudioFormat.OGG: ("ogg", "libvorbis"),
+    }
+    container_fmt, codec_name = codec_for_format[fmt]
+
+    # Ensure at least one silent sample so the muxer can write a valid header.
+    if resampled.size == 0:
+        resampled = np.zeros(1, dtype=np.int16)
+
+    buf = io.BytesIO()
+    output = av.open(buf, mode="w", format=container_fmt)
+    try:
+        stream = output.add_stream(codec_name, rate=_OUT_SAMPLE_RATE)
+        stream.layout = "mono"  # type: ignore[assignment]
+
+        # Re-frame as int16 mono at 44.1kHz so the encoder accepts it.
+        frame = av.AudioFrame.from_ndarray(
+            resampled.reshape(1, -1),
+            format="s16",
+            layout="mono",
+        )
+        frame.sample_rate = _OUT_SAMPLE_RATE
+        for packet in stream.encode(frame):
+            output.mux(packet)
+        for packet in stream.encode(None):  # flush
+            output.mux(packet)
+    finally:
+        output.close()
+    return buf.getvalue()
 
 
 class KokoroTTSBackend(TTSBackend):
