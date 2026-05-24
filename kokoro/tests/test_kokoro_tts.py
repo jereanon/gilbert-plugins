@@ -121,3 +121,40 @@ async def test_get_voice_unknown() -> None:
     backend = KokoroTTSBackend()
     v = await backend.get_voice("nope")
     assert v is None
+
+
+async def test_initialize_stores_config() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    await backend.initialize({
+        "device": "cuda",
+        "default_voice": "bm_george",
+        "speed": 1.25,
+        "preload": False,
+    })
+    assert backend._device == "cuda"
+    assert backend._default_voice == "bm_george"
+    assert backend._speed == 1.25
+    assert backend._preload is False
+
+
+async def test_initialize_defaults_when_keys_missing() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    await backend.initialize({})
+    assert backend._device == "cpu"
+    assert backend._default_voice == "af_heart"
+    assert backend._speed == 1.0
+    assert backend._preload is False
+
+
+async def test_close_clears_pipelines() -> None:
+    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
+
+    backend = KokoroTTSBackend()
+    await backend.initialize({})
+    backend._pipelines["a"] = object()  # simulate a cached pipeline
+    await backend.close()
+    assert backend._pipelines == {}
