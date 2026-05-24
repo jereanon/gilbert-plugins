@@ -1,0 +1,10 @@
+name: kokoro
+version: "1.0.0"
+description: "Kokoro local TTS backend — open-weights, in-process synthesis"
+
+provides:
+  - kokoro_tts
+
+requires: []
+
+depends_on: []
