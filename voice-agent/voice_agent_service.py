@@ -84,22 +84,30 @@ logger = logging.getLogger(__name__)
 
 _COLLECTION = "voice_conversations"
 
+# Fillers the engine speaks while the LLM is still thinking. Kept
+# short — each one is a 1-3 word interjection so the TTS round-trip
+# adds maybe a second of wall time. Variety so consecutive slow
+# answers don't all open with "hmm." The list is randomly sampled
+# per slow turn.
+_DEFAULT_FILLER_PHRASES = [
+    "Hmm.",
+    "Hmm, let me check.",
+    "One sec.",
+    "Let me look that up.",
+    "Give me a moment.",
+    "Hmm, looking.",
+    "Just a sec.",
+]
+
+
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Gilbert, the user's personal AI assistant, responding to a "
     "voice interaction. Keep replies short — one or two sentences max. "
-    "No markdown, no lists. Skip filler in your final answer ('great "
-    "question', 'happy to') and just answer. "
-    "\n\n"
-    "HOWEVER — when the user asks something you'll need to research "
-    "(searching the knowledge base, checking the calendar, calling any "
-    "tool that takes more than a second), START your reply with a "
-    "natural-sounding 'hmm' or 'let me check' or 'one sec' so the user "
-    "knows you heard them and are working. Examples: "
-    "\n  Q: 'What temperature do we cure concrete cylinders at?' "
-    "\n  A: 'Hmm, let me check the procedures… [tool call → result] "
-    "60 to 80 Fahrenheit.' "
-    "\n  Q: 'Is the sky blue?' (no tools needed) "
-    "\n  A: 'Yeah, generally.' (no filler — answer's instant) "
+    "No markdown, no lists. Skip opening filler ('great question', "
+    "'happy to') and just answer. Do NOT start with 'hmm' / 'let me "
+    "check' / 'one sec' — the runtime handles that automatically when "
+    "a tool call is going to make you slow. If you open with a filler "
+    "of your own, the user hears it TWICE. Just give them the answer."
     "\n\n"
     "The conversation stays OPEN by default. Acknowledgements like "
     "'okay', 'thanks', 'got it', 'that makes sense' mean the user "
@@ -1233,6 +1241,24 @@ class VoiceAgentService(Service):
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
             on_speaking_done=_on_speaking_done,
+            # Filler ("hmm, let me check…") played by the engine if
+            # the LLM hasn't returned within ``filler_threshold_seconds``.
+            # Without this, a knowledge-tool lookup that takes 5-10s
+            # leaves the user staring at silence wondering if they
+            # were heard. The engine plays one of these phrases at
+            # the threshold so the user knows we're working on it.
+            #
+            # Threshold tuned to 1.5s: long enough that fast answers
+            # (no tools, sub-second LLM) skip the filler entirely;
+            # short enough that any tool-using answer hits it.
+            filler_threshold_seconds=float(
+                self._config.get("filler_threshold_seconds", 1.5)
+                or 1.5
+            ),
+            filler_phrases=list(
+                self._config.get("filler_phrases")
+                or _DEFAULT_FILLER_PHRASES
+            ),
             tts_output_format=_TTSAudioFormat.MP3,
             tts_output_mime="audio/mpeg",
             # Browser plays the whole MP3 in one shot from a data URL,
