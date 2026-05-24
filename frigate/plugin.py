@@ -42,6 +42,7 @@ class FrigatePlugin(Plugin):
                 slot="dashboard.bottom",
                 label="Recent camera events",
                 required_role="user",
+                requires_capability="cameras",
             ),
         ]
 
@@ -54,6 +55,7 @@ class FrigatePlugin(Plugin):
                 description="Live view of cameras and recent detection events.",
                 icon="monitor",
                 required_role="user",
+                requires_capability="cameras",
                 add_to_nav=True,
                 nav_parent_group="system",
                 show_in_dashboard=True,

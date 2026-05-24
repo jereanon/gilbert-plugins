@@ -43,6 +43,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [guess-that-song](#guess-that-song) | `guess_game` service | — (pure stdlib) | Games |
 | [hk-webhook](#hk-webhook) | `HealthBackend "hk-webhook"` | — (pure stdlib) | Health |
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
+| [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
@@ -353,7 +354,7 @@ attempt.
 High-quality text-to-speech via the ElevenLabs API, plus batch and streaming speech-to-text via the ElevenLabs Scribe API. Used by the core `speaker.announce` flow, doorbell greetings, and anything else that calls `TTSBackend.synthesize()`.
 
 **Backends registered**
-- `TTSBackend.backend_name = "elevenlabs"` — synthesizes speech from text.
+- `TTSBackend.backend_name = "elevenlabs"` — synthesizes speech from text. Also implements `StreamingTTSCapability` (chunked output via the HTTP `/stream` endpoint) and `BidirectionalTTSCapability` (push-text / read-audio sessions via the stream-input WebSocket).
 - `BatchTranscriptionBackend.backend_name = "elevenlabs_scribe"` — one-shot transcription via `POST /v1/speech-to-text`. Supports diarization.
 - `StreamingTranscriptionBackend.backend_name = "elevenlabs_scribe_live"` — real-time transcription via the Scribe WebSocket endpoint.
 
@@ -718,6 +719,32 @@ caches by the *Jellyfin* username (NOT by Gilbert user id) so two
 Gilbert users mapped to the same Jellyfin username share the
 resolved id by definition. Token at-rest encryption is inherited
 tech debt; v1 mandates `0600` on `.gilbert/gilbert.db`.
+
+---
+
+### kokoro
+
+Local text-to-speech backend powered by the open-weights [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) model. Runs entirely in-process — no cloud API, no HTTP server. Default-disabled because of heavyweight dependencies (PyTorch ~700 MB, ~327 MB model on first use).
+
+**Backend registered**
+- `TTSBackend.backend_name = "kokoro"` — synthesizes speech from text using one `kokoro.KPipeline` per language, lazily instantiated on first use. Also implements `StreamingTTSCapability` (chunked output via sentence-split — each sentence is synthesized and encoded separately, so audio starts arriving before the full text finishes).
+
+**Runtime check** — `./gilbert.sh doctor --plugin kokoro` runs a minimal end-to-end synthesis to verify the full stack (torch + kokoro + libgomp + PyAV) is functional. The probe imports `av` and `kokoro`, builds a `KPipeline(lang_code='a')`, and synthesizes one phoneme.
+
+**Configure** (Settings → TTS, when the `kokoro` backend is selected)
+
+| Key             | Type    | Default     | Notes |
+|-----------------|---------|-------------|-------|
+| `device`        | string  | `cpu`       | `cpu`, `cuda`, `mps`, or `auto`. Restart required. |
+| `default_voice` | string  | `af_heart`  | One of the ~54 catalog voices (dropdown). |
+| `speed`         | number  | `1.0`       | Default speech rate (0.5 – 2.0). Per-request `speed` on the synthesis call overrides this. |
+| `preload`       | boolean | `false`     | Load the default-language pipeline at startup. Adds ~5–10 s to boot but avoids the latency on the first TTS call. Restart required. |
+
+**Voices** — ~54 voices across American English, British English, Japanese, Mandarin, Spanish, French, Hindi, Italian, and Portuguese. The first character of each voice ID encodes the language (`a`=American, `b`=British, `j`=Japanese, `z`=Chinese, `e`=Spanish, `f`=French, `h`=Hindi, `i`=Italian, `p`=Portuguese); the second character is gender (`f`=female, `m`=male). Filter the Settings dropdown by `language`, `region`, or `gender` labels.
+
+**Output formats** — MP3 (libmp3lame), WAV (PCM 16-bit LE), OGG (libvorbis), PCM (raw int16 LE). All output at 44.1 kHz mono, matching the rest of the TTS service.
+
+**OS requirements** — None beyond what `uv sync` installs. PyAV ships its own ffmpeg shared libraries, so no system ffmpeg install is needed. On Linux, torch needs `libgomp1` (usually present); the runtime probe surfaces a clear error if it's missing.
 
 ---
 

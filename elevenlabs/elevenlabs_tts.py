@@ -1,10 +1,14 @@
 """ElevenLabs TTS backend — text-to-speech via the ElevenLabs API."""
 
+import asyncio
+import base64 as _b64
 import hashlib
+import json as _json
 import logging
 import re
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -20,7 +24,12 @@ from gilbert.interfaces.tts import (
     AudioFormat,
     SynthesisRequest,
     SynthesisResult,
+    TTSAudioChunk,
     TTSBackend,
+    TTSStream,
+    TTSStreamConfig,
+    TTSStreamError,
+    TTSWordTiming,
     Voice,
 )
 
@@ -154,6 +163,160 @@ _CacheKey = tuple[
 # Cache value: (synthesis result, monotonic insertion timestamp) so we
 # can expire entries older than the configured TTL on access.
 _CacheEntry = tuple[SynthesisResult, float]
+
+
+async def _open_stream_input_ws(
+    *,
+    voice_id: str,
+    api_key: str,
+    model_id: str,
+    output_format: str,
+) -> Any:
+    """Open the ElevenLabs stream-input WebSocket. Returns the
+    connected websocket. Isolated as a module-level helper so tests
+    can patch it without monkey-patching ``websockets.connect``."""
+    import websockets
+
+    url = (
+        f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input"
+        f"?model_id={model_id}&output_format={output_format}"
+    )
+    return await websockets.connect(
+        url,
+        additional_headers={"xi-api-key": api_key},
+        max_size=None,
+    )
+
+
+def _alignment_to_word_events(alignment: dict[str, Any]) -> list[TTSWordTiming]:
+    """Reassemble whole-word events from ElevenLabs' per-character
+    alignment payload. Each whitespace-separated run of characters is
+    one event; start = first char's start, end = last char's start +
+    duration. Returns an empty list if the payload is malformed."""
+    chars = alignment.get("chars") or []
+    starts = alignment.get("charStartTimesMs") or []
+    durs = alignment.get("charDurationsMs") or []
+    if not (len(chars) == len(starts) == len(durs)) or not chars:
+        return []
+    events: list[TTSWordTiming] = []
+    word_chars: list[str] = []
+    word_start_ms: int | None = None
+    word_end_ms: int = 0
+    for ch, st, du in zip(chars, starts, durs, strict=False):
+        if ch.isspace():
+            if word_chars:
+                events.append(TTSWordTiming(
+                    word="".join(word_chars),
+                    start_seconds=(word_start_ms or 0) / 1000.0,
+                    end_seconds=word_end_ms / 1000.0,
+                ))
+                word_chars, word_start_ms = [], None
+            continue
+        if word_start_ms is None:
+            word_start_ms = st
+        word_chars.append(ch)
+        word_end_ms = st + du
+    if word_chars:
+        events.append(TTSWordTiming(
+            word="".join(word_chars),
+            start_seconds=(word_start_ms or 0) / 1000.0,
+            end_seconds=word_end_ms / 1000.0,
+        ))
+    return events
+
+
+class ElevenLabsTTSStream(TTSStream):
+    """Bidirectional TTS session wrapping the stream-input WebSocket.
+
+    Frame mapping:
+      - ``{"audio": "<base64>"}`` -> ``TTSAudioChunk``
+      - ``{"normalizedAlignment": {...}}`` -> one ``TTSWordTiming`` per
+        whitespace-delimited word reassembled from the character spans
+      - ``{"isFinal": true}`` -> terminates the events iterator
+      - Anything else -> ignored
+
+    A background pump task drains ``ws.recv()`` and pushes events to an
+    ``asyncio.Queue``. The ``events()`` consumer reads from that queue,
+    so the producer (``send_text`` / ``flush``) never blocks on the
+    consumer and vice versa.
+    """
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self._closed = False
+        self._events: asyncio.Queue[Any] = asyncio.Queue()
+        self._pump_task = asyncio.create_task(self._pump_recv())
+
+    async def send_text(self, text: str) -> None:
+        if self._closed:
+            raise RuntimeError("stream is closed")
+        await self._ws.send(_json.dumps({"text": text}))
+
+    async def flush(self) -> None:
+        if self._closed:
+            raise RuntimeError("stream is closed")
+        # Per ElevenLabs docs: an empty-text frame with flush=true
+        # triggers synthesis of buffered text without ending the
+        # connection (that's what end-of-input ``{"text": ""}`` does).
+        await self._ws.send(_json.dumps({"text": "", "flush": True}))
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Polite close: signal end-of-input via an empty-string text.
+        try:
+            await self._ws.send(_json.dumps({"text": ""}))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await self._ws.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._pump_task.done():
+            self._pump_task.cancel()
+        await self._events.put(None)  # sentinel — unblocks events()
+
+    def events(self) -> AsyncIterator[Any]:
+        q = self._events
+
+        async def _gen() -> AsyncIterator[Any]:
+            while True:
+                ev = await q.get()
+                if ev is None:
+                    return
+                yield ev
+
+        return _gen()
+
+    async def _pump_recv(self) -> None:
+        try:
+            while True:
+                raw = await self._ws.recv()
+                try:
+                    msg = _json.loads(raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                if "audio" in msg and msg["audio"]:
+                    await self._events.put(
+                        TTSAudioChunk(audio=_b64.b64decode(msg["audio"]))
+                    )
+                if "normalizedAlignment" in msg and msg["normalizedAlignment"]:
+                    align = msg["normalizedAlignment"]
+                    for word_ev in _alignment_to_word_events(align):
+                        await self._events.put(word_ev)
+                if msg.get("isFinal"):
+                    await self._events.put(None)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # Server hangup or socket error — surface as a recoverable=False
+            # event and terminate the consumer cleanly.
+            await self._events.put(
+                TTSStreamError(message=str(e), recoverable=False)
+            )
+            await self._events.put(None)
 
 
 class ElevenLabsTTS(TTSBackend):
@@ -714,6 +877,93 @@ class ElevenLabsTTS(TTSBackend):
         # Only cache successful synthesis
         self._cache_put(cache_key, result)
         return result
+
+    def synthesize_stream(
+        self, request: SynthesisRequest,
+    ) -> AsyncIterator[bytes]:
+        """Stream MP3/PCM audio chunks via the ElevenLabs streaming endpoint.
+
+        Skips the local response cache — streaming is intended for
+        long replies where the caller wants minimal first-byte latency
+        anyway. Skips audio-tag injection too; the director model would
+        block first-byte latency on its own round-trip. Callers that
+        want tagged audio should use ``synthesize`` instead."""
+        if not request.voice_id:
+            if self._voice_id:
+                request = SynthesisRequest(
+                    text=request.text, voice_id=self._voice_id,
+                    output_format=request.output_format, speed=request.speed,
+                    stability=request.stability, similarity_boost=request.similarity_boost,
+                    context=request.context,
+                )
+            else:
+                raise ValueError("No voice_id configured — set voice_id in TTS backend settings")
+        client = self._require_client()
+        output_format = _FORMAT_MAP.get(request.output_format, "mp3_44100_128")
+        body: dict[str, Any] = {"text": request.text, "model_id": self._model_id}
+        voice_settings: dict[str, float] = {}
+        if request.stability is not None:
+            voice_settings["stability"] = request.stability
+        if request.similarity_boost is not None:
+            voice_settings["similarity_boost"] = request.similarity_boost
+        if voice_settings:
+            body["voice_settings"] = voice_settings
+
+        async def _gen() -> AsyncIterator[bytes]:
+            async with client.stream(
+                "POST",
+                f"/text-to-speech/{request.voice_id}/stream",
+                json=body,
+                params={"output_format": output_format},
+            ) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+
+        return _gen()
+
+    async def open_stream(self, config: TTSStreamConfig) -> TTSStream:
+        """Open a bidirectional TTS session via the stream-input WS API.
+
+        The WebSocket requires a priming frame as the first send before
+        any subsequent text frames are accepted; we send a single space
+        with default voice_settings so callers don't have to. Subsequent
+        ``send_text()`` calls drive synthesis, ``flush()`` forces
+        rendering of buffered text, and ``close()`` ends the session.
+        """
+        voice_id = config.voice_id or self._voice_id
+        if not voice_id:
+            raise ValueError(
+                "No voice_id configured — set voice_id in TTS backend settings"
+            )
+        if not self._api_key:
+            raise RuntimeError(
+                "ElevenLabs TTS not initialized — call initialize() first"
+            )
+        output_format = _FORMAT_MAP.get(config.output_format, "mp3_44100_128")
+        ws = await _open_stream_input_ws(
+            voice_id=voice_id,
+            api_key=self._api_key,
+            model_id=self._model_id,
+            output_format=output_format,
+        )
+        # ElevenLabs requires a priming frame as the first send. We use
+        # a single-space placeholder so we don't synthesize anything
+        # audible — subsequent send_text frames are what actually
+        # produce audio.
+        await ws.send(
+            _json.dumps(
+                {
+                    "text": " ",
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.75,
+                    },
+                }
+            )
+        )
+        return ElevenLabsTTSStream(ws)
 
     async def list_voices(self) -> list[Voice]:
         client = self._require_client()
