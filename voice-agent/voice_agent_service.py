@@ -49,7 +49,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gilbert.interfaces.ai import ConversationMessagePoster
-from gilbert.interfaces.configuration import ConfigParam
+from gilbert.interfaces.configuration import ConfigParam, ConfigurationReader
 from gilbert.interfaces.conversation import (
     BrainToolResult,
     ConversationConfig,
@@ -726,7 +726,7 @@ class VoiceAgentService(Service):
                         sample_rate=16000,
                         channels=1,
                     ),
-                    sensitivity=0.5,
+                    sensitivity=self._wake_sensitivity(),
                 )
                 # Try the TranscriptionService capability first (the
                 # "right" path — uses the user's configured default).
@@ -1181,36 +1181,12 @@ class VoiceAgentService(Service):
         return "speech"
 
     def config_params(self) -> list[ConfigParam]:
+        # Wake-word knobs (backend, keywords, sensitivity) belong to the
+        # transcription service — voice-agent consumes the WakeWordListener
+        # capability and doesn't own wake-word config. Only the fields
+        # voice-agent's runtime actually reads from self._config are
+        # declared here.
         return [
-            ConfigParam(
-                key="wake_keywords",
-                type=ToolParameterType.ARRAY,
-                description=(
-                    "Wake-word keywords. Which strings are valid depends "
-                    "on the active wake-word backend (porcupine / "
-                    "openwakeword)."
-                ),
-                default=["hey gilbert"],
-                restart_required=True,
-            ),
-            ConfigParam(
-                key="wake_word_backend",
-                type=ToolParameterType.STRING,
-                description=(
-                    "Wake-word backend name. Leave blank to use whatever "
-                    "TranscriptionService selected as default."
-                ),
-                default="",
-                choices_from="transcription.wake_word_backends",
-                restart_required=True,
-            ),
-            ConfigParam(
-                key="sensitivity",
-                type=ToolParameterType.NUMBER,
-                description="Wake-word sensitivity, 0..1. Higher fires more.",
-                default=0.5,
-                restart_required=True,
-            ),
             ConfigParam(
                 key="idle_timeout_seconds",
                 type=ToolParameterType.NUMBER,
@@ -1236,6 +1212,27 @@ class VoiceAgentService(Service):
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
         self._config = dict(config)
+
+    def _wake_sensitivity(self) -> float:
+        """Read the wake-word sensitivity from the transcription service's
+        config section. Wake-word knobs live with the transcription
+        service (it owns the WakeWordListener capability), so voice-agent
+        defers to it rather than maintaining its own sensitivity setting."""
+        if self._resolver is None:
+            return 0.5
+        config_svc = self._resolver.get_capability("configuration")
+        if not isinstance(config_svc, ConfigurationReader):
+            return 0.5
+        try:
+            section = config_svc.get_section("transcription")
+        except Exception:
+            return 0.5
+        wake = section.get("wake_word") if isinstance(section, dict) else None
+        if isinstance(wake, dict):
+            raw = wake.get("sensitivity")
+            if isinstance(raw, int | float):
+                return float(raw)
+        return 0.5
 
     # --- Lifecycle ---------------------------------------------------
 
@@ -1273,11 +1270,8 @@ class VoiceAgentService(Service):
         # Pull config — same pattern as PhoneCallService.
         config_svc = resolver.get_capability("configuration")
         section: dict[str, Any] = {}
-        if config_svc is not None:
-            from gilbert.interfaces.configuration import ConfigurationReader
-
-            if isinstance(config_svc, ConfigurationReader):
-                section = config_svc.get_section(self.config_namespace)
+        if isinstance(config_svc, ConfigurationReader):
+            section = config_svc.get_section(self.config_namespace)
 
         # Toggleable services default off — the user opts in from
         # ``/settings → Services`` after the plugin is installed.
