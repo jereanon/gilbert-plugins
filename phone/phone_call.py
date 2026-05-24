@@ -41,6 +41,7 @@ from gilbert.interfaces.conversation import (
     ConversationStatus,
     OpeningBehavior,
     OpeningPolicy,
+    get_current_conversation_ctx,
 )
 from gilbert.interfaces.ai import (
     AISamplingProvider,
@@ -84,6 +85,21 @@ _COLLECTION = "phone_calls"
 # Stops the brain (which then hangs up) once exceeded. Configurable in
 # ``/settings`` via ``phone_call.max_call_seconds``.
 _DEFAULT_MAX_CALL_SECONDS = 900  # 15 minutes
+
+# Filler phrases the engine speaks while a slow LLM/tool turn is in
+# flight (knowledge-base lookup, MCP call, etc.). Same UX motivation
+# as voice-agent — without these the REMOTE hears dead air for 5-15s
+# during a tool call and assumes the line dropped. Phrasing is tuned
+# for phone etiquette: the remote doesn't know what we're "checking"
+# so a generic "one sec" or "let me check" is friendlier than
+# voice-agent's casual "hmm."
+_DEFAULT_PHONE_FILLER_PHRASES = [
+    "One sec, let me check.",
+    "Just a moment.",
+    "Let me look that up for you.",
+    "Bear with me one second.",
+    "Hold on a moment please.",
+]
 
 # How long of remote silence after the brain finishes speaking before we
 # proactively prompt the remote ("are you still there?"). Voicemail
@@ -594,6 +610,13 @@ class PhoneCallService(Service):
     def get_tools(self, user_ctx: Any = None) -> list[ToolDefinition]:
         if not self._enabled:
             return []
+        # In-call tools — only visible while the engine is driving a
+        # phone-call ai.chat() turn (the engine sets the ContextVar
+        # before each call). Regular chat turns never see hang_up
+        # etc., so the LLM can't accidentally hang up a call that
+        # doesn't exist.
+        if get_current_conversation_ctx() is not None:
+            return self._in_call_tools()
         return [
             ToolDefinition(
                 name="make_phone_call",
@@ -663,9 +686,129 @@ class PhoneCallService(Service):
             )
         ]
 
+    def _in_call_tools(self) -> list[ToolDefinition]:
+        """Tools the LLM may use during a live phone call. Mirror of the
+        old ``PhoneCallBrainToolProvider.get_brain_tools`` list, exposed
+        through the regular ToolProvider surface so the full AI service
+        (``use_full_ai_service=True``) can dispatch them like any other
+        Gilbert tool. Visibility is gated by the ContextVar — see
+        ``get_tools`` for the guard.
+        """
+        return [
+            ToolDefinition(
+                name="hang_up",
+                description=(
+                    "Drop the line. Bookkeeping ONLY — does NOT speak. "
+                    "You MUST say goodbye in the message content of THIS "
+                    "SAME turn, e.g. content='Thanks so much, have a good "
+                    "one!' + hang_up(reason='completed'). Calling hang_up "
+                    "without spoken content gives the remote dead air and "
+                    "then a dial tone — rude. Use only when the "
+                    "conversation is genuinely done."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="reason",
+                        type=ToolParameterType.STRING,
+                        description="Short reason recorded on the call.",
+                    ),
+                ],
+            ),
+            ToolDefinition(
+                name="confirm_and_end",
+                description=(
+                    "Bookkeeping ONLY — records the structured outcome onto "
+                    "the call. Does NOT speak. You MUST speak the readback "
+                    "yourself in the message content of THIS SAME turn, e.g. "
+                    "content='Great, so that\\'s Tuesday at 8 AM with a loaner "
+                    "lined up — sound right?' + confirm_and_end({...}). On "
+                    "the NEXT turn, after the remote confirms, speak a brief "
+                    "thanks/goodbye and call ``hang_up``."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="summary",
+                        type=ToolParameterType.OBJECT,
+                        description=(
+                            "Structured outcome — e.g. "
+                            '{"appointment_datetime": "...", '
+                            '"service_advisor": "...", "loaner_confirmed": true}. '
+                            "Stored on the call record for the post-call "
+                            "summary. The remote does NOT hear these fields; "
+                            "say them yourself in the message content."
+                        ),
+                    ),
+                ],
+            ),
+            ToolDefinition(
+                name="escalate_to_user",
+                description=(
+                    "Bail out — the situation needs the actual user. Gilbert "
+                    "will apologize, ask the remote to call back, and hang up."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="reason",
+                        type=ToolParameterType.STRING,
+                        description="Why escalation is required.",
+                    ),
+                ],
+            ),
+            ToolDefinition(
+                name="note",
+                description=(
+                    "Stash a fact onto the call's structured outcome. Use for "
+                    "anything worth surfacing in the post-call summary that "
+                    "doesn't trigger an end-of-call."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="key",
+                        type=ToolParameterType.STRING,
+                        description="Outcome field name (snake_case).",
+                    ),
+                    ToolParameter(
+                        name="value",
+                        type=ToolParameterType.STRING,
+                        description="Value to store.",
+                    ),
+                ],
+            ),
+            ToolDefinition(
+                name="send_dtmf",
+                description=(
+                    "Send DTMF digits to navigate an IVR menu. Use ONLY when "
+                    "the remote prompts for a key press."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="digits",
+                        type=ToolParameterType.STRING,
+                        description='Sequence of 0-9, *, # — e.g. "2" or "1234#".',
+                    ),
+                ],
+            ),
+        ]
+
     async def execute_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> str | ToolOutput:
+        # In-call tools (only resolvable via ContextVar set by the
+        # engine right before ai.chat()). Visibility is gated by
+        # ``get_tools``; dispatch is gated here so a tool called
+        # outside an active call returns a clean error rather than
+        # crashing or doing partial work.
+        if name in (
+            "hang_up",
+            "confirm_and_end",
+            "escalate_to_user",
+            "note",
+            "send_dtmf",
+        ):
+            ctx = get_current_conversation_ctx()
+            if ctx is None:
+                return f"(no active phone call — '{name}' is in-call only)"
+            return await self._execute_in_call_tool(name, arguments, ctx)
         if name != "make_phone_call":
             raise KeyError(name)
         # User context comes from the async-local set by the AI
@@ -719,6 +862,70 @@ class PhoneCallService(Service):
         # conversation when the call wraps, so no "go check /calls"
         # exhortation needed.
         return f"Call started. call_id={call_id}"
+
+    async def _execute_in_call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        ctx: ConversationContext,
+    ) -> str:
+        """Dispatch one of the in-call tools (hang_up / confirm_and_end /
+        escalate_to_user / note / send_dtmf). Mirrors
+        PhoneCallBrainToolProvider.handle_brain_tool but returns a
+        plain string for the Gilbert AI service to relay back to the
+        model instead of a ``BrainToolResult`` enum — the engine
+        observes ``ctx.outcome["end_requested"]`` after each chat
+        round to decide whether to terminate the call.
+        """
+        if name == "hang_up":
+            reason = str(arguments.get("reason") or "")
+            ctx.outcome["hang_up_reason"] = reason
+            await ctx.record_turn(
+                "system", f"(brain hung up: {reason})"
+            )
+            ctx.outcome["end_requested"] = True
+            return f"OK, hanging up. Reason: {reason}"
+
+        if name == "confirm_and_end":
+            summary = arguments.get("summary") or {}
+            if isinstance(summary, dict):
+                ctx.outcome.update(summary)
+            await ctx.record_turn(
+                "system",
+                f"(brain reading back confirmation: {summary})",
+            )
+            return f"Outcome recorded: {summary}"
+
+        if name == "escalate_to_user":
+            reason = str(arguments.get("reason") or "")
+            ctx.outcome["escalated"] = True
+            ctx.outcome["escalation_reason"] = reason
+            await ctx.record_turn(
+                "system",
+                f"(brain escalating: {reason})",
+            )
+            await ctx.publish_event(
+                "phone.call.escalation_requested",
+                {"reason": reason},
+            )
+            ctx.outcome["end_requested"] = True
+            return f"Escalating to user. Reason: {reason}"
+
+        if name == "note":
+            key = str(arguments.get("key") or "").strip()
+            value = arguments.get("value")
+            if key:
+                ctx.outcome[key] = value
+            return f"Noted: {key}={value}"
+
+        if name == "send_dtmf":
+            # Backend doesn't yet support sending DTMF — log + record
+            # (same TODO as the brain-tool path).
+            digits = str(arguments.get("digits") or "")
+            await ctx.record_turn("us", f"(DTMF: {digits})")
+            return f"DTMF queued (backend support pending): {digits}"
+
+        raise KeyError(f"phone has no in-call tool {name!r}")
 
     # --- start_call (the public entry point) ------------------------
 
@@ -893,6 +1100,17 @@ class PhoneCallService(Service):
         async def _on_transcript_turn(
             who: str, text: str, ts_seconds: float
         ) -> None:
+            # Diagnostic: same shape as the voice-agent transcript
+            # log. If "them" (remote) transcripts stop arriving
+            # mid-call, this goes silent and we know to look at
+            # Telnyx → STT plumbing rather than the brain.
+            log.info(
+                "transcript: call_id=%s who=%s chars=%d ts=%.2fs",
+                record.call_id,
+                who,
+                len(text),
+                ts_seconds,
+            )
             record.transcript.append(
                 {"who": who, "text": text, "ts": ts_seconds}
             )
@@ -948,6 +1166,12 @@ class PhoneCallService(Service):
 
         engine_config = ConversationConfig(
             system_prompt=system_prompt,
+            # Brain-tool provider is still passed for backwards
+            # compat with the complete_one_shot path, but on the
+            # full AI service path it's unused. The in-call tools
+            # (hang_up, confirm_and_end, …) are now exposed as
+            # ContextVar-gated Gilbert tools on this same service
+            # — see ``_in_call_tools`` / ``_execute_in_call_tool``.
             brain_tool_provider=PhoneCallBrainToolProvider(),
             opening_policy=OpeningPolicy(
                 behavior=OpeningBehavior.WAIT_FOR_REMOTE,
@@ -958,6 +1182,26 @@ class PhoneCallService(Service):
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
             on_llm_turn=None,  # engine logs LLM turns itself
+            # Promote phone to the full agentic loop, same as
+            # voice-agent. Gives Gilbert knowledge.search, MCP
+            # tools, calendar, etc. while on the call — so when
+            # the remote asks "what's our address?" Gilbert can
+            # actually look it up instead of saying "I don't know."
+            use_full_ai_service=True,
+            # Filler ("hmm, let me check…") while a slow tool
+            # lookup is in flight. Same threshold + phrase list as
+            # voice-agent — calibrated to skip the filler for
+            # fast Q&A and only fire when a tool call is genuinely
+            # slow. Without this the remote sits in dead air for
+            # 5-15s during a knowledge-base lookup.
+            filler_threshold_seconds=float(
+                self._config.get("filler_threshold_seconds", 3.0)
+                or 3.0
+            ),
+            filler_phrases=list(
+                self._config.get("filler_phrases")
+                or _DEFAULT_PHONE_FILLER_PHRASES
+            ),
         )
 
         outcome: ConversationOutcome | None = None
