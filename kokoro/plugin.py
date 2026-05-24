@@ -28,7 +28,7 @@ class KokoroPlugin(Plugin):
         # through a KPipeline so a misconfigured torch/CUDA/libgomp install
         # fails here instead of at first user request.
         probe = (
-            "python -c \"import av, kokoro; "
+            'python -c "import av, kokoro; '
             "p = kokoro.KPipeline(lang_code='a'); "
             "list(p('hi', voice='af_heart'))\""
         )

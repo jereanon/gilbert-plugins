@@ -37,68 +37,68 @@ def _v(voice_id: str, name: str, language: str, region: str, gender: str) -> Voi
 # character is gender (f=female, m=male).
 _VOICES: list[Voice] = [
     # American English (a)
-    _v("af_alloy",   "Alloy",   "en-US", "American", "female"),
-    _v("af_aoede",   "Aoede",   "en-US", "American", "female"),
-    _v("af_bella",   "Bella",   "en-US", "American", "female"),
-    _v("af_heart",   "Heart",   "en-US", "American", "female"),
+    _v("af_alloy", "Alloy", "en-US", "American", "female"),
+    _v("af_aoede", "Aoede", "en-US", "American", "female"),
+    _v("af_bella", "Bella", "en-US", "American", "female"),
+    _v("af_heart", "Heart", "en-US", "American", "female"),
     _v("af_jessica", "Jessica", "en-US", "American", "female"),
-    _v("af_kore",    "Kore",    "en-US", "American", "female"),
-    _v("af_nicole",  "Nicole",  "en-US", "American", "female"),
-    _v("af_nova",    "Nova",    "en-US", "American", "female"),
-    _v("af_river",   "River",   "en-US", "American", "female"),
-    _v("af_sarah",   "Sarah",   "en-US", "American", "female"),
-    _v("af_sky",     "Sky",     "en-US", "American", "female"),
-    _v("am_adam",    "Adam",    "en-US", "American", "male"),
-    _v("am_echo",    "Echo",    "en-US", "American", "male"),
-    _v("am_eric",    "Eric",    "en-US", "American", "male"),
-    _v("am_fenrir",  "Fenrir",  "en-US", "American", "male"),
-    _v("am_liam",    "Liam",    "en-US", "American", "male"),
+    _v("af_kore", "Kore", "en-US", "American", "female"),
+    _v("af_nicole", "Nicole", "en-US", "American", "female"),
+    _v("af_nova", "Nova", "en-US", "American", "female"),
+    _v("af_river", "River", "en-US", "American", "female"),
+    _v("af_sarah", "Sarah", "en-US", "American", "female"),
+    _v("af_sky", "Sky", "en-US", "American", "female"),
+    _v("am_adam", "Adam", "en-US", "American", "male"),
+    _v("am_echo", "Echo", "en-US", "American", "male"),
+    _v("am_eric", "Eric", "en-US", "American", "male"),
+    _v("am_fenrir", "Fenrir", "en-US", "American", "male"),
+    _v("am_liam", "Liam", "en-US", "American", "male"),
     _v("am_michael", "Michael", "en-US", "American", "male"),
-    _v("am_onyx",    "Onyx",    "en-US", "American", "male"),
-    _v("am_puck",    "Puck",    "en-US", "American", "male"),
-    _v("am_santa",   "Santa",   "en-US", "American", "male"),
+    _v("am_onyx", "Onyx", "en-US", "American", "male"),
+    _v("am_puck", "Puck", "en-US", "American", "male"),
+    _v("am_santa", "Santa", "en-US", "American", "male"),
     # British English (b)
-    _v("bf_alice",    "Alice",    "en-GB", "British", "female"),
-    _v("bf_emma",     "Emma",     "en-GB", "British", "female"),
+    _v("bf_alice", "Alice", "en-GB", "British", "female"),
+    _v("bf_emma", "Emma", "en-GB", "British", "female"),
     _v("bf_isabella", "Isabella", "en-GB", "British", "female"),
-    _v("bf_lily",     "Lily",     "en-GB", "British", "female"),
-    _v("bm_daniel",   "Daniel",   "en-GB", "British", "male"),
-    _v("bm_fable",    "Fable",    "en-GB", "British", "male"),
-    _v("bm_george",   "George",   "en-GB", "British", "male"),
-    _v("bm_lewis",    "Lewis",    "en-GB", "British", "male"),
+    _v("bf_lily", "Lily", "en-GB", "British", "female"),
+    _v("bm_daniel", "Daniel", "en-GB", "British", "male"),
+    _v("bm_fable", "Fable", "en-GB", "British", "male"),
+    _v("bm_george", "George", "en-GB", "British", "male"),
+    _v("bm_lewis", "Lewis", "en-GB", "British", "male"),
     # Japanese (j)
-    _v("jf_alpha",    "Alpha",    "ja", "Japan", "female"),
+    _v("jf_alpha", "Alpha", "ja", "Japan", "female"),
     _v("jf_gongitsune", "Gongitsune", "ja", "Japan", "female"),
-    _v("jf_nezumi",   "Nezumi",   "ja", "Japan", "female"),
+    _v("jf_nezumi", "Nezumi", "ja", "Japan", "female"),
     _v("jf_tebukuro", "Tebukuro", "ja", "Japan", "female"),
-    _v("jm_kumo",     "Kumo",     "ja", "Japan", "male"),
+    _v("jm_kumo", "Kumo", "ja", "Japan", "male"),
     # Mandarin Chinese (z)
-    _v("zf_xiaobei",  "Xiaobei",  "zh", "Mainland", "female"),
-    _v("zf_xiaoni",   "Xiaoni",   "zh", "Mainland", "female"),
+    _v("zf_xiaobei", "Xiaobei", "zh", "Mainland", "female"),
+    _v("zf_xiaoni", "Xiaoni", "zh", "Mainland", "female"),
     _v("zf_xiaoxiao", "Xiaoxiao", "zh", "Mainland", "female"),
-    _v("zf_xiaoyi",   "Xiaoyi",   "zh", "Mainland", "female"),
-    _v("zm_yunjian",  "Yunjian",  "zh", "Mainland", "male"),
-    _v("zm_yunxi",    "Yunxi",    "zh", "Mainland", "male"),
-    _v("zm_yunxia",   "Yunxia",   "zh", "Mainland", "male"),
-    _v("zm_yunyang",  "Yunyang",  "zh", "Mainland", "male"),
+    _v("zf_xiaoyi", "Xiaoyi", "zh", "Mainland", "female"),
+    _v("zm_yunjian", "Yunjian", "zh", "Mainland", "male"),
+    _v("zm_yunxi", "Yunxi", "zh", "Mainland", "male"),
+    _v("zm_yunxia", "Yunxia", "zh", "Mainland", "male"),
+    _v("zm_yunyang", "Yunyang", "zh", "Mainland", "male"),
     # Spanish (e)
-    _v("ef_dora",     "Dora",     "es", "Spain", "female"),
-    _v("em_alex",     "Alex",     "es", "Spain", "male"),
-    _v("em_santa",    "Santa",    "es", "Spain", "male"),
+    _v("ef_dora", "Dora", "es", "Spain", "female"),
+    _v("em_alex", "Alex", "es", "Spain", "male"),
+    _v("em_santa", "Santa", "es", "Spain", "male"),
     # French (f)
-    _v("ff_siwis",    "Siwis",    "fr", "France", "female"),
+    _v("ff_siwis", "Siwis", "fr", "France", "female"),
     # Hindi (h)
-    _v("hf_alpha",    "Alpha",    "hi", "India", "female"),
-    _v("hf_beta",     "Beta",     "hi", "India", "female"),
-    _v("hm_omega",    "Omega",    "hi", "India", "male"),
-    _v("hm_psi",      "Psi",      "hi", "India", "male"),
+    _v("hf_alpha", "Alpha", "hi", "India", "female"),
+    _v("hf_beta", "Beta", "hi", "India", "female"),
+    _v("hm_omega", "Omega", "hi", "India", "male"),
+    _v("hm_psi", "Psi", "hi", "India", "male"),
     # Italian (i)
-    _v("if_sara",     "Sara",     "it", "Italy", "female"),
-    _v("im_nicola",   "Nicola",   "it", "Italy", "male"),
+    _v("if_sara", "Sara", "it", "Italy", "female"),
+    _v("im_nicola", "Nicola", "it", "Italy", "male"),
     # Portuguese (p)
-    _v("pf_dora",     "Dora",     "pt", "Brazil", "female"),
-    _v("pm_alex",     "Alex",     "pt", "Brazil", "male"),
-    _v("pm_santa",    "Santa",    "pt", "Brazil", "male"),
+    _v("pf_dora", "Dora", "pt", "Brazil", "female"),
+    _v("pm_alex", "Alex", "pt", "Brazil", "male"),
+    _v("pm_santa", "Santa", "pt", "Brazil", "male"),
 ]
 
 
@@ -147,9 +147,7 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
         for out_frame in resampler.resample(None):
             chunks.append(out_frame.to_ndarray().reshape(-1))
         resampled = (
-            np.concatenate(chunks).astype(np.int16)
-            if chunks
-            else np.zeros(0, dtype=np.int16)
+            np.concatenate(chunks).astype(np.int16) if chunks else np.zeros(0, dtype=np.int16)
         )
 
     if fmt == AudioFormat.PCM:
@@ -171,7 +169,7 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
     output = av.open(buf, mode="w", format=container_fmt)
     try:
         stream = output.add_stream(codec_name, rate=_OUT_SAMPLE_RATE)
-        stream.layout = "mono"  # type: ignore[assignment]
+        stream.layout = "mono"  # type: ignore[union-attr]
 
         # Re-frame as int16 mono at 44.1kHz so the encoder accepts it.
         frame = av.AudioFrame.from_ndarray(
@@ -180,9 +178,9 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
             layout="mono",
         )
         frame.sample_rate = _OUT_SAMPLE_RATE
-        for packet in stream.encode(frame):
+        for packet in stream.encode(frame):  # type: ignore[union-attr,arg-type]
             output.mux(packet)
-        for packet in stream.encode(None):  # flush
+        for packet in stream.encode(None):  # type: ignore[union-attr]
             output.mux(packet)
     finally:
         output.close()
@@ -191,7 +189,7 @@ def _encode(samples_24k_f32: np.ndarray, fmt: AudioFormat) -> bytes:
 
 def _build_pipeline(lang_code: str, device: str) -> Any:
     """Construct a kokoro.KPipeline. Isolated so tests can patch it."""
-    from kokoro import KPipeline  # type: ignore[import-untyped]
+    from kokoro import KPipeline  # type: ignore[attr-defined]  # kokoro has no py.typed stubs
 
     # device="auto" lets kokoro pick — pass-through otherwise.
     if device == "auto":
@@ -262,7 +260,10 @@ class KokoroTTSBackend(TTSBackend):
         self._preload = bool(config.get("preload", False))
         logger.info(
             "KokoroTTSBackend initialized: device=%s default_voice=%s speed=%s preload=%s",
-            self._device, self._default_voice, self._speed, self._preload,
+            self._device,
+            self._default_voice,
+            self._speed,
+            self._preload,
         )
         if self._preload:
             lang = _lang_code_for_voice(self._default_voice)
@@ -289,9 +290,7 @@ class KokoroTTSBackend(TTSBackend):
 
         def _run_sync() -> np.ndarray:
             chunks: list[np.ndarray] = []
-            for _g, _p, audio in pipeline(
-                request.text, voice=request.voice_id, speed=speed
-            ):
+            for _g, _p, audio in pipeline(request.text, voice=request.voice_id, speed=speed):
                 arr = np.asarray(audio, dtype=np.float32).reshape(-1)
                 chunks.append(arr)
             if not chunks:

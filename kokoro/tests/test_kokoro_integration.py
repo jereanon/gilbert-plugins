@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from gilbert.interfaces.tts import AudioFormat, SynthesisRequest
-
+from gilbert.interfaces.tts import AudioFormat, SynthesisRequest  # noqa: E402
 
 pytestmark = pytest.mark.slow
 
@@ -46,8 +45,9 @@ async def test_real_synth_wav() -> None:
     await backend.initialize({})
     try:
         result = await backend.synthesize(
-            SynthesisRequest(text="One two three.", voice_id="bm_george",
-                             output_format=AudioFormat.WAV)
+            SynthesisRequest(
+                text="One two three.", voice_id="bm_george", output_format=AudioFormat.WAV
+            )
         )
     finally:
         await backend.close()

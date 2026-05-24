@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 import pytest
 
-from gilbert.interfaces.tts import Voice
+from gilbert.interfaces.tts import (  # type: ignore[import-untyped]
+    AudioFormat,
+    SynthesisRequest,
+    TTSBackend,
+    Voice,
+)
 
 
 def test_module_imports() -> None:
@@ -63,12 +71,10 @@ def test_voice_id_first_char_encodes_lang_code(voice_id: str, expected_lang_code
     assert _lang_code_for_voice(voice_id) == expected_lang_code
 
 
-from gilbert.interfaces.tts import TTSBackend
-
-
 def test_backend_registered() -> None:
     """Importing the module registers the backend in the ABC's registry."""
     import gilbert_plugin_kokoro.kokoro_tts  # noqa: F401
+
     backends = TTSBackend.registered_backends()
     assert "kokoro" in backends
 
@@ -98,7 +104,7 @@ def test_backend_config_param_defaults() -> None:
 
 
 async def test_list_voices_returns_catalog() -> None:
-    from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend, _VOICES
+    from gilbert_plugin_kokoro.kokoro_tts import _VOICES, KokoroTTSBackend
 
     backend = KokoroTTSBackend()
     voices = await backend.list_voices()
@@ -127,12 +133,14 @@ async def test_initialize_stores_config() -> None:
     from gilbert_plugin_kokoro.kokoro_tts import KokoroTTSBackend
 
     backend = KokoroTTSBackend()
-    await backend.initialize({
-        "device": "cuda",
-        "default_voice": "bm_george",
-        "speed": 1.25,
-        "preload": False,
-    })
+    await backend.initialize(
+        {
+            "device": "cuda",
+            "default_voice": "bm_george",
+            "speed": 1.25,
+            "preload": False,
+        }
+    )
     assert backend._device == "cuda"
     assert backend._default_voice == "bm_george"
     assert backend._speed == 1.25
@@ -158,11 +166,6 @@ async def test_close_clears_pipelines() -> None:
     backend._pipelines["a"] = object()  # simulate a cached pipeline
     await backend.close()
     assert backend._pipelines == {}
-
-
-import numpy as np
-
-from gilbert.interfaces.tts import AudioFormat
 
 
 def _fake_pcm(seconds: float = 0.25, freq: float = 440.0, sr: int = 24000) -> np.ndarray:
@@ -217,17 +220,11 @@ def test_encode_empty_input_returns_short_output() -> None:
     assert out[:4] == b"RIFF"
 
 
-from unittest.mock import MagicMock, patch
-
-from gilbert.interfaces.tts import SynthesisRequest
-
-
-def _mock_pipeline_yielding(samples_per_chunk: list[int]):
+def _mock_pipeline_yielding(samples_per_chunk: list[int]) -> MagicMock:
     """Build a mock KPipeline whose call returns float32 chunks."""
     rng = np.random.default_rng(0)
     chunks = [
-        (None, None, rng.standard_normal(n).astype(np.float32) * 0.1)
-        for n in samples_per_chunk
+        (None, None, rng.standard_normal(n).astype(np.float32) * 0.1) for n in samples_per_chunk
     ]
     pipeline = MagicMock()
     pipeline.return_value = iter(chunks)
@@ -270,17 +267,13 @@ async def test_synthesize_caches_pipeline_per_language() -> None:
     pipeline_a = _mock_pipeline_yielding([2400])
     pipeline_b = _mock_pipeline_yielding([2400])
 
-    def _build(lang_code: str, device: str):
+    def _build(lang_code: str, device: str) -> MagicMock:
         return pipeline_a if lang_code == "a" else pipeline_b
 
-    pipeline_a.return_value = iter(
-        [(None, None, np.zeros(2400, dtype=np.float32))]
-    )
+    pipeline_a.return_value = iter([(None, None, np.zeros(2400, dtype=np.float32))])
     with patch.object(kt, "_build_pipeline", side_effect=_build) as build:
         await backend.synthesize(SynthesisRequest(text="hi", voice_id="af_heart"))
-        pipeline_a.return_value = iter(
-            [(None, None, np.zeros(2400, dtype=np.float32))]
-        )
+        pipeline_a.return_value = iter([(None, None, np.zeros(2400, dtype=np.float32))])
         await backend.synthesize(SynthesisRequest(text="hi", voice_id="am_adam"))
         await backend.synthesize(SynthesisRequest(text="hi", voice_id="bf_emma"))
 
@@ -315,9 +308,7 @@ async def test_synthesize_unknown_voice_raises_valueerror() -> None:
     backend = KokoroTTSBackend()
     await backend.initialize({})
     with pytest.raises(ValueError, match="Unknown Kokoro voice"):
-        await backend.synthesize(
-            SynthesisRequest(text="x", voice_id="xx_nope")
-        )
+        await backend.synthesize(SynthesisRequest(text="x", voice_id="xx_nope"))
 
 
 async def test_synthesize_preload_builds_default_lang_pipeline() -> None:
