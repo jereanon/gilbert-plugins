@@ -40,7 +40,9 @@ from gilbert.interfaces.messaging import (
     Message,
     MessageDirection,
     MessageStatus,
+    MessageType,
     MessagingBackend,
+    SendResult,
 )
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.tools import ToolParameterType
@@ -138,7 +140,8 @@ class TelnyxMessaging(MessagingBackend):
         body: str,
         from_number: str = "",
         media_urls: list[str] | None = None,
-    ) -> str:
+        preferred_type: MessageType = MessageType.RCS,
+    ) -> SendResult:
         if self._http is None:
             raise RuntimeError("TelnyxMessaging is not initialized")
         if not from_number:
@@ -149,6 +152,12 @@ class TelnyxMessaging(MessagingBackend):
             "from": from_number,
             "to": to,
             "text": body,
+            # Telnyx wants uppercase tier names in the request. Their
+            # API will downgrade automatically (e.g. RCS → SMS when
+            # the recipient isn't RCS-capable) and report the actual
+            # tier back in ``data.type`` on the response — we
+            # normalize that to our lowercase ``MessageType`` enum.
+            "type": preferred_type.value.upper(),
         }
         # MMS attachments — only included when present so plain SMS
         # routes stay on the cheaper path.
@@ -175,14 +184,20 @@ class TelnyxMessaging(MessagingBackend):
             raise RuntimeError(
                 f"Telnyx /v2/messages 200 but missing data.id: {data!r}"
             )
+        actual_type = _normalize_type(
+            msg.get("type"), default=preferred_type.value
+        )
         logger.info(
-            "TelnyxMessaging: sent id=%s to=%s from=%s len=%d",
+            "TelnyxMessaging: sent id=%s to=%s from=%s len=%d "
+            "preferred=%s actual=%s",
             msg_id,
             to,
             from_number,
             len(body),
+            preferred_type.value,
+            actual_type,
         )
-        return msg_id
+        return SendResult(message_id=msg_id, actual_type=actual_type)
 
 
 # ── Webhook parsing / dispatch ────────────────────────────────────────
@@ -198,6 +213,24 @@ _inbound_deliverer: InboundDeliverer | None = None
 def _set_inbound_deliverer(d: InboundDeliverer) -> None:
     global _inbound_deliverer
     _inbound_deliverer = d
+
+
+def _normalize_type(raw: Any, *, default: str) -> str:
+    """Coerce Telnyx's transport-tier label into a ``MessageType``
+    value. Telnyx ships uppercase (``"SMS"`` / ``"MMS"`` / ``"RCS"``);
+    we store lowercase to match the enum.
+
+    Unknown / missing values fall back to ``default`` — preference for
+    outbound (so the SPA badge still renders something useful), empty
+    string for inbound legacy rows.
+    """
+    if not raw:
+        return default
+    candidate = str(raw).strip().lower()
+    try:
+        return str(MessageType(candidate).value)
+    except ValueError:
+        return default
 
 
 async def deliver_messaging_webhook(payload: dict[str, Any]) -> None:
@@ -272,6 +305,11 @@ async def deliver_messaging_webhook(payload: dict[str, Any]) -> None:
         created_at=str(msg.get("received_at") or ""),
         media_urls=media_urls,
         backend="telnyx",
+        # Carrier-reported transport tier — used for the SPA's
+        # per-message badge. Telnyx ships it as ``"SMS"`` / ``"MMS"``
+        # / ``"RCS"`` (uppercase); normalize to lowercase to match
+        # our ``MessageType`` enum values.
+        type=_normalize_type(msg.get("type"), default=""),
     )
 
     try:

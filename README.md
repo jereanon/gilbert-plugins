@@ -45,7 +45,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
-| [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) | — (pure stdlib) | Communication |
+| [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
 | [ntfy](#ntfy) | `PushNotificationBackend "ntfy"` | — (uses `httpx`) | Notifications |
@@ -64,7 +64,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [sonos](#sonos) | `SpeakerBackend "sonos"`, `MusicBackend "sonos"` | `aiosonos`, `zeroconf` | Media |
 | [tavily](#tavily) | `WebSearchBackend "tavily"` | — (uses `httpx`) | Intelligence |
 | [telegram](#telegram) | `PushNotificationBackend "telegram"` | — (uses `httpx`) | Notifications |
-| [telnyx](#telnyx) | `TelephonyBackend "telnyx"` (voice), `MessagingBackend "telnyx"` (SMS) | — (uses `httpx`, `websockets`) | Telephony / Communication |
+| [telnyx](#telnyx) | `TelephonyBackend "telnyx"` (voice), `MessagingBackend "telnyx"` (RCS / MMS / SMS) | — (uses `httpx`, `websockets`) | Telephony / Communication |
 | [tesseract](#tesseract) | `OCRBackend "tesseract"` | `pytesseract` | Intelligence |
 | [unifi](#unifi) | `PresenceBackend "unifi"`, `DoorbellBackend "unifi"` | — (uses `httpx`/`aiohttp`) | Monitoring |
 | [voice-agent](#voice-agent) | `voice_agent` service (wake-word-activated voice conversation, `/voice` SPA page) | — (pure stdlib) | Speech |
@@ -780,13 +780,15 @@ Both backends advertise the same connection parameters so the lights and shades 
 
 ### messaging
 
-Bidirectional SMS / text-message orchestration. Hosts `MessagingService`, the `send_text_message` AI tool, and the `/messages` SPA page. Backend-agnostic — the carrier integration lives in a separate plugin (e.g. [telnyx](#telnyx) contributes `MessagingBackend "telnyx"`).
+Bidirectional text-message orchestration across three transport tiers — **RCS** (modern, rich text + media + read receipts, default), **MMS** (SMS + binary attachments), and **SMS** (plain-text fallback). Hosts `MessagingService`, the `send_text_message` AI tool, and the `/messages` SPA page. Backend-agnostic — the carrier integration lives in a separate plugin (e.g. [telnyx](#telnyx) contributes `MessagingBackend "telnyx"`).
 
 **Service registered** — `MessagingService`, capability `messaging`. Toggleable (default off). Implements `MessagingProvider`, `ToolProvider`, `WsHandlerProvider`, `Configurable`. Persists messages into the `messages` collection; thread grouping is derived at read time so multi-number setups are first-class.
 
-**AI tool** — `send_text_message` (`/msg send <to> <body>`): send a text message to a phone number from the configured Gilbert sender. The tool description discourages markdown and formal sign-offs — SMS-style brevity.
+**Transport tiers** — outbound sends specify a `preferred_type` (defaulting to the service's configured default, `rcs` out of the box). The carrier downgrades to MMS (media + no RCS) or SMS (no media + no RCS) per the recipient's capabilities and reports the actual tier back in `SendResult.actual_type`. That value is stamped onto `Message.type` so the SPA renders a per-message badge (RCS / MMS / SMS) and surfaces unexpected downgrades. Inbound messages carry whatever transport the carrier reports.
 
-**WS RPCs** — `messaging.threads.list`, `messaging.thread.get`, `messaging.send`. Bus events: `messaging.message_received`, `messaging.message_sent`, `messaging.thread_updated`.
+**AI tool** — `send_text_message` (`/msg send <to> <body>`): send a text message to a phone number from the configured Gilbert sender. Optional `message_type` argument (`rcs` / `mms` / `sms`) forces a specific tier — useful when the operator knows the recipient can't handle RCS or wants to keep billing predictable. The tool description discourages markdown and formal sign-offs.
+
+**WS RPCs** — `messaging.threads.list`, `messaging.thread.get`, `messaging.send` (accepts optional `preferred_type`). Bus events: `messaging.message_received`, `messaging.message_sent`, `messaging.thread_updated` (all carry `type`).
 
 **Inbound flow** — the carrier plugin receives the carrier-side webhook (e.g. `/api/telnyx/messages/webhook`), parses into a `Message`, and calls back through the deliverer bound to it at startup. `MessagingService` resolves the `our_number` → `owner_user_id` mapping, persists, fires bus events, and (optionally) routes the message through `AIService.chat()` for an auto-reply.
 
@@ -795,8 +797,9 @@ Bidirectional SMS / text-message orchestration. Hosts `MessagingService`, the `s
 - `backend` — Messaging backend provider (choices come from registered `MessagingBackend`s, default `telnyx`).
 - `from_number` — Shared E.164 sender for outbound messages.
 - `owner_user_id` — Which Gilbert user owns the shared `from_number`. Inbound messages route to this user's threads. Required for inbound to work; outbound works without it.
+- `default_message_type` — Outbound transport preference when the caller doesn't specify one. Defaults `rcs` (modern, rich text + media + read receipts + no segment length cap, end-to-end encrypted with Universal Profile 2.0+). Choices: `rcs` / `mms` / `sms`. Force `sms` to disable RCS globally — useful when your provider prices RCS differently or hasn't rolled it out on your number yet.
 - `auto_reply` — When enabled, Gilbert reads inbound messages and replies via the AI service automatically. Defaults `false` — inbound messages still arrive and appear in the SPA, but the user composes replies manually.
-- `auto_reply_system_prompt` *(AI prompt, multi-line)* — System prompt for the LLM when auto-replying. Tuned for SMS-short tone; lets the LLM stay silent by returning empty text.
+- `auto_reply_system_prompt` *(AI prompt, multi-line)* — System prompt for the LLM when auto-replying. Tuned for texting-short tone; lets the LLM stay silent by returning empty text.
 
 **Carrier-specific** — flattened under `settings.<key>` based on the chosen `backend`. For [telnyx](#telnyx): `settings.api_key`, `settings.messaging_profile_id`.
 
@@ -1303,7 +1306,7 @@ Three integration points Telnyx talks to on Gilbert — two for voice, one for S
 
 All three endpoints must be reachable from Telnyx's network, which means Gilbert needs a publicly-routable HTTPS URL — either an existing reverse-proxy / tunnel (Cloudflared, ngrok, your own ingress) or the ngrok plugin's tunnel service.
 
-**Backends registered** — `TelephonyBackend.backend_name = "telnyx"` (voice) and `MessagingBackend.backend_name = "telnyx"` (SMS / MMS).
+**Backends registered** — `TelephonyBackend.backend_name = "telnyx"` (voice) and `MessagingBackend.backend_name = "telnyx"` (RCS / MMS / SMS — ships `type: "RCS"` to `/v2/messages` by default and reads the carrier-picked actual tier off `data.type` in the response; inbound webhook payloads' `type` is normalized to lowercase to match `MessageType`).
 
 **Configure — voice** (Settings → Phone → backend selector + below)
 

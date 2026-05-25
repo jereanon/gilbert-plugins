@@ -15,8 +15,10 @@ from gilbert.interfaces.messaging import (
     Message,
     MessageDirection,
     MessageStatus,
+    MessageType,
     MessagingBackend,
     MessagingProvider,
+    SendResult,
 )
 
 
@@ -35,6 +37,11 @@ class _FakeBackend(MessagingBackend):
         self.next_id_seq = 0
         self._deliverer: Any = None
         self.fail_next_send = False
+        # When set, the next send returns this as ``actual_type`` to
+        # simulate a carrier downgrade (e.g. RCS → SMS for an
+        # iPhone-without-RCS recipient). ``None`` = echo back the
+        # preferred type the caller asked for.
+        self.next_actual_type: str | None = None
 
     @classmethod
     def backend_config_params(cls):  # type: ignore[override]
@@ -53,12 +60,15 @@ class _FakeBackend(MessagingBackend):
         body: str,
         from_number: str = "",
         media_urls: list[str] | None = None,
-    ) -> str:
+        preferred_type: MessageType = MessageType.RCS,
+    ) -> SendResult:
         if self.fail_next_send:
             self.fail_next_send = False
             raise RuntimeError("simulated carrier failure")
         self.next_id_seq += 1
         msg_id = f"fake_{self.next_id_seq:04d}"
+        actual = self.next_actual_type or preferred_type.value
+        self.next_actual_type = None
         self.sent.append(
             {
                 "id": msg_id,
@@ -66,9 +76,11 @@ class _FakeBackend(MessagingBackend):
                 "from": from_number,
                 "body": body,
                 "media_urls": list(media_urls or []),
+                "preferred_type": preferred_type.value,
+                "actual_type": actual,
             }
         )
-        return msg_id
+        return SendResult(message_id=msg_id, actual_type=actual)
 
     # Custom hook the service calls when wiring inbound delivery.
     def bind_inbound_deliverer(self, deliverer: Any) -> None:
@@ -457,7 +469,19 @@ async def test_tool_visible_after_start_with_backend() -> None:
     assert t.name == "send_text_message"
     assert t.slash_command == "send"
     assert t.slash_help  # non-empty
-    assert {p.name for p in t.parameters} == {"to_number", "body"}
+    assert {p.name for p in t.parameters} == {
+        "to_number",
+        "body",
+        "message_type",
+    }
+    # The transport-tier param must enumerate every MessageType so the
+    # LLM (and the slash-command parser) can't pass a value the
+    # backend rejects.
+    type_param = next(p for p in t.parameters if p.name == "message_type")
+    assert type_param.required is False
+    assert sorted(type_param.enum or []) == sorted(
+        t.value for t in MessageType
+    )
 
 
 @pytest.mark.asyncio
@@ -579,3 +603,264 @@ async def test_auto_reply_silent_when_llm_returns_empty() -> None:
         )
     )
     assert len(backend.sent) == sent_before
+
+
+# ── RCS / transport-tier tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_defaults_preferred_type_to_rcs() -> None:
+    """Out-of-the-box ``default_message_type`` is ``rcs`` — sends with
+    no explicit ``preferred_type`` argument must pass ``RCS`` through
+    to the backend. The carrier handles downgrade."""
+    svc, _, _ = _service_with_backend()
+    await _start_service(svc)
+    backend = svc._backend  # noqa: SLF001
+    assert isinstance(backend, _FakeBackend)
+
+    msg = await svc.send(
+        user_id="usr_alice",
+        to_number="+15555550100",
+        body="hi",
+    )
+
+    assert backend.sent[-1]["preferred_type"] == MessageType.RCS.value
+    assert msg.type == MessageType.RCS.value
+
+
+@pytest.mark.asyncio
+async def test_send_persists_carrier_reported_actual_type_on_downgrade() -> None:
+    """When the carrier downgrades RCS → SMS (recipient isn't
+    RCS-capable), the persisted ``Message.type`` must reflect what
+    actually rode the wire — that's what the SPA badge renders."""
+    svc, _, _ = _service_with_backend()
+    storage, _ = await _start_service(svc)
+    backend = svc._backend  # noqa: SLF001
+    assert isinstance(backend, _FakeBackend)
+    backend.next_actual_type = MessageType.SMS.value
+
+    msg = await svc.send(
+        user_id="usr_alice",
+        to_number="+15555550100",
+        body="hi",
+    )
+
+    assert backend.sent[-1]["preferred_type"] == MessageType.RCS.value
+    assert msg.type == MessageType.SMS.value
+    row = storage.rows[("messages", msg.message_id)]
+    assert row["type"] == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_send_honours_explicit_preferred_type() -> None:
+    """Caller passes ``preferred_type=SMS`` (e.g. forcing the cheap
+    tier on a known no-RCS carrier) — must reach the backend
+    verbatim, not the configured default."""
+    svc, _, _ = _service_with_backend()
+    await _start_service(svc)
+    backend = svc._backend  # noqa: SLF001
+
+    msg = await svc.send(
+        user_id="usr_alice",
+        to_number="+15555550100",
+        body="hi",
+        preferred_type=MessageType.SMS,
+    )
+
+    assert backend.sent[-1]["preferred_type"] == MessageType.SMS.value
+    assert msg.type == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_failed_send_records_preferred_type_on_message() -> None:
+    """Carrier rejection means we never heard back about the actual
+    tier. Stamp the preference on the row so the SPA still has
+    something to render (and the user knows what we tried)."""
+    svc, _, _ = _service_with_backend()
+    storage, _ = await _start_service(svc)
+    backend = svc._backend  # noqa: SLF001
+    assert isinstance(backend, _FakeBackend)
+    backend.fail_next_send = True
+
+    msg = await svc.send(
+        user_id="usr_alice",
+        to_number="+15555550199",
+        body="will fail",
+        preferred_type=MessageType.MMS,
+    )
+
+    assert msg.status == MessageStatus.FAILED.value
+    assert msg.type == MessageType.MMS.value
+    row = storage.rows[("messages", msg.message_id)]
+    assert row["type"] == MessageType.MMS.value
+
+
+@pytest.mark.asyncio
+async def test_config_default_message_type_overrides_rcs_default() -> None:
+    """Operator sets ``default_message_type: sms`` in /settings (e.g.
+    their carrier doesn't charge RCS yet) — sends without an
+    explicit preference must use SMS, not RCS."""
+    from gilbert_plugin_messaging.messaging_service import MessagingService
+
+    svc = MessagingService()
+    storage = _InMemoryStorage()
+    bus = _Bus()
+    config_section = {
+        "enabled": True,
+        "backend": "fake_messaging",
+        "from_number": "+15551234567",
+        "owner_user_id": "usr_alice",
+        "default_message_type": MessageType.SMS.value,
+        "auto_reply": False,
+        "settings": {},
+    }
+
+    class _Cfg:
+        def get(self, path: str) -> Any:
+            return None
+
+        def get_section(self, name: str) -> dict[str, Any]:
+            return dict(config_section) if name == "messaging" else {}
+
+        def get_section_safe(self, name: str) -> dict[str, Any]:
+            return self.get_section(name)
+
+        async def set(self, path: str, value: Any) -> dict[str, Any]:
+            return {}
+
+    await svc.start(
+        _Resolver(
+            entity_storage=storage,
+            event_bus=_BusProvider(bus),
+            configuration=_Cfg(),
+        )
+    )
+    backend = svc._backend  # noqa: SLF001
+    assert isinstance(backend, _FakeBackend)
+
+    msg = await svc.send(
+        user_id="usr_alice",
+        to_number="+15555550100",
+        body="hi",
+    )
+
+    assert backend.sent[-1]["preferred_type"] == MessageType.SMS.value
+    assert msg.type == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_config_default_message_type_invalid_falls_back_to_rcs() -> None:
+    """Garbage in /settings shouldn't break the service. Fall back to
+    the modern default."""
+    from gilbert_plugin_messaging.messaging_service import MessagingService
+
+    svc = MessagingService()
+    storage = _InMemoryStorage()
+    bus = _Bus()
+    config_section = {
+        "enabled": True,
+        "backend": "fake_messaging",
+        "from_number": "+15551234567",
+        "owner_user_id": "usr_alice",
+        "default_message_type": "carrier-pigeon",
+        "auto_reply": False,
+        "settings": {},
+    }
+
+    class _Cfg:
+        def get(self, path: str) -> Any:
+            return None
+
+        def get_section(self, name: str) -> dict[str, Any]:
+            return dict(config_section) if name == "messaging" else {}
+
+        def get_section_safe(self, name: str) -> dict[str, Any]:
+            return self.get_section(name)
+
+        async def set(self, path: str, value: Any) -> dict[str, Any]:
+            return {}
+
+    await svc.start(
+        _Resolver(
+            entity_storage=storage,
+            event_bus=_BusProvider(bus),
+            configuration=_Cfg(),
+        )
+    )
+    assert svc._default_message_type is MessageType.RCS  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_inbound_carrier_reported_type_round_trips_through_storage() -> None:
+    """Inbound message arrives with ``type=sms`` from the carrier —
+    must survive persist + ``get_messages`` so the SPA renders the
+    badge correctly."""
+    svc, _, _ = _service_with_backend(owner_user_id="usr_alice")
+    storage, _ = await _start_service(svc, owner_user_id="usr_alice")
+    backend = svc._backend  # noqa: SLF001
+
+    await backend.simulate_inbound(
+        Message(
+            message_id="inb_typed",
+            user_id="",
+            our_number="+15551234567",
+            other_number="+15555550100",
+            direction=MessageDirection.INBOUND.value,
+            body="legacy carrier",
+            status=MessageStatus.RECEIVED.value,
+            created_at="2099-01-01T00:00:00Z",
+            type=MessageType.SMS.value,
+        )
+    )
+    msgs = await svc.get_messages(
+        user_id="usr_alice", other_number="+15555550100"
+    )
+    assert len(msgs) == 1
+    assert msgs[0].type == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_ws_send_accepts_preferred_type_and_returns_message_type() -> None:
+    """The SPA may pass ``preferred_type`` on the WS frame (e.g. user
+    forces SMS for a known no-RCS contact). Service must forward it
+    and return the carrier-reported actual type."""
+    svc, _, _ = _service_with_backend()
+    await _start_service(svc)
+
+    class _Conn:
+        user_id = "usr_alice"
+
+    result = await svc._ws_send(  # noqa: SLF001
+        _Conn(),
+        {
+            "id": "frame-1",
+            "to_number": "+15555550100",
+            "body": "hi",
+            "preferred_type": MessageType.SMS.value,
+        },
+    )
+    assert result["type"] == "messaging.send.result"
+    assert result["message_type"] == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_ws_send_rejects_unknown_preferred_type() -> None:
+    """Unknown tier label → 400 with a helpful error rather than the
+    backend failing later in the request path."""
+    svc, _, _ = _service_with_backend()
+    await _start_service(svc)
+
+    class _Conn:
+        user_id = "usr_alice"
+
+    result = await svc._ws_send(  # noqa: SLF001
+        _Conn(),
+        {
+            "id": "frame-bad",
+            "to_number": "+15555550100",
+            "body": "hi",
+            "preferred_type": "carrier-pigeon",
+        },
+    )
+    assert result["type"] == "messaging.error"
+    assert result["code"] == 400

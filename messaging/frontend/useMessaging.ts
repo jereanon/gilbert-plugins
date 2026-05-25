@@ -154,6 +154,7 @@ export function useMessaging(): UseMessagingApi {
         media_urls: evt.media_urls || [],
         error: "error" in evt ? evt.error : "",
         backend: "",
+        type: evt.type || "",
       });
       const unsubInbound = subscribe(
         "messaging.message_received",

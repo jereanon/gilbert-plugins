@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
-from gilbert.interfaces.messaging import Message
+from gilbert.interfaces.messaging import Message, MessageType, SendResult
 
 
 # ── send_message ────────────────────────────────────────────────────
@@ -60,18 +60,23 @@ async def test_send_message_posts_v2_messages_and_returns_id() -> None:
         transport=httpx.MockTransport(_handler),
     )
 
-    msg_id = await backend.send_message(
+    result = await backend.send_message(
         to="+15555550100",
         body="hello",
         from_number="+15551234567",
     )
-    assert msg_id == "msg_telnyx_001"
+    assert isinstance(result, SendResult)
+    assert result.message_id == "msg_telnyx_001"
+    # Default preferred_type is RCS — the response didn't echo a
+    # ``type`` field, so the backend falls back to the preference.
+    assert result.actual_type == MessageType.RCS.value
     assert captured["url"].endswith("/v2/messages")
     assert captured["headers"].get("authorization") == "Bearer KEY_test"
     assert captured["json"] == {
         "from": "+15551234567",
         "to": "+15555550100",
         "text": "hello",
+        "type": "RCS",
         "messaging_profile_id": "prof_abc",
     }
 
@@ -136,6 +141,129 @@ async def test_send_message_requires_from_number() -> None:
             body="no sender",
             from_number="",
         )
+
+
+# ── RCS / transport-tier send tests ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_message_request_type_defaults_to_uppercase_rcs() -> None:
+    """Telnyx wants uppercase tier names (``"SMS"`` / ``"MMS"`` /
+    ``"RCS"``). The default ``preferred_type`` is RCS so plain sends
+    must ship ``type: "RCS"`` to the API."""
+    from gilbert_plugin_telnyx.telnyx_messaging import TelnyxMessaging
+
+    captured: dict[str, Any] = {}
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = await _read_json(request)
+        return httpx.Response(
+            200,
+            json={"data": {"id": "rcs_001", "type": "RCS"}},
+        )
+
+    backend = TelnyxMessaging()
+    await backend.initialize({"api_key": "KEY_test"})
+    backend._http = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://api.telnyx.com/v2/",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    result = await backend.send_message(
+        to="+15555550100", body="hi", from_number="+15551234567"
+    )
+    assert captured["json"]["type"] == "RCS"
+    assert result.actual_type == MessageType.RCS.value
+
+
+@pytest.mark.asyncio
+async def test_send_message_forwards_explicit_sms_preference() -> None:
+    """Caller forces SMS (e.g. cheaper tier on a carrier where RCS
+    billing is more expensive). Backend must pipe through the
+    explicit preference instead of the default."""
+    from gilbert_plugin_telnyx.telnyx_messaging import TelnyxMessaging
+
+    captured: dict[str, Any] = {}
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = await _read_json(request)
+        return httpx.Response(
+            200, json={"data": {"id": "sms_001", "type": "SMS"}}
+        )
+
+    backend = TelnyxMessaging()
+    await backend.initialize({"api_key": "KEY_test"})
+    backend._http = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://api.telnyx.com/v2/",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    result = await backend.send_message(
+        to="+15555550100",
+        body="hi",
+        from_number="+15551234567",
+        preferred_type=MessageType.SMS,
+    )
+    assert captured["json"]["type"] == "SMS"
+    assert result.actual_type == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_send_message_reports_carrier_downgrade_in_actual_type() -> None:
+    """Caller asked for RCS; carrier downgraded to SMS because the
+    recipient isn't RCS-capable. The backend must surface the
+    downgrade via ``SendResult.actual_type`` so the SPA badge can
+    show "(downgraded to SMS)"."""
+    from gilbert_plugin_telnyx.telnyx_messaging import TelnyxMessaging
+
+    async def _handler(_request: httpx.Request) -> httpx.Response:
+        # Telnyx echoed back "SMS" even though we asked for "RCS".
+        return httpx.Response(
+            200, json={"data": {"id": "downgraded_001", "type": "SMS"}}
+        )
+
+    backend = TelnyxMessaging()
+    await backend.initialize({"api_key": "KEY_test"})
+    backend._http = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://api.telnyx.com/v2/",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    result = await backend.send_message(
+        to="+15555550100",
+        body="hi",
+        from_number="+15551234567",
+        preferred_type=MessageType.RCS,
+    )
+    assert result.actual_type == MessageType.SMS.value
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_preferred_when_response_omits_type() -> None:
+    """Older Telnyx responses (or mocks) may not echo ``data.type``.
+    Backend must fall back to the caller's preference so callers
+    never see ``actual_type=""`` for a successful send."""
+    from gilbert_plugin_telnyx.telnyx_messaging import TelnyxMessaging
+
+    async def _handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": {"id": "no_type_001"}}
+        )
+
+    backend = TelnyxMessaging()
+    await backend.initialize({"api_key": "KEY_test"})
+    backend._http = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://api.telnyx.com/v2/",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    result = await backend.send_message(
+        to="+15555550100",
+        body="hi",
+        from_number="+15551234567",
+        preferred_type=MessageType.MMS,
+    )
+    assert result.actual_type == MessageType.MMS.value
 
 
 # ── inbound webhook parsing ──────────────────────────────────────────
@@ -225,6 +353,78 @@ async def test_inbound_webhook_extracts_mms_media_urls() -> None:
         "https://example.com/img1.jpg",
         "https://example.com/img2.jpg",
     ]
+
+
+@pytest.mark.asyncio
+async def test_inbound_webhook_captures_carrier_reported_type() -> None:
+    """Inbound payloads carry ``type: "SMS"`` / ``"MMS"`` / ``"RCS"``
+    (uppercase per Telnyx). Backend normalizes to our lowercase enum
+    so ``Message.type`` matches the rest of the codebase."""
+    from gilbert_plugin_telnyx.telnyx_messaging import (
+        _set_inbound_deliverer,
+        deliver_messaging_webhook,
+    )
+
+    captured: list[Message] = []
+
+    async def _deliverer(msg: Message) -> None:
+        captured.append(msg)
+
+    _set_inbound_deliverer(_deliverer)
+
+    await deliver_messaging_webhook(
+        {
+            "data": {
+                "event_type": "message.received",
+                "payload": {
+                    "id": "msg_rcs_in",
+                    "from": {"phone_number": "+15555550100"},
+                    "to": [{"phone_number": "+15551234567"}],
+                    "text": "hey via RCS",
+                    "received_at": "2099-01-01T00:00:00Z",
+                    "type": "RCS",
+                    "media": [],
+                },
+            }
+        }
+    )
+    assert captured[-1].type == MessageType.RCS.value
+
+
+@pytest.mark.asyncio
+async def test_inbound_webhook_unknown_type_leaves_field_empty() -> None:
+    """A carrier ships an unrecognized tier (or omits the field
+    entirely on legacy payloads). Backend records an empty string
+    rather than crashing — the SPA will hide the badge for those
+    rows. Empty-string default is documented on ``Message.type``."""
+    from gilbert_plugin_telnyx.telnyx_messaging import (
+        _set_inbound_deliverer,
+        deliver_messaging_webhook,
+    )
+
+    captured: list[Message] = []
+
+    async def _deliverer(msg: Message) -> None:
+        captured.append(msg)
+
+    _set_inbound_deliverer(_deliverer)
+
+    await deliver_messaging_webhook(
+        {
+            "data": {
+                "event_type": "message.received",
+                "payload": {
+                    "id": "msg_unknown_type",
+                    "from": {"phone_number": "+15555550100"},
+                    "to": [{"phone_number": "+15551234567"}],
+                    "text": "from the future",
+                    "received_at": "2099-01-01T00:00:00Z",
+                    "type": "QUANTUM-MESH",
+                },
+            }
+        }
+    )
+    assert captured[-1].type == ""
 
 
 @pytest.mark.asyncio

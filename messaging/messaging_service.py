@@ -52,6 +52,7 @@ from gilbert.interfaces.messaging import (
     Message,
     MessageDirection,
     MessageStatus,
+    MessageType,
     MessagingBackend,
     MessagingProvider,
     ThreadSummary,
@@ -112,6 +113,10 @@ class MessagingService(Service):
         self._auto_reply_system_prompt: str = _DEFAULT_AUTO_REPLY_PROMPT
         self._owner_user_id: str = ""
         self._config: dict[str, object] = {}
+        # Default outbound transport preference. ``RCS`` per the
+        # modern-first policy; the backend / carrier downgrades to
+        # ``MMS`` (media + no RCS) or ``SMS`` (no media, no RCS).
+        self._default_message_type: MessageType = MessageType.RCS
 
         # --- resolved dependencies ---
         self._resolver: ServiceResolver | None = None
@@ -224,6 +229,24 @@ class MessagingService(Service):
                 default="",
             ),
             ConfigParam(
+                key="default_message_type",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Outbound transport preference when the caller "
+                    "doesn't specify one. ``rcs`` is the modern "
+                    "default (rich text, read receipts, media, no "
+                    "per-segment length cap); the carrier falls "
+                    "back to ``mms`` (media + no RCS) or ``sms`` "
+                    "(no media, no RCS) per the recipient's "
+                    "capabilities. Force ``sms`` to disable RCS "
+                    "globally — useful if your messaging provider "
+                    "charges differently for RCS or doesn't "
+                    "support it for your number yet."
+                ),
+                default=str(MessageType.RCS.value),
+                choices=tuple(t.value for t in MessageType),
+            ),
+            ConfigParam(
                 key="auto_reply",
                 type=ToolParameterType.BOOLEAN,
                 description=(
@@ -279,6 +302,13 @@ class MessagingService(Service):
             section.get("auto_reply_system_prompt")
             or _DEFAULT_AUTO_REPLY_PROMPT
         )
+        # Parse the configured default — fall back to RCS on any
+        # unknown value rather than crashing the service.
+        raw_type = str(section.get("default_message_type") or "").lower()
+        try:
+            self._default_message_type = MessageType(raw_type)
+        except ValueError:
+            self._default_message_type = MessageType.RCS
         self._config = dict(section.get("settings") or {})
 
         backend_name = str(section.get("backend") or self._backend_name)
@@ -345,10 +375,17 @@ class MessagingService(Service):
         body: str,
         from_number: str = "",
         media_urls: list[str] | None = None,
+        preferred_type: MessageType | None = None,
     ) -> Message:
         """Send an outbound message on behalf of ``user_id``. Persists
         + publishes the bus event in addition to handing off to the
-        backend."""
+        backend.
+
+        ``preferred_type`` defaults to the configured
+        ``default_message_type`` (``RCS`` out of the box). The carrier
+        downgrades to ``MMS`` / ``SMS`` per recipient capability — the
+        actual transport the carrier picked is stamped on
+        ``Message.type``."""
         if self._backend is None:
             raise RuntimeError(
                 "Messaging service has no backend configured — "
@@ -363,19 +400,27 @@ class MessagingService(Service):
             raise RuntimeError(
                 "No from_number configured — set messaging.from_number"
             )
+        resolved_pref = preferred_type or self._default_message_type
 
         # Send first; we want the backend-issued id as the row's
         # primary key. On failure we still record a row so the SPA
         # can show the error.
         msg_id = ""
         error = ""
+        # Default the persisted ``type`` to the caller's preference —
+        # on a failed send we never heard back from the carrier, so
+        # preference is the best we have for the SPA badge.
+        actual_type = resolved_pref.value
         try:
-            msg_id = await self._backend.send_message(
+            result = await self._backend.send_message(
                 to=to_number,
                 body=body,
                 from_number=our_number,
                 media_urls=media_urls,
+                preferred_type=resolved_pref,
             )
+            msg_id = result.message_id
+            actual_type = result.actual_type or resolved_pref.value
             status = MessageStatus.SENT.value
         except Exception as exc:
             error = str(exc)
@@ -400,6 +445,7 @@ class MessagingService(Service):
             media_urls=list(media_urls or []),
             error=error,
             backend=self._backend_name,
+            type=actual_type,
         )
         await self._persist(msg)
         await self._publish(
@@ -414,6 +460,7 @@ class MessagingService(Service):
                 "created_at": msg.created_at,
                 "media_urls": msg.media_urls,
                 "error": msg.error,
+                "type": msg.type,
             },
         )
         await self._publish(
@@ -536,6 +583,7 @@ class MessagingService(Service):
                 "status": message.status,
                 "created_at": message.created_at,
                 "media_urls": message.media_urls,
+                "type": message.type,
             },
         )
         await self._publish(
@@ -635,22 +683,27 @@ class MessagingService(Service):
                 slash_group="msg",
                 slash_command="send",
                 slash_help=(
-                    'Send an SMS to a phone number. '
+                    "Send a text to a phone number. "
                     '/msg send "+13035550100" "Running late, be 10 min"'
                 ),
                 description=(
                     "Send a text message to a phone number on the "
                     "user's behalf via the configured messaging "
-                    "provider (SMS). The recipient sees the message "
-                    "from the shared Gilbert sender number."
+                    "provider. The recipient sees the message from "
+                    "the shared Gilbert sender number. The carrier "
+                    "picks the best transport available — RCS for "
+                    "modern recipients (rich text, read receipts, "
+                    "media, no length cap), falling back to MMS or "
+                    "SMS when the recipient isn't RCS-capable."
                     "\n\n"
                     "Keep texts SHORT — one to three sentences max. "
                     "No markdown, no formal sign-offs. If the user "
                     "asked you to relay a specific phrasing, use "
                     "their phrasing verbatim. Otherwise summarize "
-                    "in casual SMS-style language."
+                    "in casual texting-style language."
                     "\n\n"
-                    "Returns the message id. Delivery status arrives "
+                    "Returns the message id and the actual transport "
+                    "tier the carrier picked. Delivery status arrives "
                     "later via the carrier — the tool's success only "
                     "means the carrier accepted the message for "
                     "delivery."
@@ -668,10 +721,26 @@ class MessagingService(Service):
                         name="body",
                         type=ToolParameterType.STRING,
                         description=(
-                            "Message body. Keep short; SMS has a "
-                            "160-char-per-segment soft limit and "
-                            "multi-segment messages bill per segment."
+                            "Message body. Keep short; SMS-tier "
+                            "fallback caps each segment at 160 chars "
+                            "and multi-segment messages bill per "
+                            "segment."
                         ),
+                    ),
+                    ToolParameter(
+                        name="message_type",
+                        type=ToolParameterType.STRING,
+                        description=(
+                            "Preferred transport tier. Defaults to "
+                            "the service's configured default "
+                            '(``rcs`` out of the box). Pass "sms" to '
+                            "force the plain-text fallback (e.g. for "
+                            "carriers where RCS billing is more "
+                            'expensive). Pass "mms" when sending '
+                            "media to a recipient without RCS."
+                        ),
+                        required=False,
+                        enum=[t.value for t in MessageType],
                     ),
                 ],
                 required_role="user",
@@ -701,12 +770,26 @@ class MessagingService(Service):
         body = str(arguments.get("body") or "").strip()
         if not to_number or not body:
             raise ValueError("to_number and body are required")
+        raw_type = str(arguments.get("message_type") or "").strip().lower()
+        preferred: MessageType | None = None
+        if raw_type:
+            try:
+                preferred = MessageType(raw_type)
+            except ValueError:
+                raise ValueError(
+                    f"message_type must be one of "
+                    f"{[t.value for t in MessageType]} (got {raw_type!r})"
+                ) from None
         msg = await self.send(
             user_id=user_id,
             to_number=to_number,
             body=body,
+            preferred_type=preferred,
         )
-        return f"Message sent. id={msg.message_id} status={msg.status}"
+        return (
+            f"Message sent. id={msg.message_id} "
+            f"status={msg.status} type={msg.type or 'unknown'}"
+        )
 
     # ── WsHandlerProvider ───────────────────────────────────────────
 
@@ -765,11 +848,24 @@ class MessagingService(Service):
             return _err(
                 frame, 400, "user_id, to_number, and body are required"
             )
+        raw_type = str(frame.get("preferred_type") or "").strip().lower()
+        preferred: MessageType | None = None
+        if raw_type:
+            try:
+                preferred = MessageType(raw_type)
+            except ValueError:
+                return _err(
+                    frame,
+                    400,
+                    f"preferred_type must be one of "
+                    f"{[t.value for t in MessageType]} (got {raw_type!r})",
+                )
         try:
             msg = await self.send(
                 user_id=user_id,
                 to_number=to,
                 body=body,
+                preferred_type=preferred,
             )
         except RuntimeError as exc:
             return _err(frame, 503, str(exc))
@@ -780,6 +876,7 @@ class MessagingService(Service):
             "ref": frame.get("id"),
             "message_id": msg.message_id,
             "status": msg.status,
+            "message_type": msg.type,
         }
 
 
@@ -803,6 +900,7 @@ def _message_to_row(msg: Message) -> dict[str, Any]:
         "media_urls": list(msg.media_urls),
         "error": msg.error,
         "backend": msg.backend,
+        "type": msg.type,
     }
 
 
@@ -819,6 +917,7 @@ def _row_to_message(row: dict[str, Any]) -> Message:
         media_urls=list(row.get("media_urls") or []),
         error=str(row.get("error") or ""),
         backend=str(row.get("backend") or ""),
+        type=str(row.get("type") or ""),
     )
 
 

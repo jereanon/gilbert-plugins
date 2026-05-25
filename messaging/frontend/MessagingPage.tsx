@@ -56,6 +56,30 @@ const STATUS_TONE: Record<string, string> = {
   failed: "bg-destructive/15 text-destructive",
 };
 
+/**
+ * Per-message transport-tier badge. RCS is the modern carrier-backed
+ * default — when the carrier downgrades to SMS/MMS (recipient isn't
+ * RCS-capable) we want it visually obvious so users can debug
+ * "why isn't this thread showing read receipts?". Empty string =
+ * legacy row before the field existed; we hide the badge entirely.
+ */
+const TYPE_LABEL: Record<string, string> = {
+  rcs: "RCS",
+  mms: "MMS",
+  sms: "SMS",
+};
+
+const TYPE_TONE: Record<string, string> = {
+  // RCS is the modern default — keep its badge subtle so it doesn't
+  // dominate when most messages ride it.
+  rcs: "bg-primary/10 text-primary",
+  // MMS sits between RCS and SMS — slightly warmer than the default.
+  mms: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  // SMS is the legacy fallback — neutral so a downgrade reads as
+  // "less" without screaming "broken".
+  sms: "bg-muted text-muted-foreground",
+};
+
 export function MessagingPage() {
   const navigate = useNavigate();
   const { otherNumber: routeOtherNumber } = useParams();
@@ -301,6 +325,24 @@ function MessageBubble({ message }: { message: MessagingMessage }) {
         <span className="text-[10px] text-muted-foreground">
           {formatTimestamp(message.created_at)}
         </span>
+        {message.type && TYPE_LABEL[message.type] && (
+          <Badge
+            variant="outline"
+            className={cn(
+              "text-[9px] py-0 font-mono tracking-wide",
+              TYPE_TONE[message.type] ?? "",
+            )}
+            title={
+              isUs && message.type === "sms"
+                ? "Carrier downgraded to SMS — recipient isn't RCS-capable"
+                : isUs && message.type === "mms"
+                  ? "MMS — media attachment, no RCS"
+                  : `Sent via ${TYPE_LABEL[message.type]}`
+            }
+          >
+            {TYPE_LABEL[message.type]}
+          </Badge>
+        )}
         {message.status && message.status !== "sent" && message.status !== "received" && (
           <Badge
             variant="outline"
