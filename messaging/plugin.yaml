@@ -1,0 +1,9 @@
+name: messaging
+version: "1.0.0"
+description: "Bidirectional text messaging (SMS / chat) — MessagingService + send_text_message AI tool. Carrier integration is a separate plugin (e.g. telnyx)."
+
+provides:
+  - messaging
+
+requires: []
+depends_on: []

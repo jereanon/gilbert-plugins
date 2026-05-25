@@ -1,0 +1,13 @@
+{
+  "name": "@gilbert-plugin/messaging-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Messaging SPA page — bidirectional SMS threads (thread list + conversation view + compose box).",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}
