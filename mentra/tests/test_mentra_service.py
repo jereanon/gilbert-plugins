@@ -462,7 +462,14 @@ async def test_final_transcription_dispatches_to_ai_with_mapped_user(
     reply_text = display_frames[-1]["layout"]["text"]
     assert "hello from gilbert" in reply_text
     assert len(audio_frames) == 1
-    assert audio_frames[-1]["text"] == "hello from gilbert"
+    # TTS is URL-based — text goes in the audioUrl query param, not
+    # as an inline ``text`` field (the cloud silently drops frames
+    # that pass text inline).
+    from urllib.parse import parse_qs, urlparse
+
+    qs = parse_qs(urlparse(audio_frames[-1]["audioUrl"]).query)
+    assert qs["text"] == ["hello from gilbert"]
+    assert audio_frames[-1]["trackId"] == 2  # TTS track
 
 
 @pytest.mark.asyncio

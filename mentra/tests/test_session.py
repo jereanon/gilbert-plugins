@@ -297,7 +297,15 @@ async def test_dashboard_write_to_main_emits_dashboard_content_update() -> None:
 
 
 @pytest.mark.asyncio
-async def test_speaker_speak_emits_audio_play_request_with_text() -> None:
+async def test_speaker_speak_emits_audio_play_request_with_tts_url() -> None:
+    """The cloud's TTS path is URL-based — ``speak()`` must build a
+    ``/api/tts?text=...`` URL and ship it as ``audioUrl``, NOT pass
+    text inline. Regression test for the first deploy where inline-
+    text frames were accepted at the WS layer but silently dropped
+    by the cloud's audio router (no audio_play_response, no audio,
+    no error frame back)."""
+    from urllib.parse import parse_qs, urlparse
+
     transport = _FakeTransport()
     session = _make_session(transport)
 
@@ -314,8 +322,72 @@ async def test_speaker_speak_emits_audio_play_request_with_text() -> None:
     ]
     assert len(aud_frames) == 1
     af = aud_frames[-1]
-    assert af["text"] == "good morning"
+    # No inline text — must be in the audioUrl query param.
+    assert "text" not in af
+    assert af["audioUrl"].startswith("/api/tts?")
+    parsed = urlparse(af["audioUrl"])
+    qs = parse_qs(parsed.query)
+    assert qs["text"] == ["good morning"]
+    # Required wire fields the cloud will silently drop the frame
+    # without.
     assert af["sessionId"] == "sess_001"
+    assert af["packageName"] == "com.example.gilbert"
+    assert af["requestId"].startswith("audio_req_")
+    assert af["volume"] == 1.0
+    assert af["stopOtherAudio"] is False
+    assert af["trackId"] == 2  # TTS track
+
+
+@pytest.mark.asyncio
+async def test_speaker_play_url_passes_required_wire_fields() -> None:
+    transport = _FakeTransport()
+    session = _make_session(transport)
+
+    connect_task = asyncio.create_task(session.connect())
+    await asyncio.sleep(0)
+    await transport.inject({"type": "tpa_connection_ack", "sessionId": "sess_001"})
+    await connect_task
+
+    await session.speaker.play_url(
+        "https://cdn.example.com/clip.mp3",
+        volume=0.5,
+        stop_other_audio=True,
+    )
+    af = [
+        f for f in transport.sent if f.get("type") == "audio_play_request"
+    ][-1]
+    assert af["audioUrl"] == "https://cdn.example.com/clip.mp3"
+    assert af["volume"] == 0.5
+    assert af["stopOtherAudio"] is True
+    assert af["trackId"] == 0  # default = speaker track
+
+
+@pytest.mark.asyncio
+async def test_speaker_speak_with_voice_settings_serializes_to_query() -> None:
+    """Voice settings go in the URL as a JSON-encoded query param so
+    the cloud's TTS proxy can parse them back."""
+    import json
+    from urllib.parse import parse_qs, urlparse
+
+    transport = _FakeTransport()
+    session = _make_session(transport)
+    connect_task = asyncio.create_task(session.connect())
+    await asyncio.sleep(0)
+    await transport.inject({"type": "tpa_connection_ack", "sessionId": "sess_001"})
+    await connect_task
+
+    await session.speaker.speak(
+        "hello",
+        voice_id="voice_abc",
+        voice_settings={"stability": 0.6, "speed": 1.2},
+    )
+    af = [
+        f for f in transport.sent if f.get("type") == "audio_play_request"
+    ][-1]
+    qs = parse_qs(urlparse(af["audioUrl"]).query)
+    assert qs["voice_id"] == ["voice_abc"]
+    parsed_settings = json.loads(qs["voice_settings"][0])
+    assert parsed_settings == {"stability": 0.6, "speed": 1.2}
 
 
 @pytest.mark.asyncio
