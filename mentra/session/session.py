@@ -361,6 +361,17 @@ class MentraSession:
         self._stopped_handlers.append(handler)
         return lambda: _safe_remove(self._stopped_handlers, handler)
 
+    def on_message(
+        self, msg_type: str, handler: Callable[[dict[str, Any]], Awaitable[None]]
+    ) -> Callable[[], None]:
+        """Register an additional handler for a specific top-level
+        message type. Multiple handlers per type are supported —
+        useful when the service wants to observe events that one of
+        the managers is also handling (e.g. ``audio_play_response``
+        is logged by ``SpeakerManager`` AND recorded in the debug
+        ring buffer by ``MentraService``)."""
+        return self._messages.register(msg_type, handler)
+
     # ── Internal lifecycle ─────────────────────────────────────────
 
     def _register_core_handlers(self) -> None:

@@ -42,8 +42,14 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
+
+# Per-user ring-buffer cap for debug events. 50 is enough to cover the
+# full session-admit → first-utterance → AI-reply → audio-response
+# loop on the in-glasses-app companion webview without burning memory.
+_EVENTS_PER_USER = 50
 
 from gilbert.interfaces.ai import AIProvider
 from gilbert.interfaces.auth import UserContext
@@ -130,6 +136,12 @@ class MentraService(Service):
         # admin SPA can show "connected 4m ago" without reaching
         # into the session object's internals.
         self._connected_at: dict[str, str] = {}
+        # Per-Mentra-user ring buffer of recent events. Used by the
+        # in-glasses-app companion webview to surface live debug
+        # state to the user's phone. Keyed by Mentra ``userId``
+        # (email) so the webview can resolve user from JWT and
+        # show only their own events.
+        self._events: dict[str, deque[dict[str, Any]]] = {}
 
     # ── Service lifecycle ──────────────────────────────────────────
 
@@ -690,6 +702,57 @@ class MentraService(Service):
                 "mentra_user": req.user_id,
             },
         )
+        # Record events for the debug webview. The model + capability
+        # summary tells the user-on-their-phone immediately whether
+        # they paired the right device.
+        self._record_event(
+            req.user_id,
+            "session_started",
+            (
+                f"Connected: {caps.model_name if caps else 'unknown model'} — "
+                f"display={'yes' if caps and caps.has_display else 'no'} "
+                f"camera={'yes' if caps and caps.has_camera else 'no'} "
+                f"mic={'yes' if caps and caps.has_microphone else 'no'} "
+                f"speaker={'yes' if caps and caps.has_speaker else 'no'}"
+            ),
+        )
+        # Register an inbound-message handler for audio_play_response
+        # so the debug webview can see success / failure / silence on
+        # every TTS request — without this the only signal on Mentra
+        # Live's audio issues is "nothing happens", which is
+        # debugging hell.
+        from .protocol.message_types import CloudToAppMessageType
+
+        async def _on_audio_response(message: dict[str, Any]) -> None:
+            request_id = str(message.get("requestId") or "")
+            success = bool(message.get("success", True))
+            if success:
+                self._record_event(
+                    req.user_id,
+                    "audio_play_response",
+                    f"Audio play succeeded (request_id={request_id[:24]}…)",
+                    data={
+                        "request_id": request_id,
+                        "duration_ms": message.get("duration"),
+                    },
+                )
+            else:
+                err = message.get("error") or {}
+                self._record_event(
+                    req.user_id,
+                    "audio_play_response",
+                    f"Audio play FAILED — code={err.get('code')} msg={err.get('message')}",
+                    level="error",
+                    data={
+                        "request_id": request_id,
+                        "error": err,
+                    },
+                )
+
+        session.on_message(
+            CloudToAppMessageType.AUDIO_PLAY_RESPONSE.value,
+            _on_audio_response,
+        )
         # Welcome the user — display + speaker, gated on whichever
         # surfaces the device actually has. Mentra Live has no
         # display (audio is the only feedback channel); Even
@@ -727,11 +790,22 @@ class MentraService(Service):
                     "Mentra welcome speech sent (TTS, blocking) for session=%s",
                     req.session_id,
                 )
+                self._record_event(
+                    req.user_id,
+                    "audio_play_request",
+                    f'Sent welcome TTS: "{welcome_text}"',
+                )
             except Exception:
                 logger.warning(
                     "Mentra welcome speech failed for session=%s",
                     req.session_id,
                     exc_info=True,
+                )
+                self._record_event(
+                    req.user_id,
+                    "audio_play_request",
+                    "Welcome TTS send FAILED",
+                    level="error",
                 )
 
         return WebhookResponse(status="success")
@@ -783,6 +857,11 @@ class MentraService(Service):
                 len(text),
                 text[:100],
             )
+            self._record_event(
+                session.user_id,
+                "transcription_final",
+                f'You said: "{text[:200]}"',
+            )
             await self._dispatch_to_ai(session, user, text)
 
         session.transcription.on_transcription(on_final_transcript)
@@ -795,6 +874,12 @@ class MentraService(Service):
                 session.session_id,
                 code,
                 reason,
+            )
+            self._record_event(
+                session.user_id,
+                "session_closed",
+                f"Disconnected — code={code} reason={reason or '(none)'}",
+                level="warning",
             )
 
         session.on_disconnected(on_disconnect)
@@ -821,10 +906,16 @@ class MentraService(Service):
                 user_ctx=user,
                 system_prompt=self._system_prompt,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Mentra AI dispatch failed for session %s",
                 session.session_id,
+            )
+            self._record_event(
+                session.user_id,
+                "ai_dispatch_failed",
+                f"AI dispatch failed: {exc}",
+                level="error",
             )
             await session.display.show_text_wall(
                 "Gilbert had an error.",
@@ -837,12 +928,23 @@ class MentraService(Service):
                 "Mentra AI returned empty response for session=%s",
                 session.session_id,
             )
+            self._record_event(
+                session.user_id,
+                "ai_reply_empty",
+                "AI returned empty response",
+                level="warning",
+            )
             return
         logger.info(
             "Mentra AI reply — session=%s len=%d preview=%r",
             session.session_id,
             len(reply),
             reply[:100],
+        )
+        self._record_event(
+            session.user_id,
+            "ai_reply",
+            f'Gilbert says: "{reply[:200]}"',
         )
         await self._render_reply(session, reply)
 
@@ -875,6 +977,76 @@ class MentraService(Service):
                 await session.speaker.speak(reply)
             except Exception:
                 logger.debug("Mentra speaker.speak raised", exc_info=True)
+
+    # ── Debug ring buffer (MentraDebugProvider) ──────────────────
+
+    def _record_event(
+        self,
+        mentra_user_id: str,
+        kind: str,
+        message: str,
+        *,
+        level: str = "info",
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Push an event to the per-user ring buffer for the debug
+        webview. No-op if user id is empty (e.g. fired before user
+        resolution). Capped at ``_EVENTS_PER_USER`` entries per user.
+        """
+        if not mentra_user_id:
+            return
+        buf = self._events.get(mentra_user_id)
+        if buf is None:
+            buf = deque(maxlen=_EVENTS_PER_USER)
+            self._events[mentra_user_id] = buf
+        buf.append(
+            {
+                "timestamp": _now_iso(),
+                "kind": kind,
+                "level": level,
+                "message": message,
+                "data": data or {},
+            }
+        )
+
+    def get_recent_events(
+        self, mentra_user_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Implements ``MentraDebugProvider.get_recent_events`` — used
+        by core's ``/api/mentra/debug/events`` route. Returns most-
+        recent events LAST (chronological order)."""
+        buf = self._events.get(mentra_user_id)
+        if buf is None:
+            return []
+        # Slice the deque (oldest → newest), bounded by limit.
+        return list(buf)[-limit:]
+
+    def get_active_session_summary(
+        self, mentra_user_id: str
+    ) -> dict[str, Any] | None:
+        """Implements ``MentraDebugProvider.get_active_session_summary``.
+        Returns the session-id, capabilities, and connection time of
+        the live session for this Mentra user — or ``None`` if no
+        live session exists."""
+        for session_id, session in self._sessions.items():
+            if session.user_id == mentra_user_id:
+                caps = session.capabilities
+                return {
+                    "session_id": session_id,
+                    "mentra_user_id": session.user_id,
+                    "gilbert_user_id": session.gilbert_user_id,
+                    "connected_at": self._connected_at.get(session_id, ""),
+                    "model": caps.model_name if caps else "",
+                    "capabilities": {
+                        "has_display": caps.has_display if caps else False,
+                        "has_camera": caps.has_camera if caps else False,
+                        "has_microphone": caps.has_microphone if caps else False,
+                        "has_speaker": caps.has_speaker if caps else False,
+                    }
+                    if caps
+                    else {},
+                }
+        return None
 
     # ── User mapping ───────────────────────────────────────────────
 
