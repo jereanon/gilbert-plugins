@@ -668,6 +668,20 @@ class MentraService(Service):
 
         self._sessions[req.session_id] = session
         self._connected_at[req.session_id] = _now_iso()
+        caps = session.capabilities
+        logger.info(
+            "Mentra session admitted — session_id=%s mentra_user=%s "
+            "gilbert_user=%s model=%s has_display=%s has_camera=%s "
+            "has_mic=%s has_speaker=%s",
+            req.session_id,
+            req.user_id,
+            gilbert_user.user_id,
+            caps.model_name if caps else "<unknown>",
+            caps.has_display if caps else False,
+            caps.has_camera if caps else False,
+            caps.has_microphone if caps else False,
+            caps.has_speaker if caps else False,
+        )
         await self._publish_bus_event(
             "mentra.session_started",
             {
@@ -681,8 +695,15 @@ class MentraService(Service):
             await session.display.show_text_wall(
                 "Gilbert ready.", duration_ms=3000
             )
+            logger.info(
+                "Mentra welcome card sent for session=%s", req.session_id
+            )
         except Exception:
-            logger.debug("Mentra welcome display failed", exc_info=True)
+            logger.warning(
+                "Mentra welcome display failed for session=%s",
+                req.session_id,
+                exc_info=True,
+            )
 
         return WebhookResponse(status="success")
 
@@ -727,6 +748,12 @@ class MentraService(Service):
             text = (getattr(data, "text", "") or "").strip()
             if not text:
                 return
+            logger.info(
+                "Mentra transcription final — session=%s len=%d text=%r",
+                session.session_id,
+                len(text),
+                text[:100],
+            )
             await self._dispatch_to_ai(session, user, text)
 
         session.transcription.on_transcription(on_final_transcript)
@@ -777,7 +804,17 @@ class MentraService(Service):
             return
         reply = (result.response_text or "").strip()
         if not reply:
+            logger.info(
+                "Mentra AI returned empty response for session=%s",
+                session.session_id,
+            )
             return
+        logger.info(
+            "Mentra AI reply — session=%s len=%d preview=%r",
+            session.session_id,
+            len(reply),
+            reply[:100],
+        )
         await self._render_reply(session, reply)
 
     async def _render_reply(
