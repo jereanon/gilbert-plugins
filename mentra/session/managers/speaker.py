@@ -32,9 +32,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlencode
 
-from ...protocol.message_types import AppToCloudMessageType
+from ...protocol.message_types import (
+    AppToCloudMessageType,
+    CloudToAppMessageType,
+)
 from .base import ManagerDeps
 
 logger = logging.getLogger(__name__)
@@ -56,10 +61,20 @@ class SpeakerManager:
     All methods are fire-and-forget when ``stop_other_audio=False``
     (the default) — they ship the frame and return immediately. The
     cloud handles delivery to the glasses speaker asynchronously.
+
+    Registers a handler for ``audio_play_response`` events so the
+    cloud's success / failure / duration data lands in the logs.
+    Without this, audio failures (bad URL, TTS quota, etc.) were
+    silently dropped — we had no signal on why nothing was playing
+    through the speaker on the first deploy.
     """
 
     def __init__(self, deps: ManagerDeps) -> None:
         self._deps = deps
+        self._cleanup = self._deps.register_message_handler(
+            CloudToAppMessageType.AUDIO_PLAY_RESPONSE.value,
+            self._on_audio_play_response,
+        )
 
     async def play_url(
         self,
@@ -130,10 +145,46 @@ class SpeakerManager:
             "packageName": self._deps.package_name,
             "sessionId": self._deps.get_session_id(),
             "requestId": _request_id(),
+            "timestamp": _iso_now(),
         }
         if track_id is not None:
             payload["trackId"] = int(track_id)
         await self._deps.send_frame(payload)
+
+    async def _on_audio_play_response(self, message: dict[str, Any]) -> None:
+        """Log the cloud's response to our ``audio_play_request``.
+
+        Useful states:
+
+        - ``success: true`` + ``duration`` populated → audio played.
+        - ``success: false`` + ``error.code`` populated → cloud
+          refused the request (bad URL, TTS quota exceeded, etc.).
+          Logged at WARNING so we see it without raising the level.
+        """
+        request_id = str(message.get("requestId") or "")
+        success = bool(message.get("success", True))
+        if success:
+            logger.info(
+                "Mentra audio_play_response — success request_id=%s duration_ms=%s",
+                request_id,
+                message.get("duration"),
+            )
+            return
+        err = message.get("error") or {}
+        logger.warning(
+            "Mentra audio_play_response — FAILED request_id=%s code=%s message=%s",
+            request_id,
+            err.get("code"),
+            err.get("message"),
+        )
+
+
+def _iso_now() -> str:
+    """Wire timestamp — upstream SDK uses ``new Date()`` which
+    serializes to an ISO 8601 string with a ``Z`` suffix. Some
+    cloud-side code paths require the field be present (silently
+    drop requests without it) so we always include it."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _build_audio_play_request(
@@ -157,6 +208,7 @@ def _build_audio_play_request(
         "packageName": package_name,
         "sessionId": session_id,
         "requestId": _request_id(),
+        "timestamp": _iso_now(),
         "audioUrl": audio_url,
         "volume": max(0.0, min(1.0, float(volume))),
         "stopOtherAudio": bool(stop_other_audio),
