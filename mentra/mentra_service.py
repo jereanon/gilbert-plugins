@@ -690,20 +690,42 @@ class MentraService(Service):
                 "mentra_user": req.user_id,
             },
         )
-        # Welcome card on the display so the user knows we're live.
-        try:
-            await session.display.show_text_wall(
-                "Gilbert ready.", duration_ms=3000
-            )
-            logger.info(
-                "Mentra welcome card sent for session=%s", req.session_id
-            )
-        except Exception:
-            logger.warning(
-                "Mentra welcome display failed for session=%s",
-                req.session_id,
-                exc_info=True,
-            )
+        # Welcome the user — display + speaker, gated on whichever
+        # surfaces the device actually has. Mentra Live has no
+        # display (audio is the only feedback channel); Even
+        # Realities G1 has a display but check before assuming
+        # speaker — some SKUs don't ship one. Sending a frame for a
+        # surface the device lacks silently drops at the cloud
+        # without an error response.
+        welcome_text = "Welcome to Gilbert."
+        if caps is None or caps.has_display:
+            try:
+                await session.display.show_text_wall(
+                    welcome_text, duration_ms=3000
+                )
+                logger.info(
+                    "Mentra welcome display sent for session=%s",
+                    req.session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Mentra welcome display failed for session=%s",
+                    req.session_id,
+                    exc_info=True,
+                )
+        if self._tts_via_cloud and (caps is None or caps.has_speaker):
+            try:
+                await session.speaker.speak(welcome_text)
+                logger.info(
+                    "Mentra welcome speech sent for session=%s",
+                    req.session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Mentra welcome speech failed for session=%s",
+                    req.session_id,
+                    exc_info=True,
+                )
 
         return WebhookResponse(status="success")
 

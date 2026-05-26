@@ -456,12 +456,14 @@ async def test_final_transcription_dispatches_to_ai_with_mapped_user(
     audio_frames = [
         f for f in fake.sent if f.get("type") == "audio_play_request"
     ]
-    # First display frame is the "Gilbert ready" welcome from the
-    # session start; the reply frame is the second one.
+    # Expected timeline: welcome display + welcome speech (session
+    # admit), then reply display + reply speech (AI dispatch). Order
+    # of the two welcome frames vs the two reply frames is
+    # deterministic; within each pair the display goes first.
     assert len(display_frames) >= 2
+    assert len(audio_frames) >= 2
     reply_text = display_frames[-1]["layout"]["text"]
     assert "hello from gilbert" in reply_text
-    assert len(audio_frames) == 1
     # TTS is URL-based — text goes in the audioUrl query param, not
     # as an inline ``text`` field (the cloud silently drops frames
     # that pass text inline).
@@ -470,6 +472,10 @@ async def test_final_transcription_dispatches_to_ai_with_mapped_user(
     qs = parse_qs(urlparse(audio_frames[-1]["audioUrl"]).query)
     assert qs["text"] == ["hello from gilbert"]
     assert audio_frames[-1]["trackId"] == 2  # TTS track
+    # Welcome speech is the first audio frame; verify it carries
+    # the right text.
+    welcome_qs = parse_qs(urlparse(audio_frames[0]["audioUrl"]).query)
+    assert welcome_qs["text"] == ["Welcome to Gilbert."]
 
 
 @pytest.mark.asyncio
