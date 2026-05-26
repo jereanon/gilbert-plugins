@@ -156,7 +156,7 @@ class FrigateMQTT:
             kwargs: dict[str, Any] = {
                 "hostname": self._host,
                 "port": self._port,
-                "client_id": self._client_id,
+                "identifier": self._client_id,
             }
             if self._username:
                 kwargs["username"] = self._username

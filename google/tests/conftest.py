@@ -17,6 +17,7 @@ if _pkg_name not in sys.modules:
     sys.modules[_pkg_name] = pkg
 
     for _mod_name in (
+        "google_credentials",
         "google_auth",
         "google_directory",
         "gmail",

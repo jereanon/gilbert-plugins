@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import re
 from collections.abc import Callable
@@ -36,6 +35,14 @@ from ._google_retry import (
     call_with_retry,
     is_transient_http_error,
 )
+from .google_credentials import (
+    GoogleCredentialMode,
+    build_google_credentials,
+    build_google_oauth_authorization_url,
+    exchange_google_oauth_code,
+    google_credential_spec_from_config,
+    require_google_credential_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,18 @@ class GmailBackend(EmailBackend):
     @classmethod
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
+            ConfigParam(
+                key="credential_mode",
+                type=ToolParameterType.STRING,
+                description="Google credential mode. Use oauth_bot for ordinary Gmail accounts.",
+                default=GoogleCredentialMode.OAUTH_BOT.value,
+                choices=(
+                    GoogleCredentialMode.OAUTH_BOT.value,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT.value,
+                    GoogleCredentialMode.SHARED_SERVICE_ACCOUNT.value,
+                ),
+                restart_required=True,
+            ),
             ConfigParam(
                 key="email_address",
                 type=ToolParameterType.STRING,
@@ -68,17 +87,60 @@ class GmailBackend(EmailBackend):
                 description="Email of the user to impersonate via domain-wide delegation.",
                 restart_required=True,
             ),
+            ConfigParam(
+                key="oauth_client_id",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client ID for oauth_bot mode.",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_client_secret",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client secret for oauth_bot mode.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_redirect_uri",
+                type=ToolParameterType.STRING,
+                description="OAuth redirect URI registered for this backend.",
+                default="urn:ietf:wg:oauth:2.0:oob",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_refresh_token",
+                type=ToolParameterType.STRING,
+                description="OAuth refresh token populated by Connect Google.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_auth_code",
+                type=ToolParameterType.STRING,
+                description="Temporary Google OAuth authorization code for Connect Google complete.",
+                sensitive=True,
+                restart_required=True,
+            ),
         ]
 
     @classmethod
     def backend_actions(cls) -> list[ConfigAction]:
         return [
             ConfigAction(
+                key="connect_google",
+                label="Connect Google",
+                description="Open Google's OAuth consent screen for this Gmail backend.",
+            ),
+            ConfigAction(
+                key="connect_google_complete",
+                label="Complete Google connection",
+                description="Exchange oauth_auth_code for a refresh token.",
+            ),
+            ConfigAction(
                 key="test_connection",
                 label="Test connection",
                 description=(
-                    "Fetch the Gmail profile for the delegated user to "
-                    "verify the service account and delegation."
+                    "Fetch the Gmail profile to verify credentials."
                 ),
             ),
         ]
@@ -90,6 +152,10 @@ class GmailBackend(EmailBackend):
     ) -> ConfigActionResult:
         if key == "test_connection":
             return await self._action_test_connection()
+        if key == "connect_google":
+            return self._action_connect_google(payload)
+        if key == "connect_google_complete":
+            return await self._action_connect_google_complete(payload)
         return ConfigActionResult(
             status="error",
             message=f"Unknown action: {key}",
@@ -119,43 +185,90 @@ class GmailBackend(EmailBackend):
             message=f"Connected to Gmail as {email} ({total} messages).",
         )
 
+    def _action_connect_google(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        scopes = self._scopes()
+        client_id = str(cfg.get("oauth_client_id") or "")
+        redirect_uri = str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob")
+        if not client_id:
+            return ConfigActionResult(
+                status="error",
+                message="oauth_client_id is required before connecting Google.",
+            )
+        url = build_google_oauth_authorization_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scopes=scopes,
+        )
+        return ConfigActionResult(
+            status="pending",
+            message="Open Google, approve access, paste the code into oauth_auth_code, then continue.",
+            open_url=url,
+            followup_action="connect_google_complete",
+        )
+
+    async def _action_connect_google_complete(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        auth_code = str(cfg.get("oauth_auth_code") or "")
+        if not auth_code:
+            return ConfigActionResult(
+                status="error",
+                message="Paste the Google authorization code into oauth_auth_code first.",
+            )
+        try:
+            persist = await exchange_google_oauth_code(
+                client_id=str(cfg.get("oauth_client_id") or ""),
+                client_secret=str(cfg.get("oauth_client_secret") or ""),
+                redirect_uri=str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob"),
+                auth_code=auth_code,
+            )
+        except Exception as exc:
+            return ConfigActionResult(status="error", message=f"Google OAuth error: {exc}")
+        persist["credential_mode"] = GoogleCredentialMode.OAUTH_BOT.value
+        return ConfigActionResult(
+            status="ok",
+            message="Google OAuth refresh token saved into the form. Save to persist it.",
+            data={"persist": persist},
+        )
+
     def __init__(self) -> None:
         self._email_address: str = ""
         self._service: Any = None  # gmail API resource
         self._creds: Any = None  # cached credentials so we can rebuild _service
+
+    @staticmethod
+    def _scopes() -> tuple[str, ...]:
+        return (
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
+        )
+
+    @staticmethod
+    def _payload_config(payload: dict[str, Any]) -> dict[str, Any]:
+        cfg = payload.get("config") if isinstance(payload, dict) else None
+        return dict(cfg if isinstance(cfg, dict) else payload)
 
     async def initialize(self, config: dict[str, Any] | None = None) -> None:
         if config is None:
             return
 
         self._email_address = config.get("email_address", "")
-        sa_json = config.get("service_account_json", "")
-        delegated_user = config.get("delegated_user", self._email_address)
-
-        if not sa_json:
-            logger.warning("Gmail backend: no service_account_json configured")
-            return
 
         try:
-            sa_info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-        except json.JSONDecodeError:
-            logger.error("Gmail backend: invalid service_account_json")
-            return
-
-        try:
-            from google.oauth2 import service_account
-
-            scopes = [
-                "https://www.googleapis.com/auth/gmail.modify",
-                "https://www.googleapis.com/auth/gmail.send",
-            ]
-            creds = service_account.Credentials.from_service_account_info(
-                sa_info,
-                scopes=scopes,
+            spec = google_credential_spec_from_config(
+                config,
+                scopes=self._scopes(),
+                legacy_delegated_user=self._email_address,
             )
-            if delegated_user:
-                creds = creds.with_subject(delegated_user)
-            self._creds = creds
+            require_google_credential_mode(
+                spec,
+                supported_modes={
+                    GoogleCredentialMode.OAUTH_BOT,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT,
+                },
+                backend_label="Gmail",
+            )
+            self._creds = build_google_credentials(spec)
 
             self._service = await asyncio.to_thread(self._build_service)
             logger.info("Gmail backend initialized (email=%s)", self._email_address)

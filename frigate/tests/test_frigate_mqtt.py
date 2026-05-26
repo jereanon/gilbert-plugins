@@ -186,5 +186,7 @@ async def test_mqtt_subscribes_to_events_and_available() -> None:
     await asyncio.sleep(0.05)
     await mqtt.stop()
     client = captured["client"]
+    assert client.kwargs["identifier"] == "gilbert-cameras"
+    assert "client_id" not in client.kwargs
     assert "frigate/events" in client.subscribed
     assert "frigate/available" in client.subscribed

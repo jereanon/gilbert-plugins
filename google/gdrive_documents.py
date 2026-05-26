@@ -6,7 +6,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from gilbert.interfaces.configuration import ConfigParam
+from gilbert.interfaces.configuration import ConfigAction, ConfigActionResult, ConfigParam
 from gilbert.interfaces.knowledge import (
     DocumentBackend,
     DocumentContent,
@@ -16,6 +16,15 @@ from gilbert.interfaces.knowledge import (
 from gilbert.interfaces.tools import ToolParameterType
 
 from ._google_retry import call_with_retry
+from .google_credentials import (
+    GoogleCredentialMode,
+    build_google_credentials,
+    build_google_oauth_authorization_url,
+    exchange_google_oauth_code,
+    google_credential_spec_from_config,
+    require_google_credential_mode,
+    service_account_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +109,18 @@ class GoogleDriveDocumentBackend(DocumentBackend):
     def backend_config_params(cls) -> list[ConfigParam]:
         return [
             ConfigParam(
+                key="credential_mode",
+                type=ToolParameterType.STRING,
+                description="Google credential mode. Use oauth_bot for ordinary Google accounts.",
+                default=GoogleCredentialMode.OAUTH_BOT.value,
+                choices=(
+                    GoogleCredentialMode.OAUTH_BOT.value,
+                    GoogleCredentialMode.SHARED_SERVICE_ACCOUNT.value,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT.value,
+                ),
+                restart_required=True,
+            ),
+            ConfigParam(
                 key="service_account_json",
                 type=ToolParameterType.STRING,
                 description="Google service account key (paste JSON content).",
@@ -115,12 +136,79 @@ class GoogleDriveDocumentBackend(DocumentBackend):
                 restart_required=True,
             ),
             ConfigParam(
+                key="oauth_client_id",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client ID for oauth_bot mode.",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_client_secret",
+                type=ToolParameterType.STRING,
+                description="Google OAuth client secret for oauth_bot mode.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_redirect_uri",
+                type=ToolParameterType.STRING,
+                description="OAuth redirect URI registered for this backend.",
+                default="urn:ietf:wg:oauth:2.0:oob",
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_refresh_token",
+                type=ToolParameterType.STRING,
+                description="OAuth refresh token populated by Connect Google.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
+                key="oauth_auth_code",
+                type=ToolParameterType.STRING,
+                description="Temporary Google OAuth authorization code for Connect Google complete.",
+                sensitive=True,
+                restart_required=True,
+            ),
+            ConfigParam(
                 key="folder_id",
                 type=ToolParameterType.STRING,
                 description="Google Drive folder or Shared Drive ID to index.",
                 restart_required=True,
             ),
         ]
+
+    @classmethod
+    def backend_actions(cls) -> list[ConfigAction]:
+        return [
+            ConfigAction(
+                key="connect_google",
+                label="Connect Google",
+                description="Open Google's OAuth consent screen for this Drive backend.",
+            ),
+            ConfigAction(
+                key="connect_google_complete",
+                label="Complete Google connection",
+                description="Exchange oauth_auth_code for a refresh token.",
+            ),
+            ConfigAction(
+                key="test_connection",
+                label="Test connection",
+                description="Verify Google Drive credentials and return the share target if applicable.",
+            ),
+        ]
+
+    async def invoke_backend_action(
+        self,
+        key: str,
+        payload: dict[str, Any],
+    ) -> ConfigActionResult:
+        if key == "connect_google":
+            return self._action_connect_google(payload)
+        if key == "connect_google_complete":
+            return await self._action_connect_google_complete(payload)
+        if key == "test_connection":
+            return await self._action_test_connection(payload)
+        return ConfigActionResult(status="error", message=f"Unknown action: {key}")
 
     def __init__(self, name: str = "gdrive") -> None:
         self._name = name
@@ -133,6 +221,69 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         # Lock to serialize Drive API calls — httplib2 is not thread-safe
         self._api_lock = asyncio.Lock()
 
+    @staticmethod
+    def _scopes() -> tuple[str, ...]:
+        return ("https://www.googleapis.com/auth/drive.readonly",)
+
+    @staticmethod
+    def _payload_config(payload: dict[str, Any]) -> dict[str, Any]:
+        cfg = payload.get("config") if isinstance(payload, dict) else None
+        return dict(cfg if isinstance(cfg, dict) else payload)
+
+    def _action_connect_google(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        client_id = str(cfg.get("oauth_client_id") or "")
+        redirect_uri = str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob")
+        if not client_id:
+            return ConfigActionResult(status="error", message="oauth_client_id is required before connecting Google.")
+        return ConfigActionResult(
+            status="pending",
+            message="Open Google, approve access, paste the code into oauth_auth_code, then continue.",
+            open_url=build_google_oauth_authorization_url(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                scopes=self._scopes(),
+            ),
+            followup_action="connect_google_complete",
+        )
+
+    async def _action_connect_google_complete(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        auth_code = str(cfg.get("oauth_auth_code") or "")
+        if not auth_code:
+            return ConfigActionResult(status="error", message="Paste the Google authorization code into oauth_auth_code first.")
+        try:
+            persist = await exchange_google_oauth_code(
+                client_id=str(cfg.get("oauth_client_id") or ""),
+                client_secret=str(cfg.get("oauth_client_secret") or ""),
+                redirect_uri=str(cfg.get("oauth_redirect_uri") or "urn:ietf:wg:oauth:2.0:oob"),
+                auth_code=auth_code,
+            )
+        except Exception as exc:
+            return ConfigActionResult(status="error", message=f"Google OAuth error: {exc}")
+        persist["credential_mode"] = GoogleCredentialMode.OAUTH_BOT.value
+        return ConfigActionResult(
+            status="ok",
+            message="Google OAuth refresh token saved into the form. Save to persist it.",
+            data={"persist": persist},
+        )
+
+    async def _action_test_connection(self, payload: dict[str, Any]) -> ConfigActionResult:
+        cfg = self._payload_config(payload)
+        spec = google_credential_spec_from_config(cfg, scopes=self._scopes())
+        if spec.mode is GoogleCredentialMode.SHARED_SERVICE_ACCOUNT:
+            email = service_account_email(spec.service_account_json)
+            suffix = f" Share the Drive folder with {email}." if email else ""
+            return ConfigActionResult(status="ok", message=f"Shared service account config is readable.{suffix}")
+        if self._drive is None:
+            return ConfigActionResult(status="error", message="Google Drive backend is not initialized — save and restart before testing the live API.")
+        try:
+            result = await self._call(lambda svc: svc.about().get(fields="user").execute())
+        except Exception as exc:
+            return ConfigActionResult(status="error", message=f"Google Drive API error: {exc}")
+        user = (result.get("user") or {}).get("emailAddress", "(unknown)")
+        return ConfigActionResult(status="ok", message=f"Connected to Google Drive as {user}.")
+
     @property
     def source_id(self) -> str:
         return f"gdrive:{self._name}"
@@ -142,34 +293,27 @@ class GoogleDriveDocumentBackend(DocumentBackend):
         return f"Google Drive: {self._name}"
 
     async def initialize(self, config: dict[str, object]) -> None:
-        import json as _json
-
         self._folder_id = str(config.get("folder_id", "") or config.get("shared_drive_id", ""))
         self._name = str(config.get("name", self._name))
 
-        sa_json = config.get("service_account_json", "")
-        delegated_user = str(config.get("delegated_user", ""))
-
-        if sa_json:
-            try:
-                sa_info = _json.loads(sa_json) if isinstance(sa_json, str) else sa_json
-                from google.oauth2 import service_account
-
-                scopes = ["https://www.googleapis.com/auth/drive.readonly"]
-                creds = service_account.Credentials.from_service_account_info(
-                    sa_info,
-                    scopes=scopes,
-                )
-                if delegated_user:
-                    creds = creds.with_subject(delegated_user)
-                self._creds = creds
-
-                self._drive = await asyncio.to_thread(self._build_service)
-            except Exception:
-                logger.exception("Failed to initialize Google Drive backend '%s'", self._name)
-                return
-        else:
-            logger.warning("Google Drive backend '%s': no credentials configured", self._name)
+        try:
+            spec = google_credential_spec_from_config(
+                dict(config),
+                scopes=self._scopes(),
+            )
+            require_google_credential_mode(
+                spec,
+                supported_modes={
+                    GoogleCredentialMode.OAUTH_BOT,
+                    GoogleCredentialMode.SHARED_SERVICE_ACCOUNT,
+                    GoogleCredentialMode.DELEGATED_SERVICE_ACCOUNT,
+                },
+                backend_label="Google Drive",
+            )
+            self._creds = build_google_credentials(spec)
+            self._drive = await asyncio.to_thread(self._build_service)
+        except Exception:
+            logger.exception("Failed to initialize Google Drive backend '%s'", self._name)
             return
 
         logger.info(

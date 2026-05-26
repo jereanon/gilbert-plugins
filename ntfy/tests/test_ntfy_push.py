@@ -85,7 +85,29 @@ async def test_send_delivers_on_2xx() -> None:
         headers = call_kwargs["headers"]
         assert headers["Priority"] == "3"
         assert headers["Tags"] == "robot"
-        assert headers["Title"] == "Gilbert · Test"
+        assert headers["Title"] == "Gilbert - Test"
+        headers["Title"].encode("ascii")
+    finally:
+        await backend.close()
+
+
+async def test_send_sanitizes_non_ascii_title_for_http_headers() -> None:
+    backend = NtfyPush()
+    await backend.initialize({})
+    try:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(
+            return_value=httpx.Response(
+                status_code=200,
+                request=httpx.Request("POST", "https://ntfy.sh/x"),
+            )
+        )
+        mock_client.aclose = AsyncMock()
+        backend._client = mock_client
+        await backend.send(_make_destination(), _make_message())
+        title = mock_client.post.call_args.kwargs["headers"]["Title"]
+        assert title == "Gilbert - Test"
+        title.encode("ascii")
     finally:
         await backend.close()
 
@@ -328,6 +350,9 @@ async def test_test_connection_happy_path() -> None:
             "test_connection", {"topic": "test-x82js"}
         )
         assert result.status == "ok"
+        title = mock_client.post.call_args.kwargs["headers"]["Title"]
+        assert title == "Gilbert - Test"
+        title.encode("ascii")
     finally:
         await backend.close()
 
@@ -368,4 +393,3 @@ async def test_tag_map_for_source(source: str, expected: str) -> None:
     from gilbert_plugin_ntfy.ntfy_push import _ntfy_tag_for_source
 
     assert _ntfy_tag_for_source(source) == expected
-
