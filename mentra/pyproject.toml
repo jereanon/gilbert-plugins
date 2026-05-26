@@ -1,0 +1,13 @@
+[project]
+name = "gilbert-plugin-mentra"
+version = "0.1.0"
+description = "Mentra smart-glasses platform — voice assistant + dashboard on MentraOS"
+requires-python = ">=3.12"
+# ``websockets`` is already a top-level Gilbert dep (used by the voice
+# brain). We pin the same floor so we don't drift accidentally.
+dependencies = [
+    "websockets>=12.0",
+]
+
+[tool.uv]
+package = false

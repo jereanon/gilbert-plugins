@@ -45,6 +45,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
+| [mentra](#mentra) | `mentra` service (`MentraService` + `mentra_webhook` capability) — Gilbert on Mentra smart glasses (Even Realities G1, Vuzix Z100, Mentra Live) | `websockets>=12` | Wearables |
 | [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
@@ -777,6 +778,50 @@ Both backends advertise the same connection parameters so the lights and shades 
 **Config action** — `test_connection`: connects to the repeater and reports the discovered light + shade counts.
 
 **Third-party deps** — `pylutron>=0.4.1`.
+
+---
+
+### mentra
+
+Smart-glasses platform — connects Gilbert to [MentraOS](https://mentra.glass), the manufacturer-agnostic smart-glasses OS. Same app runs across Even Realities G1, Vuzix Z100, Mentra Live, and future devices. The plugin is a **Python port of the upstream TypeScript `@mentra/sdk`** — JSON-over-WebSocket protocol layer + per-feature managers — so the entire integration lives in-process inside Gilbert with no Node sidecar.
+
+**Service registered** — `MentraService`, capabilities `mentra` + `mentra_webhook` + `ws_handlers`. Toggleable (default off). Implements `Configurable` + the `MentraWebhookEndpoint` Protocol that core's `/api/mentra/webhook` route resolves. Per-session state isolated by Mentra `sessionId`; no module-level mutable state.
+
+**Architecture (inverted from carrier plugins)** — Mentra Cloud is the initiator: user launches the Gilbert app from their phone, cloud POSTs a `session_request` webhook to our app, the plugin dials BACK to the cloud-supplied `websocketUrl` and authenticates via `x-api-key` header + a `tpa_connection_init` first frame. Cloud responds with `tpa_connection_ack` carrying current settings + device capabilities. Bidirectional JSON thereafter (binary frames for raw PCM audio in both directions).
+
+**Per-session flow**
+1. Webhook arrives → service looks up Mentra `userId` (email) in the `mentra_user_mappings` collection → refuses if no mapping (no auto-create).
+2. `WebSocketTransport` opens the back-channel; `MentraSession` runs the handshake.
+3. Cloud-side capabilities (`hasDisplay`, `hasCamera`, `hasMicrophone`, …) populate `session.capabilities`; manager methods that don't apply on a given device degrade gracefully.
+4. Transcription stream subscribed automatically; only `isFinal=True` finals dispatch into `AIService.chat(user_ctx=<mapped UserContext>)`. The system prompt biases the LLM toward glasses-appropriate brevity.
+5. AI reply rendered to the heads-up display via `session.display.show_text_wall` AND spoken via cloud TTS through `session.speaker.speak`.
+
+**Managers shipped in v1**
+- `session.transcription.on_transcription(handler)` — final + interim transcripts
+- `session.button.on_button_press(handler)` — short / long press events
+- `session.display.show_text_wall / show_double_text_wall / show_reference_card / show_bitmap / clear` — foreground display
+- `session.dashboard.write_to_main / write_to_expanded / write` — persistent glance area
+- `session.speaker.speak / play_url / stop` — cloud-side TTS + audio URL playback
+
+Camera, LED, location, and livestream managers are stubbed for follow-up — the protocol layer carries all the message-type enums + stream definitions, only the wrapper classes need adding. Audio chunk streaming (binary PCM frames in / out) is plumbed at the transport layer but no manager surfaces it yet.
+
+**Configure** (Settings → Mentra → Mentra)
+- `enabled` — Toggle the service on. Defaults `false`.
+- `api_key` *(sensitive)* — Mentra app API key from the MentraOS developer console. Sent in the WebSocket upgrade headers (`x-api-key`) and the first JSON frame to authenticate this app instance.
+- `package_name` — Reverse-DNS app identifier registered in the Mentra developer console (e.g. `com.example.gilbert`).
+- `tts_via_cloud` — When enabled (default), AI replies are spoken via Mentra Cloud's built-in TTS. Disable to suppress audio output if you want to wire TTS through a different Gilbert speaker later.
+- `display_duration_ms` — How long an AI reply stays on the heads-up display before auto-clearing (default `8000`, `0` for indefinite).
+- `system_prompt` *(AI prompt, multi-line)* — System prompt the LLM uses for glasses-originated requests. Tuned for brevity (small display, audio readback).
+
+**User mappings** — Operators add rows to the `mentra_user_mappings` collection mapping each authorized Mentra email to a Gilbert user. Sessions for unmapped Mentra users are refused at the webhook stage. (A future UI panel will manage this; for now use the SPA's entity-store admin tools or seed via `gilbert.yaml`.)
+
+**Plugin UI** — `/mentra` admin page (`required_role="admin"`) for managing user mappings + watching live session activity. Backend-loaded today; SPA panel ships in a follow-up.
+
+**Webhook URL** — Configure your Mentra developer console to POST session lifecycle events to `<public-url>/api/mentra/webhook`. The route is mounted by core; the plugin only owns the `mentra_webhook` capability that dispatches the payloads.
+
+**Third-party deps** — `websockets>=12` (already a Gilbert dep, used by the voice brain). No native code, no MP3 encoder yet (deferred until SpeakerManager-side TTS lands).
+
+**Reference** — Upstream SDK source: [`Mentra-Community/MentraOS/cloud/packages/sdk`](https://github.com/Mentra-Community/MentraOS/tree/dev/cloud/packages/sdk). MIT license; the Python port mirrors message-type / stream-type / layout-type names verbatim so cross-referencing the canonical client when debugging a protocol mismatch stays trivial.
 
 ---
 
