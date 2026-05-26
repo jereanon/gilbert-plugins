@@ -46,8 +46,12 @@ from ..protocol.frames import (
 from ..protocol.message_types import CloudToAppMessageType
 from .managers import (
     ButtonManager,
+    CameraManager,
     DashboardManager,
     DisplayManager,
+    LedManager,
+    LocationManager,
+    MicManager,
     SpeakerManager,
     TranscriptionManager,
 )
@@ -218,9 +222,9 @@ class _SubscriptionState:
 class MentraSession:
     """One Mentra Cloud session.
 
-    Owns one ``Transport`` and the per-feature managers
-    (transcription, button, display, dashboard, speaker). The
-    plugin's service layer constructs one of these per inbound
+    Owns one ``Transport`` and the per-feature managers (transcription,
+    button, display, dashboard, speaker, mic, location, camera, LED).
+    The plugin's service layer constructs one of these per inbound
     ``session_request`` webhook and tears it down on the matching
     ``stop_request`` (or permanent disconnect).
     """
@@ -243,9 +247,15 @@ class MentraSession:
             Callable[[int, str], Awaitable[None]]
         ] = []
         self._stopped_handlers: list[Callable[[str], Awaitable[None]]] = []
+        # Reconnect state — currently used only to mark a session
+        # PERMANENTLY closed (e.g. RECONNECT_REJECTED with NOT_RUNNING
+        # / BOOT_TIMEOUT). Cloud re-fires the webhook on the next
+        # user-initiated open, so we don't need full auto-reconnect.
+        self._permanent: bool = False
 
         # Wire transport callbacks into our dispatch.
         self._transport.on_text(self._on_text)
+        self._transport.on_binary(self._on_binary)
         self._transport.on_close(self._on_close)
         self._transport.on_error(self._on_error)
 
@@ -264,6 +274,10 @@ class MentraSession:
         self.display = DisplayManager(deps)
         self.dashboard = DashboardManager(deps)
         self.speaker = SpeakerManager(deps)
+        self.mic = MicManager(deps)
+        self.location = LocationManager(deps)
+        self.camera = CameraManager(deps)
+        self.led = LedManager(deps)
 
         # Register the core handlers that drive lifecycle state.
         self._register_core_handlers()
@@ -374,12 +388,35 @@ class MentraSession:
             CloudToAppMessageType.CONNECTION_ERROR.value,
             self._on_connection_error,
         )
+        # Reconnect outcomes — cloud emits these in response to our
+        # ``reconnect`` frame after a transport drop. We don't fire
+        # reconnects automatically (the cloud re-fires the webhook
+        # for any user-initiated open), so these are mostly defensive
+        # — if a future ``reconnect()`` path goes in, the handlers
+        # already wire the right cleanup.
+        self._messages.register(
+            CloudToAppMessageType.RECONNECT_REJECTED.value,
+            self._on_reconnect_rejected,
+        )
+        self._messages.register(
+            CloudToAppMessageType.RECONNECT_DEFERRED.value,
+            self._on_reconnect_deferred,
+        )
 
     async def _on_text(self, raw: str) -> None:
         frame = parse_frame(raw)
         if not frame:
             return
         await self._messages.dispatch(frame)
+
+    async def _on_binary(self, data: bytes) -> None:
+        """Binary frames carry mic audio (16 kHz mono 16-bit PCM).
+        Mentra's protocol doesn't currently multiplex multiple
+        binary streams on one connection, so we forward every
+        binary frame to ``MicManager`` and let it decide whether to
+        dispatch (it skips when no ``on_audio_chunk`` subscriber is
+        registered)."""
+        await self.mic.handle_binary_audio(data)
 
     async def _on_close(self, code: int, reason: str) -> None:
         # Mark connected event so a pending connect() raises rather
@@ -393,6 +430,48 @@ class MentraSession:
 
     async def _on_error(self, exc: BaseException) -> None:
         logger.error("Mentra transport error: %s", exc)
+
+    async def _on_reconnect_rejected(self, message: dict[str, Any]) -> None:
+        """Cloud refused our reconnect attempt. ``NOT_RUNNING`` /
+        ``BOOT_TIMEOUT`` mean the original session is unrecoverable
+        — close the transport and let the service layer drop us
+        from the registry. Other codes are transient and the cloud
+        will let us retry; we don't reattempt automatically because
+        Mentra Cloud re-fires the webhook on the user's next open."""
+        code = str(message.get("code") or "")
+        msg = str(message.get("message") or f"reconnect rejected: {code}")
+        permanent = code in ("NOT_RUNNING", "BOOT_TIMEOUT")
+        logger.info(
+            "Mentra reconnect rejected: code=%r permanent=%s msg=%s",
+            code,
+            permanent,
+            msg,
+        )
+        if permanent:
+            self._permanent = True
+            self._connected.set()
+            await self._transport.close(code=1000, reason=msg[:120])
+
+    async def _on_reconnect_deferred(self, message: dict[str, Any]) -> None:
+        """Cloud is asking us to wait before retrying — it'll be
+        ready for us again within ``timeoutMs``. v1 just logs +
+        keeps the transport open; if the user takes another action
+        the cloud will eventually re-fire the webhook."""
+        try:
+            timeout_ms = int(message.get("timeoutMs") or 30000)
+        except (TypeError, ValueError):
+            timeout_ms = 30000
+        logger.info(
+            "Mentra reconnect deferred for %dms", timeout_ms
+        )
+
+    @property
+    def is_permanently_closed(self) -> bool:
+        """``True`` after the cloud signalled a permanent rejection
+        (e.g. ``RECONNECT_REJECTED`` with ``NOT_RUNNING``). The
+        service layer uses this to decide whether to keep the
+        session in its registry or drop it."""
+        return self._permanent
 
     async def _on_data_stream(self, message: dict[str, Any]) -> None:
         await self._streams.handle(message)

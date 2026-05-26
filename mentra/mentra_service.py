@@ -41,6 +41,8 @@ meet.
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from gilbert.interfaces.ai import AIProvider
@@ -123,6 +125,11 @@ class MentraService(Service):
 
         # ── Live session registry — keyed by Mentra sessionId ─────
         self._sessions: dict[str, MentraSession] = {}
+        # Tracks when each live session was admitted (ISO8601 UTC).
+        # Surfaced via the ``mentra.sessions.list`` WS RPC so the
+        # admin SPA can show "connected 4m ago" without reaching
+        # into the session object's internals.
+        self._connected_at: dict[str, str] = {}
 
     # ── Service lifecycle ──────────────────────────────────────────
 
@@ -140,6 +147,264 @@ class MentraService(Service):
                 "Even Realities G1, Vuzix Z100, Mentra Live."
             ),
         )
+
+    # ── WsHandlerProvider ──────────────────────────────────────────
+
+    def get_ws_handlers(self) -> dict[str, Any]:
+        """RPC handlers backing the admin SPA panel at ``/mentra``.
+
+        Five frame types: list/create/update/delete on the user-mapping
+        collection, plus a read-only ``sessions.list`` for the live
+        session table. All five are admin-only — the panel is for
+        the operator who configured the integration, not end users.
+        """
+        return {
+            "mentra.mappings.list": self._ws_mappings_list,
+            "mentra.mappings.create": self._ws_mappings_create,
+            "mentra.mappings.update": self._ws_mappings_update,
+            "mentra.mappings.delete": self._ws_mappings_delete,
+            "mentra.sessions.list": self._ws_sessions_list,
+        }
+
+    async def _ws_mappings_list(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        gate = _require_admin(conn, frame)
+        if gate is not None:
+            return gate
+        if self._storage is None:
+            return _err(frame, 503, "storage unavailable")
+        try:
+            rows = await self._storage.backend.query(
+                Query(collection=_MAPPINGS_COLLECTION, limit=10_000)
+            )
+        except Exception:
+            logger.exception("Mentra mappings list failed")
+            return _err(frame, 500, "failed to list mappings")
+        rows.sort(key=lambda r: str(r.get("created_at") or ""))
+        return {
+            "type": "mentra.mappings.list.result",
+            "ref": frame.get("id"),
+            "mappings": [_mapping_to_dict(r) for r in rows],
+        }
+
+    async def _ws_mappings_create(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        gate = _require_admin(conn, frame)
+        if gate is not None:
+            return gate
+        if self._storage is None:
+            return _err(frame, 503, "storage unavailable")
+        mentra_user_id = str(frame.get("mentra_user_id") or "").strip()
+        gilbert_user_id = str(frame.get("gilbert_user_id") or "").strip()
+        if not mentra_user_id or not gilbert_user_id:
+            return _err(
+                frame,
+                400,
+                "mentra_user_id and gilbert_user_id are required",
+            )
+        display_name = str(frame.get("display_name") or "").strip()
+        roles_raw = frame.get("roles") or ["user"]
+        if not isinstance(roles_raw, list):
+            return _err(frame, 400, "roles must be a list of strings")
+        roles = [str(r) for r in roles_raw if str(r).strip()]
+        if not roles:
+            roles = ["user"]
+
+        # Refuse to silently overwrite an existing mapping for the
+        # same Mentra account — the admin almost certainly meant
+        # "edit" rather than "create".
+        try:
+            existing = await self._storage.backend.query(
+                Query(
+                    collection=_MAPPINGS_COLLECTION,
+                    filters=[
+                        Filter(
+                            field="mentra_user_id",
+                            op=FilterOp.EQ,
+                            value=mentra_user_id,
+                        ),
+                    ],
+                    limit=1,
+                )
+            )
+        except Exception:
+            logger.exception("Mentra mapping pre-check query failed")
+            return _err(frame, 500, "storage error")
+        if existing:
+            return _err(
+                frame,
+                409,
+                f"mapping for {mentra_user_id!r} already exists",
+            )
+
+        entity_id = f"map_{uuid.uuid4().hex[:16]}"
+        row = {
+            "id": entity_id,
+            "mentra_user_id": mentra_user_id,
+            "gilbert_user_id": gilbert_user_id,
+            "display_name": display_name or mentra_user_id,
+            "roles": roles,
+            "created_at": _now_iso(),
+        }
+        try:
+            await self._storage.backend.put(
+                _MAPPINGS_COLLECTION, entity_id, row
+            )
+        except Exception:
+            logger.exception(
+                "Mentra mapping create persist failed for %s",
+                mentra_user_id,
+            )
+            return _err(frame, 500, "failed to persist mapping")
+        return {
+            "type": "mentra.mappings.create.result",
+            "ref": frame.get("id"),
+            "mapping": _mapping_to_dict(row),
+        }
+
+    async def _ws_mappings_update(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        gate = _require_admin(conn, frame)
+        if gate is not None:
+            return gate
+        if self._storage is None:
+            return _err(frame, 503, "storage unavailable")
+        # ``mapping_id`` not ``id`` — ``id`` on the frame is reserved
+        # for the RPC envelope's correlation id (echoed as ``ref``).
+        entity_id = str(frame.get("mapping_id") or "").strip()
+        if not entity_id:
+            return _err(frame, 400, "mapping_id is required")
+        try:
+            existing = await self._storage.backend.get(
+                _MAPPINGS_COLLECTION, entity_id
+            )
+        except Exception:
+            logger.exception(
+                "Mentra mapping fetch failed for id=%s", entity_id
+            )
+            return _err(frame, 500, "storage error")
+        if existing is None:
+            return _err(frame, 404, f"mapping {entity_id!r} not found")
+
+        merged = dict(existing)
+        if "mentra_user_id" in frame:
+            merged["mentra_user_id"] = str(
+                frame.get("mentra_user_id") or ""
+            ).strip()
+        if "gilbert_user_id" in frame:
+            merged["gilbert_user_id"] = str(
+                frame.get("gilbert_user_id") or ""
+            ).strip()
+        if "display_name" in frame:
+            merged["display_name"] = str(
+                frame.get("display_name") or ""
+            ).strip()
+        if "roles" in frame:
+            roles_raw = frame.get("roles") or []
+            if not isinstance(roles_raw, list):
+                return _err(
+                    frame, 400, "roles must be a list of strings"
+                )
+            roles = [str(r) for r in roles_raw if str(r).strip()]
+            merged["roles"] = roles or ["user"]
+        if not merged.get("mentra_user_id") or not merged.get(
+            "gilbert_user_id"
+        ):
+            return _err(
+                frame,
+                400,
+                "mentra_user_id and gilbert_user_id must be non-empty",
+            )
+        # Preserve identity + created_at across the merge.
+        merged["id"] = entity_id
+        merged.setdefault("created_at", _now_iso())
+        try:
+            await self._storage.backend.put(
+                _MAPPINGS_COLLECTION, entity_id, merged
+            )
+        except Exception:
+            logger.exception(
+                "Mentra mapping update persist failed for id=%s",
+                entity_id,
+            )
+            return _err(frame, 500, "failed to persist mapping")
+        return {
+            "type": "mentra.mappings.update.result",
+            "ref": frame.get("id"),
+            "mapping": _mapping_to_dict(merged),
+        }
+
+    async def _ws_mappings_delete(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        gate = _require_admin(conn, frame)
+        if gate is not None:
+            return gate
+        if self._storage is None:
+            return _err(frame, 503, "storage unavailable")
+        # ``mapping_id`` not ``id`` — see _ws_mappings_update.
+        entity_id = str(frame.get("mapping_id") or "").strip()
+        if not entity_id:
+            return _err(frame, 400, "mapping_id is required")
+        try:
+            await self._storage.backend.delete(
+                _MAPPINGS_COLLECTION, entity_id
+            )
+        except Exception:
+            logger.exception(
+                "Mentra mapping delete failed for id=%s", entity_id
+            )
+            return _err(frame, 500, "failed to delete mapping")
+        return {
+            "type": "mentra.mappings.delete.result",
+            "ref": frame.get("id"),
+            "status": "ok",
+        }
+
+    async def _ws_sessions_list(
+        self, conn: Any, frame: dict[str, Any]
+    ) -> dict[str, Any]:
+        gate = _require_admin(conn, frame)
+        if gate is not None:
+            return gate
+        sessions: list[dict[str, Any]] = []
+        for sid, session in self._sessions.items():
+            caps = session.capabilities
+            caps_dict: dict[str, Any] = {}
+            if caps is not None:
+                caps_dict = {
+                    "modelName": caps.model_name,
+                    "hasCamera": caps.has_camera,
+                    "hasDisplay": caps.has_display,
+                    "hasMicrophone": caps.has_microphone,
+                    "hasSpeaker": caps.has_speaker,
+                    "hasImu": caps.has_imu,
+                    "hasButton": caps.has_button,
+                    "hasLight": caps.has_light,
+                    "hasWifi": caps.has_wifi,
+                }
+            sessions.append(
+                {
+                    "session_id": sid,
+                    "mentra_user_id": session.user_id,
+                    "gilbert_user_id": session.gilbert_user_id,
+                    "connected_at": self._connected_at.get(sid, ""),
+                    "capabilities": caps_dict,
+                }
+            )
+        # Most-recently-connected first so the SPA's top row is the
+        # session the admin is most likely diagnosing.
+        sessions.sort(
+            key=lambda s: str(s.get("connected_at") or ""), reverse=True
+        )
+        return {
+            "type": "mentra.sessions.list.result",
+            "ref": frame.get("id"),
+            "sessions": sessions,
+        }
 
     async def start(self, resolver: ServiceResolver) -> None:
         self._resolver = resolver
@@ -191,6 +456,7 @@ class MentraService(Service):
                     sid,
                 )
         self._sessions.clear()
+        self._connected_at.clear()
 
     # ── Configurable ───────────────────────────────────────────────
 
@@ -357,6 +623,7 @@ class MentraService(Service):
         # Tear down any existing session with the same id (cloud
         # sometimes re-fires the webhook after a transient drop).
         old = self._sessions.pop(req.session_id, None)
+        self._connected_at.pop(req.session_id, None)
         if old is not None:
             try:
                 await old.disconnect()
@@ -400,6 +667,7 @@ class MentraService(Service):
             )
 
         self._sessions[req.session_id] = session
+        self._connected_at[req.session_id] = _now_iso()
         await self._publish_bus_event(
             "mentra.session_started",
             {
@@ -423,6 +691,7 @@ class MentraService(Service):
     ) -> WebhookResponse:
         req = _parse_stop_request(payload)
         session = self._sessions.pop(req.session_id, None)
+        self._connected_at.pop(req.session_id, None)
         if session is not None:
             try:
                 await session.disconnect()
@@ -464,6 +733,7 @@ class MentraService(Service):
 
         async def on_disconnect(code: int, reason: str) -> None:
             self._sessions.pop(session.session_id, None)
+            self._connected_at.pop(session.session_id, None)
             logger.info(
                 "Mentra session %s closed: code=%s reason=%r",
                 session.session_id,
@@ -644,6 +914,79 @@ def _parse_stop_request(payload: dict[str, object]) -> StopWebhookRequest:
         timestamp=str(payload.get("timestamp") or ""),
         reason=reason,
     )
+
+
+def _now_iso() -> str:
+    """ISO8601 UTC timestamp with a trailing ``Z`` rather than the
+    ``+00:00`` Python prints by default — keeps the wire format
+    consistent with the messaging service and SPA-side parsers."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _mapping_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a stored mapping row to the WS wire shape.
+
+    The storage layer is permissive (any JSON-serializable dict). The
+    SPA expects every field present with sensible defaults — this
+    keeps the TypeScript types tight without forcing the SPA to
+    handle ``undefined`` everywhere."""
+    roles_raw = row.get("roles") or []
+    if isinstance(roles_raw, (list, tuple, set, frozenset)):
+        roles = [str(r) for r in roles_raw]
+    else:
+        roles = [str(roles_raw)]
+    return {
+        "id": str(row.get("id") or ""),
+        "mentra_user_id": str(row.get("mentra_user_id") or ""),
+        "gilbert_user_id": str(row.get("gilbert_user_id") or ""),
+        "display_name": str(row.get("display_name") or ""),
+        "roles": roles,
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+def _require_admin(
+    conn: Any, frame: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return an error frame if the connection isn't an admin, else
+    ``None`` (= proceed).
+
+    Checks the connection's role set per the user prompt's contract
+    (``"admin"`` in ``conn.roles``). Falls back to the canonical
+    numeric ``user_level <= 0`` check the rest of the codebase uses,
+    so we accept either signal — useful for fakes in tests and for
+    forward-compat if the role taxonomy evolves."""
+    roles = getattr(conn, "roles", None)
+    if roles is None:
+        roles = getattr(conn, "user_roles", frozenset())
+    try:
+        if "admin" in roles:  # type: ignore[operator]
+            return None
+    except TypeError:
+        pass
+    user_level = getattr(conn, "user_level", 999)
+    try:
+        if int(user_level) <= 0:
+            return None
+    except (TypeError, ValueError):
+        pass
+    return {
+        "type": "mentra.error",
+        "ref": frame.get("id"),
+        "code": 403,
+        "message": "admin role required",
+    }
+
+
+def _err(
+    frame: dict[str, Any], code: int, message: str
+) -> dict[str, Any]:
+    return {
+        "type": "mentra.error",
+        "ref": frame.get("id"),
+        "code": code,
+        "message": message,
+    }
 
 
 def _summarize_for_display(text: str, *, max_chars: int = 200) -> str:
