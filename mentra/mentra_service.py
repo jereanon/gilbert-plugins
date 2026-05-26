@@ -717,12 +717,35 @@ class MentraService(Service):
             try:
                 await session.speaker.speak(welcome_text)
                 logger.info(
-                    "Mentra welcome speech sent for session=%s",
+                    "Mentra welcome speech sent (TTS) for session=%s",
                     req.session_id,
                 )
             except Exception:
                 logger.warning(
                     "Mentra welcome speech failed for session=%s",
+                    req.session_id,
+                    exc_info=True,
+                )
+            # DIAGNOSTIC — also send a known-good public MP3 to
+            # isolate whether the cloud-side TTS endpoint is the
+            # issue or whether ``audio_play_request`` itself is
+            # silently dropped on this device. If THIS plays but
+            # the TTS one doesn't, the issue is the ``/api/tts``
+            # path; if neither plays, the issue is the entire
+            # audio_play_request handoff. Remove once we identify
+            # the failure mode.
+            try:
+                await session.speaker.play_url(
+                    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+                    volume=1.0,
+                )
+                logger.info(
+                    "Mentra DIAGNOSTIC public-mp3 play_url sent for session=%s",
+                    req.session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Mentra DIAGNOSTIC public-mp3 play_url failed for session=%s",
                     req.session_id,
                     exc_info=True,
                 )
