@@ -110,10 +110,19 @@ class SpeakerManager:
         voice_settings: dict[str, float] | None = None,
         volume: float = 1.0,
         stop_other_audio: bool = False,
+        track_id: int = _TRACK_SPEAKER,
     ) -> None:
         """Server-side TTS. Builds the cloud's ``/api/tts`` URL with
         the text + optional voice settings, then dispatches it as a
-        normal ``play_url`` call on the TTS track.
+        normal ``play_url`` call.
+
+        ``track_id`` defaults to ``_TRACK_SPEAKER`` (0) rather than
+        ``_TRACK_TTS`` (2). On Mentra Live the cloud appears to route
+        only track-0 audio to the physical speaker (testing shows
+        ``trackId=2`` returns ``audio_play_response: success`` with a
+        non-zero duration but no actual audio reaches the user's ear).
+        Override to ``_TRACK_TTS`` only when you specifically want TTS
+        to coexist with music on track 0.
 
         Voice settings dict keys mirror ElevenLabs:
         ``stability`` / ``similarity_boost`` / ``style`` / ``speed``
@@ -133,7 +142,7 @@ class SpeakerManager:
         await self.play_url(
             tts_url,
             volume=volume,
-            track_id=_TRACK_TTS,
+            track_id=track_id,
             stop_other_audio=stop_other_audio,
         )
 
