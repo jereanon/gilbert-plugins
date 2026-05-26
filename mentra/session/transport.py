@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from enum import IntEnum
@@ -26,6 +27,34 @@ from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as ws_connect
 
 logger = logging.getLogger(__name__)
+
+
+def _build_default_ssl_context() -> ssl.SSLContext:
+    """Build the SSL context used for ``wss://`` back-channels.
+
+    Python's default ``ssl.create_default_context()`` reads the CA
+    bundle from a platform-specific path (``/etc/ssl/certs/...`` on
+    most distros). NixOS doesn't ship that path by default — the
+    Python interpreter's ``ssl`` module can't find the CA bundle and
+    every ``wss://`` connection fails with ``CERTIFICATE_VERIFY_FAILED:
+    unable to get local issuer certificate``.
+
+    Using ``certifi``'s bundled Mozilla CA roots side-steps the
+    problem on every OS (the bundle is ~280 KB shipped with the
+    package; the same one ``httpx`` / ``requests`` / ``aiohttp`` use
+    by default).
+    """
+    try:
+        import certifi
+    except ImportError:
+        # certifi isn't a direct dep but it's a transitive dep of
+        # everything (httpx, etc.). Fall back to the platform default
+        # — most setups work even without certifi.
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+_DEFAULT_SSL_CONTEXT = _build_default_ssl_context()
 
 
 __all__ = [
@@ -147,6 +176,13 @@ class WebSocketTransport(Transport):
         if self._state is TransportState.OPEN:
             return
         self._state = TransportState.CONNECTING
+        # Only pass an SSL context for ``wss://`` URLs — ``ws://``
+        # connects must not enable TLS or the handshake fails before
+        # the upgrade. See module-level ``_build_default_ssl_context``
+        # for why we use ``certifi`` instead of the platform default.
+        extra_kwargs: dict[str, Any] = {}
+        if self._url.startswith("wss://"):
+            extra_kwargs["ssl"] = _DEFAULT_SSL_CONTEXT
         try:
             # ``connect`` is the async-context-manager form, but its
             # underlying ``ClientConnection`` is also awaitable as a
@@ -157,6 +193,7 @@ class WebSocketTransport(Transport):
                     self._url,
                     additional_headers=self._headers,
                     open_timeout=self._connect_timeout,
+                    **extra_kwargs,
                 ),
                 timeout=self._connect_timeout,
             )

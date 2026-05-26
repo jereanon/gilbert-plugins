@@ -499,3 +499,32 @@ async def test_reconnect_deferred_logs_without_marking_permanent() -> None:
     )
     assert session.is_permanently_closed is False
     assert session.is_connected is True
+
+
+# ── Transport SSL ──────────────────────────────────────────────────
+
+
+def test_transport_uses_certifi_ssl_context_for_wss_urls() -> None:
+    """Python's default SSL context fails on NixOS hosts because the
+    OS doesn't ship the CA bundle at the path Python expects. We use
+    ``certifi``'s bundled Mozilla roots instead — the same fix every
+    reasonable Python HTTP library applies.
+
+    Regression test for the deployment to meridian: without this,
+    every ``wss://`` open to Mentra Cloud raised
+    ``CERTIFICATE_VERIFY_FAILED`` and the glasses showed "Can't
+    connect to Gilbert"."""
+    import ssl
+
+    from gilbert_plugin_mentra.session.transport import (
+        _DEFAULT_SSL_CONTEXT,
+    )
+
+    assert isinstance(_DEFAULT_SSL_CONTEXT, ssl.SSLContext)
+    # Verify mode should be CERT_REQUIRED (the default for
+    # ``create_default_context``). If a future refactor accidentally
+    # neuters TLS verification, this test fails loudly.
+    assert _DEFAULT_SSL_CONTEXT.verify_mode == ssl.CERT_REQUIRED
+    # Default context should be configured to check hostnames too —
+    # disabling that would let an attacker present any valid cert.
+    assert _DEFAULT_SSL_CONTEXT.check_hostname is True

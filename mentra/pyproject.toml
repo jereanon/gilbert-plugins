@@ -5,8 +5,14 @@ description = "Mentra smart-glasses platform — voice assistant + dashboard on 
 requires-python = ">=3.12"
 # ``websockets`` is already a top-level Gilbert dep (used by the voice
 # brain). We pin the same floor so we don't drift accidentally.
+# ``certifi`` is used to side-step the Python-on-NixOS missing-CA-bundle
+# issue when opening ``wss://`` connections to Mentra Cloud — the
+# platform default trust store is unreliable on minimal Linux
+# distributions, and certifi is already a transitive dep of httpx /
+# aiohttp / requests so the install footprint is zero.
 dependencies = [
     "websockets>=12.0",
+    "certifi>=2024.0.0",
 ]
 
 [tool.uv]
