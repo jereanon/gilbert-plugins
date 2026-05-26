@@ -407,7 +407,28 @@ class MentraSession:
         frame = parse_frame(raw)
         if not frame:
             return
-        await self._messages.dispatch(frame)
+        # Temporary diagnostic tracing for production debug — log
+        # every inbound frame's top-level type so we can spot
+        # silently-dropped audio_play_response / permission_error /
+        # other cloud events we haven't wired up handlers for. Drop
+        # to DEBUG once we have a stable picture of which event
+        # shapes the cloud actually emits.
+        frame_type = str(frame.get("type") or "<no-type>")
+        if frame_type == "data_stream":
+            stream_type = str(frame.get("streamType") or "<no-streamType>")
+            logger.info(
+                "Mentra inbound — type=data_stream streamType=%s",
+                stream_type,
+            )
+        else:
+            logger.info("Mentra inbound — type=%s", frame_type)
+        handled = await self._messages.dispatch(frame)
+        if not handled:
+            logger.warning(
+                "Mentra inbound UNHANDLED — type=%s body=%s",
+                frame_type,
+                {k: v for k, v in frame.items() if k != "type"},
+            )
 
     async def _on_binary(self, data: bytes) -> None:
         """Binary frames carry mic audio (16 kHz mono 16-bit PCM).
