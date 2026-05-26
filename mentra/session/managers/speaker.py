@@ -181,10 +181,14 @@ class SpeakerManager:
 
 def _iso_now() -> str:
     """Wire timestamp — upstream SDK uses ``new Date()`` which
-    serializes to an ISO 8601 string with a ``Z`` suffix. Some
-    cloud-side code paths require the field be present (silently
-    drop requests without it) so we always include it."""
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    serializes to ISO 8601 with MILLISECOND precision + ``Z``
+    suffix. Python's default ``isoformat()`` gives microsecond
+    precision; the cloud's audio router is strict about format
+    and silently drops requests with extra digits. Match JS
+    exactly here."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def _build_audio_play_request(

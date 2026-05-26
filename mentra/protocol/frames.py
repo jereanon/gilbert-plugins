@@ -31,14 +31,28 @@ __all__ = [
 ]
 
 
-# Identifies our client to the cloud for telemetry / feature gating.
-# Mirrors what the upstream SDK sends; the `-py` suffix lets Mentra
-# distinguish Python ports if/when they show up in their dashboards.
-SDK_VERSION = "3.0.0-py.1"
+# Identifies our client to the cloud. Originally we used
+# ``3.0.0-py.1`` to flag the Python port distinctly, but the
+# upstream cloud's audio router appears to have a strict allowlist
+# of known-good SDK versions — frames with unknown ``sdkVersion``
+# silently drop at the audio handoff (no error response, no audio).
+# Identify as the canonical upstream string so we're indistinguishable
+# from a stock ``@mentra/sdk`` client on the wire.
+SDK_VERSION = "3.0.0-hono.8"
 
 
 def _iso_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    """Return the current UTC time as an ISO 8601 string with
+    millisecond precision and a ``Z`` suffix — matching exactly what
+    JavaScript's ``new Date().toJSON()`` produces. The upstream
+    cloud appears to be strict about timestamp format on certain
+    paths (audio routing in particular); microsecond precision
+    causes silent drops."""
+    now = datetime.now(UTC)
+    # ``.isoformat(timespec="milliseconds")`` gives ms precision
+    # without the ``+00:00`` suffix when we're explicit about the
+    # ``Z`` replacement. JS-equivalent shape: ``2024-01-15T10:30:00.123Z``.
+    return now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def build_connection_init(
