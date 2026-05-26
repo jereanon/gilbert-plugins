@@ -1,0 +1,12 @@
+[project]
+name = "gilbert-plugin-messaging"
+version = "1.0.0"
+description = "Bidirectional messaging — MessagingService + send_text_message AI tool"
+requires-python = ">=3.12"
+# No third-party deps; HTTP / WebSocket bits live in the carrier
+# backend plugin (e.g. telnyx). This plugin is pure orchestration over
+# MessagingBackend implementations + AI tool + WS handlers + storage.
+dependencies = []
+
+[tool.uv]
+package = false

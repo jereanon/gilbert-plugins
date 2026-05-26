@@ -1,11 +1,16 @@
-"""Telnyx telephony plugin — registers TelnyxTelephony as a TelephonyBackend
-and exposes ``TelnyxWebhookService`` as the ``telnyx_webhook`` capability
-so core's ``/api/telnyx/*`` routes can dispatch without importing this
-plugin module directly.
+"""Telnyx plugin — registers two backends and two webhook services:
 
-The backend itself only handles call placement + carrier-side audio
-plumbing. The conversation brain (STT, LLM, TTS) lives in core's
-``PhoneCallService``.
+- ``TelnyxTelephony`` (``TelephonyBackend``) + ``TelnyxWebhookService``
+  (``telnyx_webhook`` capability) — outbound voice calls, consumed by
+  the ``phone`` plugin.
+- ``TelnyxMessaging`` (``MessagingBackend``) +
+  ``TelnyxMessagingWebhookService`` (``telnyx_messaging_webhook``
+  capability) — bidirectional SMS, consumed by the ``messaging``
+  plugin.
+
+Both products share the same Telnyx API key (configured separately on
+each backend so the keys can be rotated independently). The capability
+services keep ``web/`` routes from importing this module directly.
 """
 
 from __future__ import annotations
@@ -18,15 +23,29 @@ class TelnyxPlugin(Plugin):
         return PluginMeta(
             name="telnyx",
             version="1.0.0",
-            description="Telnyx telephony backend for PhoneCallService",
-            provides=["telnyx_telephony", "telnyx_webhook"],
+            description=(
+                "Telnyx integration — telephony (voice calls) + "
+                "messaging (SMS / MMS). Each product is a separate "
+                "backend registered via the standard backend registry."
+            ),
+            provides=[
+                "telnyx_telephony",
+                "telnyx_webhook",
+                "telnyx_messaging",
+                "telnyx_messaging_webhook",
+            ],
             requires=[],
         )
 
     async def setup(self, context: PluginContext) -> None:
-        from . import telnyx_telephony  # registers backend via __init_subclass__
+        # Side-effect imports register both backends via
+        # ``__init_subclass__`` on the respective ABCs.
+        from . import telnyx_messaging, telnyx_telephony
 
         context.services.register(telnyx_telephony.TelnyxWebhookService())
+        context.services.register(
+            telnyx_messaging.TelnyxMessagingWebhookService()
+        )
 
     async def teardown(self) -> None:
         pass
