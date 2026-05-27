@@ -1140,33 +1140,49 @@ class MentraService(Service):
             text = (getattr(data, "text", "") or "").strip()
             if not text:
                 return
-            if time.monotonic() < mute_until_monotonic[0]:
+            # Mentra Cloud's transcription payload carries extra
+            # metadata we should be paying attention to — log every
+            # field so we can tell from production logs what the
+            # cloud actually labels Gilbert's echo vs the user
+            # speaking. Without this we're guessing about whether
+            # speaker diarization is something we could be filtering
+            # on (decision-relevant for echo suppression beyond the
+            # time-window mute we have today).
+            speaker_id = str(getattr(data, "speaker_id", "") or "")
+            confidence = float(getattr(data, "confidence", 0.0) or 0.0)
+            in_mute = time.monotonic() < mute_until_monotonic[0]
+            logger.info(
+                "Mentra transcription %s — session=%s speaker_id=%r "
+                "confidence=%.2f len=%d text=%r",
+                "(MUTED)" if in_mute else "final",
+                session.session_id,
+                speaker_id,
+                confidence,
+                len(text),
+                text[:120],
+            )
+            if in_mute:
                 # Almost certainly Gilbert's own voice echoing back
                 # through the glasses mic. Drop loudly so the log
                 # shows the suppression happening (otherwise it
                 # looks like "Gilbert ignored what I said").
-                logger.info(
-                    "Mentra: dropping echo-suspect transcript during "
-                    "Gilbert's TTS playback (session=%s text=%r)",
-                    session.session_id,
-                    text[:80],
-                )
-                # Surface the suppression in the debug webview too —
-                # otherwise the user just sees "Gilbert spoke" then
-                # nothing, with no signal that we heard but ignored
-                # the audio (and why).
+                #
+                # Surface the suppression in the debug webview too,
+                # WITH the speaker_id + confidence — if Mentra Cloud
+                # is labeling these distinctly from the user's
+                # speech, that's a much better signal than our
+                # blunt time-window mute and we should switch to
+                # filtering on it.
                 self._record_event(
                     session.user_id,
                     "transcription_suppressed",
-                    f'(echo suppressed during Gilbert\'s reply): "{text[:200]}"',
+                    (
+                        f'(echo suppressed): "{text[:160]}" '
+                        f"[speaker={speaker_id or '<none>'} "
+                        f"conf={confidence:.2f}]"
+                    ),
                 )
                 return
-            logger.info(
-                "Mentra transcription final — session=%s len=%d text=%r",
-                session.session_id,
-                len(text),
-                text[:100],
-            )
             # Surface every committed user transcript in the debug
             # webview. With ``disable_internal_stt=True`` the engine
             # never emits ``on_transcript_turn("them", ...)`` itself
@@ -1175,7 +1191,11 @@ class MentraService(Service):
             self._record_event(
                 session.user_id,
                 "transcription_final",
-                f'You said: "{text[:200]}"',
+                (
+                    f'You said: "{text[:160]}" '
+                    f"[speaker={speaker_id or '<none>'} "
+                    f"conf={confidence:.2f}]"
+                ),
             )
             try:
                 inject_queue.put_nowait(text)
