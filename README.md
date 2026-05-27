@@ -32,7 +32,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
-| [code-conduit](#code-conduit) | `code_conduit` service (`code_send` AI tool, `/code send` slash command) — relay to OpenCode (`opencode serve`); Claude Code planned | — (uses `httpx`) | Developer tools |
+| [code-conduit](#code-conduit) | `code_conduit` service (`code_send` + `code_recent_activity` AI tools, `/code send` + `/code recent` slash commands, `code.notification` bus events) — relay to OpenCode (`opencode serve`); Claude Code planned | — (uses `httpx`) | Developer tools |
 | [deepgram](#deepgram) | `StreamingTranscriptionBackend "deepgram"` | — (uses `websockets`) | Speech |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
@@ -280,16 +280,21 @@ The doctor reads `Plugin.runtime_dependencies()` (see `CLAUDE.md`). With Docker 
 
 ### code-conduit
 
-Gilbert as a *conduit* between the user (typically over voice via the Mentra glasses or the chat UI) and a coding agent the user runs on their own machine. The plugin never edits code, never reviews diffs, and never makes editorial judgments — it just relays messages verbatim into a session managed by the coding agent (currently [OpenCode](https://github.com/sst/opencode); Claude Code planned for Phase 3) and exposes a tool so the LLM can fire that relay mid-conversation when the user says *"tell Claude to ..."* or *"have OpenCode write tests for ..."*.
+Gilbert as a *conduit* between the user (typically over voice via the Mentra glasses or the chat UI) and a coding agent the user runs on their own machine. The plugin never edits code, never reviews diffs, and never makes editorial judgments — it just relays messages in **both directions**: outbound ("tell Claude to write tests") via the agent's HTTP API, inbound ("Claude finished the test suite") via the agent's event stream republished onto Gilbert's bus. Currently speaks [OpenCode](https://github.com/sst/opencode) via `opencode serve`; Claude Code planned for Phase 3.
 
 **Service registered**
-- `CodeConduitService` — capabilities `code_conduit`, `ai_tools`. Wraps a `CodingAgentBackend` (currently only `OpenCodeBackend`) and implements the `CodingConduitProvider` capability protocol so other services can drop messages into the agent without depending on the concrete class.
+- `CodeConduitService` — capabilities `code_conduit`, `ai_tools`. Wraps a `CodingAgentBackend` (currently only `OpenCodeBackend`), implements the `CodingConduitProvider` capability protocol so other services can drop messages into the agent without depending on the concrete class, and runs a background event pump that consumes the backend's inbound stream and publishes `code.notification` bus events for downstream subscribers (voice-brain, Mentra, push notifications, future SPA feed).
 
 **Slash commands** (under the `code` namespace)
-- `/code send <message> [project=<alias>] [new_session=true|false]` — relay `message` to the active coding agent on the named project (or the operator-configured default). Returns immediately with a `"sent"` acknowledgment; the agent's eventual response is NOT awaited (lands via the Phase-2 inbound channel).
+- `/code send <message> [project=<alias>] [new_session=true|false]` — relay `message` to the active coding agent on the named project (or the operator-configured default). Returns immediately with a `"sent"` acknowledgment; the agent's eventual response surfaces via `code.notification` bus events.
+- `/code recent [limit=N] [kind=<done|error|attention|info>]` — summarize what the coding agent has done recently from the in-memory ring buffer of inbound events (last 200 events). Default view hides `info`-grade noise (tool calls / progress) so the summary stays TTS-friendly.
 
-**AI tool**
+**AI tools**
 - `code_send(message, project?, new_session?)` — what the LLM fires when the user says *"tell Claude to ..."* / *"ask the coding agent ..."*. The system prompt makes clear: pass the user's message through verbatim, do not paraphrase. Returns a short voice-friendly confirmation ("Sent to opencode on the gilbert project.").
+- `code_recent_activity(limit?, kind?)` — what the LLM fires when the user asks *"what has the coding agent been up to?"* / *"is Claude still working on that?"* / *"any progress on the gilbert branch?"*. Returns a headline + per-event bullets summarising recent notifications.
+
+**Bus events published**
+- `code.notification` (source `code_conduit`) — every inbound coding-agent event, normalised into a severity bucket (`done` / `error` / `attention` / `info`). Event `data` carries `kind`, `summary` (TTS-friendly one-liner), `detail`, `session_id`, `project_path`, `timestamp`, `raw_type` (backend's native event-type name), and `backend`. Subscribers decide their own notification policy: voice-brain might announce `error`/`attention` immediately and `done` only when the voice loop is idle; the SPA `/coding` feed (Phase 3) renders every event.
 
 **Configure** (Settings → Integrations → Code Conduit)
 - `enabled` — required, off by default. Service toggle exposed under Settings → Services.
@@ -310,7 +315,11 @@ Gilbert as a *conduit* between the user (typically over voice via the Mentra gla
 2. In Gilbert's Settings → Integrations → Code Conduit, paste `http://<tailnet-ip>:4096` and the password.
 3. Click *Test connection*. Once it returns green, the LLM tool `code_send` is live — try *"tell Claude to add error handling to the new endpoint"* via chat or voice.
 
-**Scope notes** — Phase 1 (this release) is outbound only. Inbound notifications (the agent finishes a task, errors, or asks a clarifying question → Gilbert surfaces it via TTS / push) ship in Phase 2 via an SSE consumer + event bus fan-out. Claude Code support (webhook-based inbound, queue-file or `claude -p --resume` outbound) lands in Phase 3.
+**Scope notes** — Phases 1 + 2 ship in this release: outbound relay (`code_send`) and inbound notifications (`code.notification` bus events + `code_recent_activity` tool). What's still out of scope:
+
+- **SPA `/coding` feed** (Phase 3 polish) — a live two-column view of outbound messages and inbound notifications. Skeleton landed in the plugin layout but no panel is registered yet.
+- **Claude Code backend** (Phase 3) — outbound via background `claude -p --resume`, inbound via the Claude Code stop-hook posting to a Gilbert webhook. The `code.notification` bus event shape is already generic enough to accept Claude Code events without changes.
+- **Voice-brain integration** — subscribing to `code.notification` and routing severities into TTS interrupt-now / wait-for-quiet / silent buckets. Lives in `voice-agent` / `mentra`, not here. The bus events are published; consumers haven't been wired yet.
 
 ---
 

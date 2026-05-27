@@ -27,11 +27,19 @@ Out of scope for Phase 1:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+from collections import deque
 from typing import Any
 
 from gilbert.interfaces.coding_agent import (
+    EVENT_KIND_ATTENTION,
+    EVENT_KIND_DONE,
+    EVENT_KIND_ERROR,
+    EVENT_KIND_INFO,
     CodingAgentBackend,
+    CodingAgentEvent,
     CodingAgentSendResult,
 )
 from gilbert.interfaces.configuration import (
@@ -40,6 +48,7 @@ from gilbert.interfaces.configuration import (
     ConfigParam,
     ConfigurationReader,
 )
+from gilbert.interfaces.events import Event, EventBus, EventBusProvider
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.tools import (
     ToolDefinition,
@@ -51,6 +60,18 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_BACKEND = "opencode"
+
+# Cap on the in-memory ring buffer of recent events. The buffer
+# backs the ``code_recent_activity`` AI tool and the future
+# ``/coding`` SPA feed. 200 events is ~hours of background activity
+# for a single-user setup — enough to answer "what did the agent
+# do today?" without unbounded memory growth.
+_RECENT_EVENT_CAP = 200
+
+# Bus event types the conduit publishes. Anyone (voice-brain,
+# Mentra, push notifications, the SPA) can subscribe to surface
+# notifications however they want.
+BUS_EVENT_NOTIFICATION = "code.notification"
 
 
 class CodeConduitService(Service):
@@ -76,12 +97,21 @@ class CodeConduitService(Service):
         # ``project_aliases`` multiline config field.
         self._project_aliases: dict[str, str] = {}
         self._default_project_alias: str = ""
+        # Inbound notification plumbing — populated in ``start()``.
+        self._bus: EventBus | None = None
+        self._event_pump_task: asyncio.Task[None] | None = None
+        # Bounded ring buffer of recent events backing the
+        # ``code_recent_activity`` AI tool. Newer events at the
+        # right; ``maxlen`` evicts the oldest automatically.
+        self._recent_events: deque[CodingAgentEvent] = deque(
+            maxlen=_RECENT_EVENT_CAP
+        )
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="code_conduit",
             capabilities=frozenset({"code_conduit", "ai_tools"}),
-            optional=frozenset({"configuration"}),
+            optional=frozenset({"configuration", "event_bus"}),
             toggleable=True,
             toggle_description=(
                 "Relay messages between Gilbert and a coding agent "
@@ -99,10 +129,30 @@ class CodeConduitService(Service):
             logger.info("Code Conduit service disabled")
             return
 
+        # Grab the bus before applying config — the event pump
+        # spawned by ``_apply_config`` wants to know whether it has
+        # somewhere to publish. Missing event bus is non-fatal:
+        # events still land in the local ring buffer for the
+        # ``code_recent_activity`` tool.
+        bus_svc = resolver.get_capability("event_bus")
+        if isinstance(bus_svc, EventBusProvider):
+            self._bus = bus_svc.bus
+
         self._enabled = True
         await self._apply_config(section)
 
     async def stop(self) -> None:
+        # Cancel the inbound event pump before closing the backend
+        # — otherwise the pump's in-flight HTTP request races with
+        # the backend's ``aclose()`` and surfaces as scary
+        # "Cannot send a request, as the client has been closed"
+        # warnings in the log.
+        if self._event_pump_task is not None and not self._event_pump_task.done():
+            self._event_pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._event_pump_task
+        self._event_pump_task = None
+
         if self._backend is not None:
             await self._backend.close()
             self._backend = None
@@ -323,12 +373,65 @@ class CodeConduitService(Service):
                 ],
                 required_role="user",
             ),
+            ToolDefinition(
+                name="code_recent_activity",
+                slash_group="code",
+                slash_command="recent",
+                slash_help=(
+                    "Summarize what the coding agent has been doing "
+                    "recently — finishes, errors, prompts for input."
+                ),
+                description=(
+                    "Report what the user's coding agent (OpenCode "
+                    "/ Claude Code) has done recently — completed "
+                    "tasks, errors, and pending attention requests. "
+                    "USE THIS when the user asks 'what has the "
+                    "coding agent done?', 'is Claude still working "
+                    "on that?', 'any progress on the gilbert "
+                    "branch?', or any variation. Returns a short "
+                    "voice-friendly summary; defaults to the last "
+                    "10 notable events but accepts ``limit`` for "
+                    "longer / shorter windows and ``kind`` to "
+                    "filter to one severity bucket."
+                ),
+                parameters=[
+                    ToolParameter(
+                        name="limit",
+                        type=ToolParameterType.INTEGER,
+                        description=(
+                            "How many recent events to surface. "
+                            "Default 10; cap silently enforced at "
+                            "the buffer size."
+                        ),
+                        required=False,
+                        default=10,
+                    ),
+                    ToolParameter(
+                        name="kind",
+                        type=ToolParameterType.STRING,
+                        description=(
+                            "Optional severity filter: 'done' "
+                            "(finished tasks), 'error', 'attention' "
+                            "(waiting on user), or 'info' (tool "
+                            "calls / progress). Omit for all "
+                            "notable events (done / error / "
+                            "attention; ``info`` is filtered out "
+                            "by default to keep the summary "
+                            "TTS-friendly)."
+                        ),
+                        required=False,
+                    ),
+                ],
+                required_role="user",
+            ),
         ]
 
     async def execute_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        if name != "code_send":
-            raise KeyError(f"code_conduit has no tool {name!r}")
-        return await self._tool_code_send(arguments)
+        if name == "code_send":
+            return await self._tool_code_send(arguments)
+        if name == "code_recent_activity":
+            return await self._tool_code_recent_activity(arguments)
+        raise KeyError(f"code_conduit has no tool {name!r}")
 
     async def _tool_code_send(self, arguments: dict[str, Any]) -> str:
         message = str(arguments.get("message", "") or "").strip()
@@ -396,6 +499,184 @@ class CodeConduitService(Service):
             new_session=new_session,
         )
 
+    def recent_events(
+        self,
+        *,
+        limit: int = 50,
+        kind: str = "",
+    ) -> list[CodingAgentEvent]:
+        """Return the most recent events from the in-memory ring
+        buffer, newest first. Optional ``kind`` filter buckets to
+        one severity; empty means "all kinds".
+
+        Exposed for the SPA / WS RPC + the ``code_recent_activity``
+        AI tool. The buffer is bounded (see ``_RECENT_EVENT_CAP``)
+        so callers can't ask for arbitrary history — they get a
+        recent slice, not a query interface.
+        """
+        events = list(self._recent_events)
+        events.reverse()  # newest first
+        if kind:
+            events = [e for e in events if e.kind == kind]
+        if limit > 0:
+            events = events[:limit]
+        return events
+
+    # --- Inbound event pump ─────────────────────────────────────────
+
+    async def _run_event_pump(self) -> None:
+        """Background task that consumes ``backend.stream_events()``
+        and fans each event out to:
+
+        - the in-memory ring buffer (for the ``code_recent_activity``
+          tool and the future SPA feed)
+        - the Gilbert event bus as ``code.notification``, when a
+          bus is wired up — voice-brain / Mentra / push-notification
+          / SPA-feed consumers subscribe to this.
+
+        Backends that have no inbound channel return immediately
+        from ``stream_events``; the pump task then exits cleanly,
+        not as an error. Backends that DO have a channel are
+        expected to reconnect internally — if the iterator
+        terminates without an error, that's the "we're done" signal
+        and the pump exits too.
+        """
+        if self._backend is None:
+            return
+        try:
+            async for event in self._backend.stream_events():
+                self._recent_events.append(event)
+                if self._bus is not None:
+                    await self._publish_event(event)
+                # Log notable events at INFO so journalctl shows
+                # the live signal; ``info`` (default) events stay
+                # at DEBUG so a chatty agent doesn't flood the log.
+                if event.kind in (
+                    EVENT_KIND_DONE,
+                    EVENT_KIND_ERROR,
+                    EVENT_KIND_ATTENTION,
+                ):
+                    logger.info(
+                        "Code Conduit event: kind=%s session=%s "
+                        "raw_type=%s — %s",
+                        event.kind,
+                        event.session_id or "?",
+                        event.raw_type or "?",
+                        event.summary[:120],
+                    )
+                else:
+                    logger.debug(
+                        "Code Conduit event (info): raw_type=%s "
+                        "session=%s",
+                        event.raw_type or "?",
+                        event.session_id or "?",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The backend's stream_events should swallow its own
+            # transient errors and keep reconnecting. If we still
+            # get here, the iterator gave up — log loudly so the
+            # operator notices the inbound channel is dead.
+            logger.exception(
+                "Code Conduit inbound event pump exited "
+                "unexpectedly — inbound notifications are OFF "
+                "until the service restarts"
+            )
+
+    async def _publish_event(self, event: CodingAgentEvent) -> None:
+        """Translate a ``CodingAgentEvent`` into a bus ``Event`` and
+        publish. The data dict carries every interesting field so
+        subscribers can route + format without round-tripping
+        through any private API."""
+        if self._bus is None:
+            return
+        try:
+            await self._bus.publish(
+                Event(
+                    event_type=BUS_EVENT_NOTIFICATION,
+                    source="code_conduit",
+                    data={
+                        "kind": event.kind,
+                        "summary": event.summary,
+                        "detail": event.detail,
+                        "session_id": event.session_id,
+                        "project_path": event.project_path,
+                        "timestamp": event.timestamp,
+                        "raw_type": event.raw_type,
+                        "backend": self._backend_name,
+                    },
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Code Conduit: failed to publish bus notification — "
+                "ring buffer still has the event"
+            )
+
+    # --- Recent-activity tool ────────────────────────────────────────
+
+    async def _tool_code_recent_activity(
+        self,
+        arguments: dict[str, Any],
+    ) -> str:
+        """TTS-friendly summary of recent coding-agent events. The
+        default filter excludes ``info`` (tool calls / progress)
+        because those events flood the buffer faster than is
+        useful to read aloud; pass ``kind="info"`` explicitly when
+        debugging."""
+        limit_raw = arguments.get("limit", 10)
+        try:
+            limit = max(1, int(limit_raw))
+        except (TypeError, ValueError):
+            limit = 10
+        kind_filter = str(arguments.get("kind", "") or "").strip().lower()
+
+        events = list(self._recent_events)
+        events.reverse()  # newest first
+        if kind_filter:
+            events = [e for e in events if e.kind == kind_filter]
+        else:
+            # Default view: hide ``info``-grade noise. Users asking
+            # "what's been going on?" want the notable beats, not
+            # every tool call.
+            events = [e for e in events if e.kind != EVENT_KIND_INFO]
+        events = events[:limit]
+
+        if not events:
+            if kind_filter:
+                return (
+                    f"No recent {kind_filter} events from the "
+                    "coding agent."
+                )
+            return (
+                "Nothing notable from the coding agent recently — "
+                "either it's idle, or only info-grade events have "
+                "fired. Ask again with kind='info' to see those."
+            )
+
+        # Count by kind for the headline line.
+        counts: dict[str, int] = {}
+        for e in events:
+            counts[e.kind] = counts.get(e.kind, 0) + 1
+        headline_parts = []
+        for k in (
+            EVENT_KIND_DONE,
+            EVENT_KIND_ATTENTION,
+            EVENT_KIND_ERROR,
+            EVENT_KIND_INFO,
+        ):
+            if counts.get(k):
+                headline_parts.append(f"{counts[k]} {k}")
+        headline = f"Recent coding-agent activity ({', '.join(headline_parts)}):"
+
+        lines = [headline]
+        for e in events:
+            project = self._friendly_label_for(e.project_path) if e.project_path else ""
+            project_tag = f" on {project}" if project else ""
+            lines.append(f"- {e.kind.upper()}{project_tag}: {e.summary}")
+        return "\n".join(lines)
+
     # --- Internals ──────────────────────────────────────────────────
 
     async def _apply_config(self, section: dict[str, Any]) -> None:
@@ -427,6 +708,14 @@ class CodeConduitService(Service):
                 "Code Conduit started (backend=%s, %d project alias(es))",
                 self._backend_name,
                 len(self._project_aliases),
+            )
+            # Kick off the inbound-event pump. Wrapped in a Task so
+            # the SSE consumer's reconnect loop runs concurrently
+            # with the rest of the service — and so ``stop()`` can
+            # cancel it cleanly.
+            self._event_pump_task = asyncio.create_task(
+                self._run_event_pump(),
+                name="code_conduit.event_pump",
             )
         else:
             logger.warning(

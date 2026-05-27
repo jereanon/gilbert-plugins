@@ -250,3 +250,228 @@ def test_extract_session_id_handles_known_key_variants() -> None:
     # for empty and raise a friendly RuntimeError themselves.
     assert OpenCodeBackend._extract_session_id({"weird": "f"}) == ""
     assert OpenCodeBackend._extract_session_id("not a dict") == ""
+
+
+# --- Phase 2 — SSE event stream --------------------------------------------
+
+
+def test_kind_for_event_type_known_mappings() -> None:
+    """Pin the OpenCode event-type → severity bucket table. A
+    daemon change that renames events will break here loudly,
+    rather than silently downgrading every notification to
+    ``info`` (which is what the prefix fallback would do)."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import (
+        EVENT_KIND_ATTENTION,
+        EVENT_KIND_DONE,
+        EVENT_KIND_ERROR,
+        EVENT_KIND_INFO,
+    )
+
+    assert OpenCodeBackend._kind_for_event_type("session.idle") == EVENT_KIND_DONE
+    assert (
+        OpenCodeBackend._kind_for_event_type("message.updated") == EVENT_KIND_DONE
+    )
+    assert (
+        OpenCodeBackend._kind_for_event_type("session.error") == EVENT_KIND_ERROR
+    )
+    assert (
+        OpenCodeBackend._kind_for_event_type("permission.requested")
+        == EVENT_KIND_ATTENTION
+    )
+    # Unknown event types → info (the safe default — they don't
+    # interrupt the user via TTS).
+    assert (
+        OpenCodeBackend._kind_for_event_type("tool.use") == EVENT_KIND_INFO
+    )
+    assert OpenCodeBackend._kind_for_event_type("") == EVENT_KIND_INFO
+
+
+def test_kind_for_event_type_prefix_sweep_catches_new_variants() -> None:
+    """Future OpenCode releases may add new error / permission
+    event names. The prefix sweep keeps the kind mapping
+    forward-compatible — anything with 'error' or starting with
+    'permission.' buckets correctly without a SKILL update."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import (
+        EVENT_KIND_ATTENTION,
+        EVENT_KIND_ERROR,
+    )
+
+    assert (
+        OpenCodeBackend._kind_for_event_type("new.subsystem.error")
+        == EVENT_KIND_ERROR
+    )
+    assert (
+        OpenCodeBackend._kind_for_event_type("permission.future_variant")
+        == EVENT_KIND_ATTENTION
+    )
+
+
+def test_sse_frame_to_event_extracts_known_fields() -> None:
+    """The SSE frame parser pulls session_id, project_path, and
+    summary out of the JSON payload's known field aliases."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import EVENT_KIND_DONE
+
+    event = OpenCodeBackend._sse_frame_to_event(
+        "session.idle",
+        '{"sessionId": "sess_x", "projectPath": "/p", '
+        '"title": "Refactor complete", '
+        '"timestamp": "2026-05-27T05:00:00Z"}',
+    )
+    assert event.kind == EVENT_KIND_DONE
+    assert event.session_id == "sess_x"
+    assert event.project_path == "/p"
+    assert event.summary == "Refactor complete"
+    assert event.timestamp == "2026-05-27T05:00:00Z"
+    assert event.raw_type == "session.idle"
+
+
+def test_sse_frame_to_event_uses_type_field_when_event_line_missing() -> None:
+    """Some OpenCode versions only set the ``data:`` line with a
+    ``type`` field inside the JSON. The parser falls back to that
+    so we still bucket by severity correctly."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import EVENT_KIND_ERROR
+
+    event = OpenCodeBackend._sse_frame_to_event(
+        "",
+        '{"type": "session.error", "message": "model API timeout"}',
+    )
+    assert event.kind == EVENT_KIND_ERROR
+    assert event.raw_type == "session.error"
+    assert event.summary == "model API timeout"
+
+
+def test_sse_frame_to_event_handles_non_json_data() -> None:
+    """If a daemon emits a plain-string data line (older versions
+    did), we still produce a usable event — the string lands in
+    ``detail`` so the SPA feed shows something useful and the
+    summary falls back to the default per-severity label."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import EVENT_KIND_DONE
+
+    event = OpenCodeBackend._sse_frame_to_event(
+        "session.idle",
+        "raw plain-text payload",
+    )
+    assert event.kind == EVENT_KIND_DONE
+    assert event.detail == "raw plain-text payload"
+    # Fallback voice-friendly label for ``done`` when no payload
+    # title was readable.
+    assert event.summary == "Coding agent finished."
+
+
+def test_sse_frame_to_event_default_summary_per_kind() -> None:
+    """When the payload has nothing readable, the per-kind default
+    summaries are TTS-friendly one-liners. They're what the user
+    hears on the glasses when an event fires."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import (
+        EVENT_KIND_ATTENTION,
+        EVENT_KIND_DONE,
+        EVENT_KIND_ERROR,
+    )
+
+    done = OpenCodeBackend._sse_frame_to_event("session.idle", "{}")
+    err = OpenCodeBackend._sse_frame_to_event("session.error", "{}")
+    att = OpenCodeBackend._sse_frame_to_event("permission.requested", "{}")
+    assert done.kind == EVENT_KIND_DONE
+    assert "finished" in done.summary.lower()
+    assert err.kind == EVENT_KIND_ERROR
+    assert "errored" in err.summary.lower()
+    assert att.kind == EVENT_KIND_ATTENTION
+    assert "waiting" in att.summary.lower()
+
+
+@pytest.mark.asyncio
+async def test_stream_events_parses_multiple_sse_frames() -> None:
+    """Wire-format integration test: drive a fake SSE response
+    through the parser and assert it produces the right sequence
+    of CodingAgentEvents. Uses MockTransport so no real network
+    is touched."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    from gilbert.interfaces.coding_agent import (
+        EVENT_KIND_DONE,
+        EVENT_KIND_ERROR,
+        EVENT_KIND_INFO,
+    )
+
+    # Standard SSE format: each line ends \n, frames separated
+    # by an extra blank line. httpx's aiter_lines splits on \n.
+    sse_body = (
+        b': keep-alive comment\n'
+        b'\n'
+        b'event: session.idle\n'
+        b'data: {"sessionId": "s1", "title": "Done."}\n'
+        b'\n'
+        b'event: tool.use\n'
+        b'data: {"sessionId": "s1", "title": "Calling read_file"}\n'
+        b'\n'
+        b'event: session.error\n'
+        b'data: {"sessionId": "s1", "message": "rate limited"}\n'
+        b'\n'
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        # Stream the body chunk-by-chunk to simulate a real SSE
+        # connection. httpx.MockTransport accepts a bytes body
+        # and feeds aiter_lines as if it were a stream.
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse_body,
+        )
+
+    backend = OpenCodeBackend()
+    await backend.initialize({"server_url": "http://x.test", "server_password": "pw"})
+    await backend._client.aclose()
+    backend._client = httpx.AsyncClient(
+        base_url="http://x.test",
+        auth=("opencode", "pw"),
+        transport=httpx.MockTransport(_handler),
+    )
+
+    events: list = []
+    async for ev in backend.stream_events():
+        events.append(ev)
+        if len(events) >= 3:
+            # Don't loop forever — the mock body has exactly 3
+            # frames, but the reconnect loop would try to
+            # restart after the response ends.
+            break
+
+    assert [e.kind for e in events] == [
+        EVENT_KIND_DONE,
+        EVENT_KIND_INFO,
+        EVENT_KIND_ERROR,
+    ]
+    assert events[0].session_id == "s1"
+    assert events[0].summary == "Done."
+    assert events[2].summary == "rate limited"
+
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_events_returns_silently_when_unconfigured() -> None:
+    """No password → no client → stream_events returns immediately
+    rather than crashing. Matches the pattern in other read methods
+    so the service's pump task can spin up before the operator
+    fills in Settings without exploding."""
+    from gilbert_plugin_code_conduit.opencode_backend import OpenCodeBackend
+
+    backend = OpenCodeBackend()
+    await backend.initialize({"server_url": "http://x.test"})  # no pw
+    events = []
+    async for ev in backend.stream_events():
+        events.append(ev)
+    assert events == []
