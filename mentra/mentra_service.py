@@ -1104,12 +1104,31 @@ class MentraService(Service):
                     session.session_id,
                     text[:80],
                 )
+                # Surface the suppression in the debug webview too —
+                # otherwise the user just sees "Gilbert spoke" then
+                # nothing, with no signal that we heard but ignored
+                # the audio (and why).
+                self._record_event(
+                    session.user_id,
+                    "transcription_suppressed",
+                    f'(echo suppressed during Gilbert\'s reply): "{text[:200]}"',
+                )
                 return
             logger.info(
                 "Mentra transcription final — session=%s len=%d text=%r",
                 session.session_id,
                 len(text),
                 text[:100],
+            )
+            # Surface every committed user transcript in the debug
+            # webview. With ``disable_internal_stt=True`` the engine
+            # never emits ``on_transcript_turn("them", ...)`` itself
+            # (its listen loop early-returns), so this is the only
+            # place a "what the user said" event gets logged.
+            self._record_event(
+                session.user_id,
+                "transcription_final",
+                f'You said: "{text[:200]}"',
             )
             try:
                 inject_queue.put_nowait(text)

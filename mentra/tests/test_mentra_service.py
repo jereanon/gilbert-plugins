@@ -714,6 +714,82 @@ async def test_echo_during_gilbert_playback_is_dropped(
 
 
 @pytest.mark.asyncio
+async def test_user_transcript_recorded_to_debug_ring_buffer(
+    monkeypatch: Any,
+) -> None:
+    """The phone-side debug webview surfaces a per-user event ring
+    buffer (``MentraDebugProvider.get_recent_events``). With
+    ``disable_internal_stt=True`` the engine's STT loop never fires
+    its own ``on_transcript_turn("them", ...)``, so the plugin's
+    transcription handler is the only place a "what the user said"
+    event gets logged. Verify it does so."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "what time is it", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    events = svc.get_recent_events("alice@example.com", limit=50)
+    final = [e for e in events if e["kind"] == "transcription_final"]
+    assert len(final) == 1
+    assert "what time is it" in final[0]["message"]
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_echo_suppressed_transcript_surfaced_in_debug_buffer(
+    monkeypatch: Any,
+) -> None:
+    """Echo-suppressed transcripts must show up in the debug webview
+    with a distinct ``kind`` so the user can SEE that the mic
+    caught something but we ignored it because Gilbert was talking.
+    Without this, an over-aggressive mute window would look like
+    "Gilbert just ignored my second utterance" — frustrating to
+    debug."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    # Arm the mute window.
+    await config.on_llm_turn("hello hello", [])
+
+    # Echo arrives during the mute.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "hello", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    events = svc.get_recent_events("alice@example.com", limit=50)
+    suppressed = [e for e in events if e["kind"] == "transcription_suppressed"]
+    assert len(suppressed) == 1
+    assert "echo suppressed" in suppressed[0]["message"].lower()
+    assert "hello" in suppressed[0]["message"]
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
 async def test_partial_transcription_does_not_enqueue(
     monkeypatch: Any,
 ) -> None:
