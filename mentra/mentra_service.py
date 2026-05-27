@@ -82,12 +82,6 @@ from gilbert.interfaces.storage import (
     StorageProvider,
 )
 from gilbert.interfaces.tools import ToolParameterType
-from gilbert.interfaces.transcription import (
-    AudioEncoding,
-)
-from gilbert.interfaces.transcription import (
-    AudioFormat as STTAudioFormat,
-)
 from gilbert.interfaces.tts import AudioFormat as TTSAudioFormat
 
 from .session import MentraSession, MentraSessionConfig, WebSocketTransport
@@ -1047,17 +1041,57 @@ class MentraService(Service):
             audio_out=sink,
             events=None,  # type: ignore[arg-type]
         )
+        # ``audio_in`` is never iterated when ``disable_internal_stt``
+        # is True (engine listen loop early-returns) — wire a fresh
+        # generator anyway so the dataclass field isn't None for any
+        # observer that introspects it.
         conv_session.audio_in = conv_session._audio_in_iter()  # type: ignore[assignment]
         conv_session.events = conv_session._events_iter()  # type: ignore[assignment]
 
-        # Wire MicManager → engine queue. Subscribing also tells the
-        # cloud to start shipping binary frames (lazy — no bandwidth
-        # without a consumer). Held in scope so the cleanup block
-        # can unsubscribe explicitly.
-        async def _on_audio_chunk(chunk: Any) -> None:
-            await conv_session.push_audio_chunk(chunk.data)
+        # Cloud transcription → engine inject queue.
+        #
+        # Why not feed raw PCM to the engine's STT pump? Mentra Cloud
+        # does NOT actually stream binary audio_chunk frames to apps
+        # on Mentra Live + iOS (observed in production: the
+        # subscription is sent but no binary frames arrive — the
+        # engine's pump starves, Scribe idle-times out after 15s,
+        # the listen loop reopens, then the audio_in generator is
+        # closed-on-reopen and Gilbert stops responding entirely).
+        # The cloud DOES ship cloud-side transcription results via
+        # the JSON ``transcription`` stream — that's the path
+        # everything actually works on. Subscribe to it and feed
+        # the engine via its synthetic-turn queue, which behaves
+        # identically to an STT-driven turn from the engine's
+        # perspective.
+        inject_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
 
-        mic_cleanup = session.mic.on_audio_chunk(_on_audio_chunk)
+        async def _on_transcription(data: Any) -> None:
+            # Only commit on isFinal — partials are noise, the engine
+            # would re-think on every keystroke.
+            if not getattr(data, "is_final", False):
+                return
+            text = (getattr(data, "text", "") or "").strip()
+            if not text:
+                return
+            logger.info(
+                "Mentra transcription final — session=%s len=%d text=%r",
+                session.session_id,
+                len(text),
+                text[:100],
+            )
+            try:
+                inject_queue.put_nowait(text)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Mentra inject queue full — dropping transcript "
+                    "(session=%s text=%r)",
+                    session.session_id,
+                    text[:60],
+                )
+
+        transcription_cleanup = session.transcription.on_transcription(
+            _on_transcription
+        )
 
         # Engine callbacks — Mentra-specific behaviour bolted onto
         # the otherwise modality-agnostic engine.
@@ -1128,15 +1162,6 @@ class MentraService(Service):
             )
         ]
 
-        # Mic format coming off the glasses (per MicManager): 16 kHz
-        # mono 16-bit signed PCM. Engine should NOT decode ulaw on
-        # the way to STT.
-        pcm_16k_mono = STTAudioFormat(
-            encoding=AudioEncoding.PCM_S16LE,
-            sample_rate=16000,
-            channels=1,
-        )
-
         config = ConversationConfig(
             system_prompt=self._system_prompt,
             # No brain-tool provider needed — we run in
@@ -1163,8 +1188,14 @@ class MentraService(Service):
             tts_realtime_pacing=False,
             use_full_ai_service=True,
             source="mentra",
-            audio_input_format=pcm_16k_mono,
-            stt_audio_format=pcm_16k_mono,
+            # Skip the engine's internal STT — Mentra Cloud handles
+            # transcription server-side and ships finalised text
+            # via the ``transcription`` JSON stream. We feed every
+            # final turn into ``inject_synthetic_user_turn_queue``
+            # above; the engine's synthetic-turn loop processes
+            # each one identically to an STT-driven turn.
+            disable_internal_stt=True,
+            inject_synthetic_user_turn_queue=inject_queue,
         )
 
         # Kick the engine off with an ACTIVE event so its opening
@@ -1190,13 +1221,13 @@ class MentraService(Service):
                 session.session_id,
             )
         finally:
-            # Unsubscribe from mic chunks so we stop paying bandwidth
-            # for a session that no longer has anyone listening.
+            # Unsubscribe from the transcription stream so we stop
+            # paying bandwidth for a session no engine is consuming.
             try:
-                mic_cleanup()
+                transcription_cleanup()
             except Exception:
                 logger.debug(
-                    "mic cleanup raised (session=%s)",
+                    "transcription cleanup raised (session=%s)",
                     session.session_id,
                     exc_info=True,
                 )

@@ -547,17 +547,17 @@ async def test_session_admit_hands_session_to_voice_brain(
     assert session.events is not None
     # Config shape: full Gilbert tool ecosystem mode, MP3 output for
     # cloud-fetchable bytes, no realtime pacing (Mentra Cloud fetches
-    # whole clip), STT at 16 kHz PCM (mic format).
-    from gilbert.interfaces.transcription import AudioEncoding
+    # whole clip), internal STT disabled (Mentra Cloud handles
+    # transcription server-side), inject queue wired so the synthetic
+    # turn loop picks up cloud transcripts.
     from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
 
     assert config.use_full_ai_service is True
     assert config.source == "mentra"
     assert config.tts_output_format == _TTSAudioFormat.MP3
     assert config.tts_realtime_pacing is False
-    assert config.stt_audio_format is not None
-    assert config.stt_audio_format.encoding == AudioEncoding.PCM_S16LE
-    assert config.stt_audio_format.sample_rate == 16000
+    assert config.disable_internal_stt is True
+    assert config.inject_synthetic_user_turn_queue is not None
     # Opening policy fires the welcome via the LLM rather than a
     # bespoke welcome string in the plugin.
     from gilbert.interfaces.conversation import OpeningBehavior
@@ -598,12 +598,20 @@ async def test_session_admit_pushes_active_event_to_engine(
 
 
 @pytest.mark.asyncio
-async def test_mic_audio_flows_into_engine_audio_in(
+async def test_cloud_transcription_finals_enqueued_for_engine(
     monkeypatch: Any,
 ) -> None:
-    """Binary mic frames the cloud sends must land on the engine's
-    ``audio_in`` iterator. Without this wiring the engine sits with
-    no audio to feed STT and Gilbert can't hear anything."""
+    """Mentra Cloud handles STT server-side and ships finalised
+    transcripts via the ``transcription`` JSON stream. The plugin
+    must pull those out and push into the engine's
+    ``inject_synthetic_user_turn_queue`` so the engine's synthetic
+    turn loop sees them as user turns.
+
+    Regression test for the production failure where raw PCM mic
+    chunks never arrived (Mentra Cloud doesn't ship binary frames
+    on Mentra Live + iOS), so the engine's internal STT pump
+    starved and Gilbert silently stopped responding after the
+    welcome greeting."""
     brain = _FakeVoiceBrain()
     brain.hold_until = asyncio.Event()
     svc, _, _, _, _ = await _start_service(brain=brain)
@@ -613,17 +621,65 @@ async def test_mic_audio_flows_into_engine_audio_in(
     for _ in range(3):
         await asyncio.sleep(0)
 
-    # Inject a binary mic frame through the transport.
-    session = svc._sessions["sess_001"]  # noqa: SLF001
-    pcm_chunk = b"\x00\x01" * 80  # 160 bytes ≈ 5ms of 16 kHz mono PCM
-    await session.mic.handle_binary_audio(pcm_chunk)
-
-    # Pull the chunk off the engine's audio iterator.
-    conv_session, _ = brain.calls[0]
-    chunk = await asyncio.wait_for(
-        conv_session.audio_in.__anext__(), timeout=1.0
+    # Inject a final transcription via the cloud's data_stream path
+    # (mirrors how the real cloud delivers transcription events).
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {
+                "text": "what time is it",
+                "isFinal": True,
+            },
+        }
     )
-    assert chunk == pcm_chunk
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # The plugin should have pushed the text into the inject queue
+    # that was handed to the engine via ConversationConfig.
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+    text = queue.get_nowait()
+    assert text == "what time is it"
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_partial_transcription_does_not_enqueue(
+    monkeypatch: Any,
+) -> None:
+    """Only ``isFinal=True`` transcriptions hit the engine. Partials
+    would re-trigger the LLM on every keystroke and double-spend
+    tokens."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "what tim", "isFinal": False},
+        }
+    )
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "what time", "isFinal": False},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+    assert queue.empty()
 
     brain.hold_until.set()
 
