@@ -66,6 +66,49 @@ _DEFAULT_LIVE_MODEL = "scribe_v2_realtime"
 _DEFAULT_LIVE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 
+def _aggregate_speaker_id(msg: dict[str, Any]) -> str:
+    """Reduce the per-word ``speaker_id`` fields in a Scribe Realtime
+    ``committed_transcript_with_timestamps`` (or
+    ``partial_transcript`` when timestamps are enabled) frame into a
+    single utterance-level label.
+
+    Scribe Realtime exposes diarization per-WORD inside the
+    ``words[]`` array — there's no dedicated diarize flag on the
+    realtime endpoint, only the per-word ids you get back when
+    ``include_timestamps=true``. For echo suppression we only need to
+    know "is this Gilbert or the user?" so a per-utterance label is
+    enough. We pick the most-frequent ``speaker_id`` across the
+    utterance's words; ties are broken by first appearance order.
+
+    Returns ``""`` when:
+      - the frame doesn't carry a ``words[]`` array (untimestamped
+        events / older protocol revs / partials without timestamps),
+      - the ``words[]`` array is empty,
+      - none of the words carry a ``speaker_id`` field.
+    """
+    words = msg.get("words")
+    if not isinstance(words, list) or not words:
+        return ""
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        sid = w.get("speaker_id")
+        if sid is None:
+            continue
+        sid_str = str(sid)
+        if sid_str not in counts:
+            order.append(sid_str)
+            counts[sid_str] = 0
+        counts[sid_str] += 1
+    if not counts:
+        return ""
+    # Majority vote; ties broken by first-appearance index so the
+    # result is deterministic given the same input.
+    return max(order, key=lambda sid: (counts[sid], -order.index(sid)))
+
+
 def _common_config(default_model: str) -> list[ConfigParam]:
     return [
         ConfigParam(
@@ -302,6 +345,7 @@ class _ScribeLiveStream(TranscriptionStream):
             if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
                     text=str(msg.get("text") or msg.get("transcript") or ""),
+                    speaker_label=_aggregate_speaker_id(msg),
                     start_seconds=float(msg.get("start", 0.0)),
                 )
             elif kind in (
@@ -313,6 +357,7 @@ class _ScribeLiveStream(TranscriptionStream):
                     text=str(msg.get("text") or msg.get("transcript") or ""),
                     start_seconds=float(msg.get("start", 0.0)),
                     end_seconds=float(msg.get("end", 0.0)),
+                    speaker_label=_aggregate_speaker_id(msg),
                 )
             elif kind in ("speech_started", "vad_speech_start"):
                 yield SpeechStarted(at_seconds=float(msg.get("at", 0.0)))
@@ -420,6 +465,14 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
         }
         if config.language and config.language != "auto":
             params["language_code"] = config.language
+        # Speaker diarization. Scribe Realtime doesn't have a documented
+        # ``diarize`` query param; instead it includes per-word
+        # ``speaker_id`` fields in ``committed_transcript_with_timestamps``
+        # frames when ``include_timestamps=true``. Opt in only when the
+        # caller asked for diarize so we don't pay for timestamp metadata
+        # we'd otherwise discard.
+        if getattr(config, "diarize", False):
+            params["include_timestamps"] = "true"
         url = f"{self._ws_url}?{urlencode(params)}"
 
         # Pass an explicit SSL context using certifi's CA bundle. On

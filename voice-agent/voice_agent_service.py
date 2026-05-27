@@ -1552,6 +1552,22 @@ class VoiceAgentService(Service):
             # ``ctx.outcome["end_requested"]`` and the engine notices
             # after each chat() round.
             use_full_ai_service=True,
+            # Speaker-id echo suppression. Voice-agent's typical
+            # setup (laptop mic + laptop speakers, or any open-air
+            # setup) bleeds Gilbert's TTS straight back into the mic
+            # and Scribe transcribes it as a "user turn" → infinite
+            # self-talk loop. With diarize_speakers=True the engine
+            # asks Scribe Realtime for per-utterance speaker labels,
+            # then classifies first sightings: any speaker_label
+            # heard while ``speaking.active`` becomes Gilbert (echo)
+            # and gets dropped from then on. Confirmed-user speakers
+            # still flow through during Gilbert's TTS → barge-in
+            # works exactly as before.
+            #
+            # Backend cost: Scribe Realtime gets ``include_timestamps=true``
+            # in its query string, which gives back per-word
+            # ``speaker_id`` fields the engine aggregates.
+            diarize_speakers=True,
             # Tag the underlying ai.chat() conversation so it doesn't
             # clutter the chat sidebar. Voice-agent already persists
             # its own _VoiceConversationRecord (visible at /voice);
