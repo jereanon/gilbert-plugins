@@ -1,0 +1,10 @@
+name: mentra
+version: "0.1.0"
+description: "Mentra smart-glasses platform — voice assistant + glanceable dashboard + ambient HUD on Even Realities G1, Vuzix Z100, Mentra Live, and other MentraOS devices."
+
+provides:
+  - mentra
+  - mentra_webhook
+
+requires: []
+depends_on: []

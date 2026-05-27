@@ -61,11 +61,90 @@ type SessionState =
 type SessionMode = "turn_based" | "conversational";
 
 const TARGET_SAMPLE_RATE = 16000;
-// We downsample with a ScriptProcessor of bufferSize 4096; at the
-// browser's native 48 kHz that's ~85 ms per buffer (4096/48000). After
-// downsample to 16 kHz it's 4096 * (16000/48000) ≈ 1365 PCM samples
-// per buffer. We send each buffer as its own ws frame.
-const SCRIPT_PROCESSOR_BUFFER_SIZE = 4096;
+// AudioWorkletNode emits one chunk per ~85 ms of target-rate audio
+// (~1365 samples at 16 kHz). The worklet runs off the main thread on
+// a dedicated audio-rendering thread, so its callback timing isn't
+// affected by React renders / TTS playback / GC pauses on the main
+// thread — fixing the 20-second mic-capture lag that the old
+// ScriptProcessorNode setup hit under load.
+const CHUNK_DURATION_MS = 85;
+
+// Inline AudioWorklet processor. Lives as a string + Blob URL so the
+// plugin doesn't need a separate worklet asset (Vite static-asset
+// handling for plugins is awkward — Blob URL is universal and works
+// regardless of the build's asset-resolution config).
+//
+// The worklet:
+//   1. Accumulates 128-sample Float32 frames from the input (audio
+//      thread's quantum)
+//   2. Downsamples to 16 kHz by averaging blocks of `downsampleRatio`
+//      source samples per output sample
+//   3. Converts each averaged sample to Int16
+//   4. postMessages a complete chunk back to the main thread once
+//      we've accumulated ~85 ms of target-rate audio
+//
+// Critical: returns `true` from process() so the audio thread keeps
+// scheduling it (returning false would have the worklet GC'd after
+// one frame).
+const MIC_WORKLET_CODE = /* js */ `
+class MicDownsampleProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const opts = (options && options.processorOptions) || {};
+    this._targetRate = opts.targetSampleRate || 16000;
+    this._chunkDurationMs = opts.chunkDurationMs || 85;
+    // sampleRate is a global in worklet scope (set by the AudioContext)
+    this._sourceRate = sampleRate;
+    this._downsampleRatio = this._sourceRate / this._targetRate;
+    this._chunkSamples = Math.floor((this._targetRate * this._chunkDurationMs) / 1000);
+    this._sourceSamplesPerChunk = Math.ceil(this._chunkSamples * this._downsampleRatio);
+    // Rolling accumulator of source-rate samples until we have enough
+    // for a chunk. Float32Array because that's what input arrives as.
+    this._acc = new Float32Array(0);
+  }
+
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || input.length === 0 || !input[0]) {
+      return true;
+    }
+    const channel = input[0]; // mono — we asked for 1 channel
+    // Append to accumulator.
+    const merged = new Float32Array(this._acc.length + channel.length);
+    merged.set(this._acc);
+    merged.set(channel, this._acc.length);
+    this._acc = merged;
+
+    while (this._acc.length >= this._sourceSamplesPerChunk) {
+      const slice = this._acc.subarray(0, this._sourceSamplesPerChunk);
+      // Copy the remainder forward (subarray is a view; we need to
+      // own the new accumulator buffer so the next iteration's
+      // \`merged\` allocation doesn't trample shared storage).
+      this._acc = new Float32Array(this._acc.subarray(this._sourceSamplesPerChunk));
+
+      const out = new Int16Array(this._chunkSamples);
+      for (let i = 0; i < this._chunkSamples; i++) {
+        const start = Math.floor(i * this._downsampleRatio);
+        const end = Math.floor((i + 1) * this._downsampleRatio);
+        let sum = 0;
+        let n = 0;
+        for (let j = start; j < end && j < slice.length; j++) {
+          sum += slice[j];
+          n++;
+        }
+        const v = n > 0 ? sum / n : 0;
+        const clamped = Math.max(-1, Math.min(1, v));
+        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+      }
+      // Transfer the buffer to avoid copying it across the worklet
+      // boundary — single bulk move instead of element-by-element.
+      this.port.postMessage(out.buffer, [out.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('mic-downsample-processor', MicDownsampleProcessor);
+`;
 
 export function VoiceAgentPage(): ReactElement {
   const { connected, rpc, subscribe } = useWebSocket();
@@ -83,13 +162,21 @@ export function VoiceAgentPage(): ReactElement {
   // referencing it before declaration.
   const audioCtxRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
 
   const teardownAudio = useCallback(() => {
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    if (workletNodeRef.current) {
+      // Closing the port first stops the worklet's postMessage
+      // delivery; disconnect cuts it out of the audio graph so the
+      // audio thread stops scheduling its process().
+      try {
+        workletNodeRef.current.port.close();
+      } catch {
+        /* ignore */
+      }
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
     if (sourceRef.current) {
       sourceRef.current.disconnect();
@@ -121,6 +208,18 @@ export function VoiceAgentPage(): ReactElement {
         typeof data.ts === "number" ? data.ts : Number(data.ts ?? 0);
       if (!who || !text) return;
       const receivedAt = Date.now();
+      // Diagnostic: log when each transcript event arrives in the
+      // browser so we can cross-reference against the server's
+      // ``voice_agent.transcript_turn`` publish timestamp in the
+      // journal. If wall-clock delta is small, WS delivery is
+      // healthy; if it's seconds, we have WS-side starvation that
+      // the AudioWorkletNode migration won't fix on its own. Keep
+      // the log lean — every transcript turn fires this, on every
+      // active voice session, for every user.
+      // eslint-disable-next-line no-console
+      console.debug(
+        `[voice_agent] transcript event who=${who} chars=${text.length} received=${receivedAt} perfNow=${Math.round(performance.now())}`
+      );
       const newTurn: TranscriptTurn = {
         who,
         text,
@@ -245,48 +344,72 @@ export function VoiceAgentPage(): ReactElement {
     const newSessionId = resp.session_id;
     setSessionId(newSessionId);
 
-    // Wire up the audio graph: MediaStreamSource → ScriptProcessor →
-    // (discard the output, we don't want a feedback loop with the
-    // speakers; the ScriptProcessor's `onaudioprocess` gives us the
-    // input buffer regardless of whether the output is connected).
+    // Wire up the audio graph:
+    //   MediaStreamSource → AudioWorkletNode (off-thread downsample
+    //                       + Int16 conversion) → muted gain →
+    //                       AudioContext destination
+    //
+    // The AudioWorkletNode runs on a dedicated audio-rendering thread.
+    // Critically, its process() callback is scheduled by the audio
+    // subsystem at fixed 128-sample boundaries regardless of what's
+    // happening on the main JS thread — React renders, TTS clip
+    // decoding, GC pauses, etc. can't starve it.
+    //
+    // The previous ScriptProcessorNode ran on the main thread; under
+    // sustained load (e.g. long TTS playback decoding in parallel)
+    // its onaudioprocess callbacks got delayed, the audio context
+    // buffered the missed input, and the SPA's transcript display
+    // lagged ~20s behind real speech. That's what this migration
+    // fixes.
     const audioCtx = new AudioContext();
     audioCtxRef.current = audioCtx;
+
+    // Register the worklet via a Blob URL — keeps the worklet code
+    // co-located with this component without needing Vite static-
+    // asset handling for plugin frontends.
+    const blob = new Blob([MIC_WORKLET_CODE], {
+      type: "application/javascript",
+    });
+    const workletUrl = URL.createObjectURL(blob);
+    try {
+      await audioCtx.audioWorklet.addModule(workletUrl);
+    } catch (err) {
+      URL.revokeObjectURL(workletUrl);
+      setError(
+        err instanceof Error
+          ? `Failed to load audio worklet: ${err.message}`
+          : "Failed to load audio worklet"
+      );
+      teardownAudio();
+      setState("idle");
+      return;
+    }
+    URL.revokeObjectURL(workletUrl);
+
     const sourceNode = audioCtx.createMediaStreamSource(stream);
     sourceRef.current = sourceNode;
-    const processor = audioCtx.createScriptProcessor(
-      SCRIPT_PROCESSOR_BUFFER_SIZE,
-      1,
-      1
-    );
-    processorRef.current = processor;
 
-    const sourceSampleRate = audioCtx.sampleRate;
-    const downsampleRatio = sourceSampleRate / TARGET_SAMPLE_RATE;
-
-    processor.onaudioprocess = (event) => {
-      // Input buffer is Float32 in [-1, 1] at the AudioContext's
-      // native sample rate (typically 48000 Hz). Downsample by
-      // averaging blocks of `downsampleRatio` samples, then convert
-      // each averaged sample to int16.
-      const input = event.inputBuffer.getChannelData(0);
-      const outLen = Math.floor(input.length / downsampleRatio);
-      const out = new Int16Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        const start = Math.floor(i * downsampleRatio);
-        const end = Math.floor((i + 1) * downsampleRatio);
-        let sum = 0;
-        let n = 0;
-        for (let j = start; j < end && j < input.length; j++) {
-          sum += input[j];
-          n++;
-        }
-        const v = n > 0 ? sum / n : 0;
-        const clamped = Math.max(-1, Math.min(1, v));
-        out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    const workletNode = new AudioWorkletNode(
+      audioCtx,
+      "mic-downsample-processor",
+      {
+        processorOptions: {
+          targetSampleRate: TARGET_SAMPLE_RATE,
+          chunkDurationMs: CHUNK_DURATION_MS,
+        },
       }
-      // Base64-encode the bytes and ship via WS RPC. Fire-and-forget
-      // — we don't await the promise so the audio thread isn't held.
-      const bytes = new Uint8Array(out.buffer);
+    );
+    workletNodeRef.current = workletNode;
+
+    // Worklet posts an Int16 PCM ArrayBuffer per ~85ms chunk back to
+    // the main thread. We base64 + RPC on the main thread; that's
+    // unavoidable because the underlying WebSocket lives here, but
+    // the audio CAPTURE itself never gets blocked by main-thread
+    // work. Fire-and-forget RPC so we don't await a server roundtrip
+    // before the next chunk can be queued.
+    workletNode.port.onmessage = (event) => {
+      const arrayBuf = event.data as ArrayBuffer;
+      const bytes = new Uint8Array(arrayBuf);
       let bin = "";
       for (let i = 0; i < bytes.byteLength; i++) {
         bin += String.fromCharCode(bytes[i]);
@@ -301,13 +424,13 @@ export function VoiceAgentPage(): ReactElement {
       });
     };
 
-    sourceNode.connect(processor);
-    // ScriptProcessor needs its output connected for `onaudioprocess`
-    // to fire reliably across browsers. Route to a dummy gain that
-    // muted to zero so we don't echo the mic back to the speakers.
+    sourceNode.connect(workletNode);
+    // Worklet's process() runs reliably as long as the node is
+    // connected to a destination. Route to a muted gain so we don't
+    // echo the mic back into the speakers.
     const muted = audioCtx.createGain();
     muted.gain.value = 0;
-    processor.connect(muted);
+    workletNode.connect(muted);
     muted.connect(audioCtx.destination);
 
     setState("active");

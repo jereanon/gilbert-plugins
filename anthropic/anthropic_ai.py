@@ -196,9 +196,18 @@ class AnthropicAI(AIBackend):
         self._temperature: float = 0.7
 
     async def initialize(self, config: dict[str, Any]) -> None:
+        from .shared_key import register_anthropic_api_key
+
         api_key = config.get("api_key")
         if not api_key:
             raise ValueError("AnthropicAI requires 'api_key' in config")
+
+        # Seed the plugin-local shared key so sibling backends
+        # (Anthropic Vision in particular) can reuse it without the
+        # operator pasting the same key under multiple Settings
+        # pages. Vision's initialize() falls back to this when its
+        # own ``api_key`` config is empty.
+        register_anthropic_api_key(str(api_key), source="ai")
 
         self._model = str(config.get("model", _DEFAULT_MODEL))
         raw_enabled = config.get("enabled_models")
@@ -589,14 +598,85 @@ class AnthropicAI(AIBackend):
         }
 
         if request.system_prompt:
-            body["system"] = request.system_prompt
+            body["system"] = self._build_system_blocks(request.system_prompt)
 
         if request.tools:
             body["tools"] = self._build_tools(request.tools)
 
         body["temperature"] = self._temperature
 
+        # Prompt-caching breakpoint on the most-recent user turn.
+        # Anthropic caches the prefix up to and including the tagged
+        # block. Tagging the last user message extends the cache to
+        # cover the conversation history — so the NEXT call (within
+        # 5min, with the same tools+system+history prefix) reads
+        # ~all of this input at the 0.1× cache rate. The agent loop's
+        # tool_use → tool_result back-and-forth is exactly the burst
+        # pattern this win compounds on. See:
+        # https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+        self._tag_last_message_cacheable(body["messages"])
+
         return body
+
+    @staticmethod
+    def _build_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
+        """Wrap the system prompt as a single content-block list with
+        a ``cache_control`` marker. Anthropic accepts either a bare
+        string or a list of content blocks; the list form is what lets
+        us attach the cache marker. This is breakpoint #2 (tools is
+        #1, last user msg is #3).
+
+        The whole system prompt is one block — splitting it into
+        multiple cacheable chunks adds complexity without changing the
+        cache behavior, since Anthropic caches the prefix up to each
+        marker and we have at most 4 markers total.
+        """
+        return [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    @staticmethod
+    def _tag_last_message_cacheable(messages: list[dict[str, Any]]) -> None:
+        """Attach ``cache_control: {"type": "ephemeral"}`` to the last
+        content block of the last message in the request.
+
+        Tagging the LAST block of the LAST message tells Anthropic to
+        cache the entire prefix — system + tools + every prior turn.
+        On the next call within the 5-minute window, the model reads
+        that whole prefix from the cache (cheap) and only spends fresh
+        input tokens on whatever's added after it.
+
+        We never tag a NEW user turn alone (that would only cache the
+        single message + everything before it, which is what we want
+        anyway). Mutates in place; returns nothing.
+        """
+        if not messages:
+            return
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            # Plain-string content — promote to a single text block so
+            # we can attach the cache marker.
+            last["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+            return
+        if isinstance(content, list) and content:
+            # Mutate the last block in place. Skip if it's an opaque
+            # type we don't know about — better to leave the request
+            # cache-control-free than to corrupt a block we don't
+            # understand.
+            target = content[-1]
+            if isinstance(target, dict):
+                target["cache_control"] = {"type": "ephemeral"}
 
     def _build_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
         """Convert internal messages to Anthropic content block format."""
@@ -991,15 +1071,32 @@ class AnthropicAI(AIBackend):
 
     @staticmethod
     def _build_tools(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-        """Convert tool definitions to Anthropic tool schema format."""
-        return [
+        """Convert tool definitions to Anthropic tool schema format.
+
+        Sorts by tool name so the serialized list is byte-stable
+        across calls — Anthropic's prompt cache invalidates if the
+        tools block differs by even one byte, and Python's dict
+        iteration is technically insertion-ordered but anything
+        upstream that builds the tool list from a set or threads
+        across coroutines could reorder it. Cheap defensive measure.
+
+        The LAST tool in the sorted list gets a ``cache_control``
+        marker — that's breakpoint #1 of the four Anthropic allows.
+        With ~190 tools at ~15-25k tokens combined, this is the
+        biggest single cache win.
+        """
+        sorted_tools = sorted(tools, key=lambda t: t.name)
+        result: list[dict[str, Any]] = [
             {
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.to_json_schema(),
             }
-            for tool in tools
+            for tool in sorted_tools
         ]
+        if result:
+            result[-1]["cache_control"] = {"type": "ephemeral"}
+        return result
 
     # --- Response Parsing ---
 

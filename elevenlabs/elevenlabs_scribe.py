@@ -66,6 +66,49 @@ _DEFAULT_LIVE_MODEL = "scribe_v2_realtime"
 _DEFAULT_LIVE_WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
 
+def _aggregate_speaker_id(msg: dict[str, Any]) -> str:
+    """Reduce the per-word ``speaker_id`` fields in a Scribe Realtime
+    ``committed_transcript_with_timestamps`` (or
+    ``partial_transcript`` when timestamps are enabled) frame into a
+    single utterance-level label.
+
+    Scribe Realtime exposes diarization per-WORD inside the
+    ``words[]`` array — there's no dedicated diarize flag on the
+    realtime endpoint, only the per-word ids you get back when
+    ``include_timestamps=true``. For echo suppression we only need to
+    know "is this Gilbert or the user?" so a per-utterance label is
+    enough. We pick the most-frequent ``speaker_id`` across the
+    utterance's words; ties are broken by first appearance order.
+
+    Returns ``""`` when:
+      - the frame doesn't carry a ``words[]`` array (untimestamped
+        events / older protocol revs / partials without timestamps),
+      - the ``words[]`` array is empty,
+      - none of the words carry a ``speaker_id`` field.
+    """
+    words = msg.get("words")
+    if not isinstance(words, list) or not words:
+        return ""
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for w in words:
+        if not isinstance(w, dict):
+            continue
+        sid = w.get("speaker_id")
+        if sid is None:
+            continue
+        sid_str = str(sid)
+        if sid_str not in counts:
+            order.append(sid_str)
+            counts[sid_str] = 0
+        counts[sid_str] += 1
+    if not counts:
+        return ""
+    # Majority vote; ties broken by first-appearance index so the
+    # result is deterministic given the same input.
+    return max(order, key=lambda sid: (counts[sid], -order.index(sid)))
+
+
 def _common_config(default_model: str) -> list[ConfigParam]:
     return [
         ConfigParam(
@@ -200,6 +243,15 @@ class _ScribeLiveStream(TranscriptionStream):
         # Telemetry — first send + first recv are the diagnostic
         # gold for "is the pipe actually moving."
         self._sent_count = 0
+        # Dedupe ring for FinalTranscript emission — Scribe sends
+        # both committed_transcript (fast) and
+        # committed_transcript_with_timestamps (delayed 20-30s) for
+        # the same utterance. We keep only the first arrival per
+        # (text, end_ms) pair so the engine doesn't dispatch the
+        # same user turn twice. Key uses integer milliseconds so a
+        # 1e-9 float-drift between the two variants doesn't defeat
+        # the match. See events() for the full story.
+        self._recent_final_keys: list[tuple[str, int]] = []
 
     async def send(self, chunk: bytes) -> None:
         if self._closed:
@@ -302,6 +354,7 @@ class _ScribeLiveStream(TranscriptionStream):
             if kind == "partial_transcript" or kind == "partial":
                 yield PartialTranscript(
                     text=str(msg.get("text") or msg.get("transcript") or ""),
+                    speaker_label=_aggregate_speaker_id(msg),
                     start_seconds=float(msg.get("start", 0.0)),
                 )
             elif kind in (
@@ -309,10 +362,56 @@ class _ScribeLiveStream(TranscriptionStream):
                 "committed_transcript_with_timestamps",
                 "final",
             ):
+                # Dedupe across the plain + timestamped variants of
+                # the same utterance. Scribe Realtime emits BOTH:
+                # ``committed_transcript`` fires fast at end-of-VAD,
+                # then ``committed_transcript_with_timestamps`` for
+                # the same text 20-30s later (verified live —
+                # observed gap was 27s). Without dedupe the engine
+                # dispatches the user's turn TWICE, producing
+                # duplicate AI replies / repeated TTS playback.
+                #
+                # Keep only the first-arriving variant per (text,
+                # end_ms) tuple. The end-time disambiguator protects
+                # against the legitimate case where the user said
+                # the same words twice in a row; integer
+                # milliseconds protect against float-drift between
+                # the plain + timestamped variants of the same
+                # utterance (Scribe has been observed to round to
+                # different decimal places across the two).
+                final_text = str(
+                    msg.get("text") or msg.get("transcript") or ""
+                )
+                end_seconds = float(msg.get("end", 0.0))
+                # Skip dedupe for empty finals — Scribe occasionally
+                # emits silence-only commits and we don't want them
+                # to poison the ring (or get yielded as empty
+                # FinalTranscripts that the engine then dispatches
+                # to the LLM as a no-op turn).
+                if not final_text:
+                    continue
+                end_ms = int(round(end_seconds * 1000))
+                dedup_key = (final_text, end_ms)
+                if dedup_key in self._recent_final_keys:
+                    logger.info(
+                        "Scribe Live: suppressing duplicate final "
+                        "(%s) for text=%r end=%.2f",
+                        kind,
+                        final_text[:80],
+                        end_seconds,
+                    )
+                    continue
+                self._recent_final_keys.append(dedup_key)
+                # Bounded ring so memory stays flat even across long
+                # sessions. 32 deep covers every reasonable
+                # plain+timestamped pairing while staying tiny.
+                if len(self._recent_final_keys) > 32:
+                    self._recent_final_keys.pop(0)
                 yield FinalTranscript(
-                    text=str(msg.get("text") or msg.get("transcript") or ""),
+                    text=final_text,
                     start_seconds=float(msg.get("start", 0.0)),
-                    end_seconds=float(msg.get("end", 0.0)),
+                    end_seconds=end_seconds,
+                    speaker_label=_aggregate_speaker_id(msg),
                 )
             elif kind in ("speech_started", "vad_speech_start"):
                 yield SpeechStarted(at_seconds=float(msg.get("at", 0.0)))
@@ -420,6 +519,14 @@ class ElevenLabsScribeLiveBackend(StreamingTranscriptionBackend):
         }
         if config.language and config.language != "auto":
             params["language_code"] = config.language
+        # Speaker diarization. Scribe Realtime doesn't have a documented
+        # ``diarize`` query param; instead it includes per-word
+        # ``speaker_id`` fields in ``committed_transcript_with_timestamps``
+        # frames when ``include_timestamps=true``. Opt in only when the
+        # caller asked for diarize so we don't pay for timestamp metadata
+        # we'd otherwise discard.
+        if getattr(config, "diarize", False):
+            params["include_timestamps"] = "true"
         url = f"{self._ws_url}?{urlencode(params)}"
 
         # Pass an explicit SSL context using certifi's CA bundle. On

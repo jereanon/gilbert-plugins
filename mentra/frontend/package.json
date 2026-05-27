@@ -1,0 +1,13 @@
+{
+  "name": "@gilbert-plugin/mentra-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Mentra admin SPA panel — user-mapping CRUD + live glasses-session table.",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}

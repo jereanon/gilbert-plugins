@@ -45,6 +45,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [jellyfin](#jellyfin) | `MediaLibraryBackend "jellyfin"` | — (uses `httpx`) | Media |
 | [kokoro](#kokoro) | `TTSBackend "kokoro"` | `kokoro`, `torch`, `av`, `numpy` | Speech |
 | [lutron-radiora](#lutron-radiora) | `LightsBackend "lutron-radiora"`, `ShadesBackend "lutron-radiora"` | `pylutron` | Lighting |
+| [mentra](#mentra) | `mentra` service (`MentraService` + `mentra_webhook` capability) — Gilbert on Mentra smart glasses (Even Realities G1, Vuzix Z100, Mentra Live) | `websockets>=12` | Wearables |
 | [messaging](#messaging) | `messaging` service (`MessagingService` + `send_text_message` AI tool, `/messages` SPA page) — RCS / MMS / SMS, RCS by default | — (pure stdlib) | Communication |
 | [mistral](#mistral) | `AIBackend "mistral"` | — (uses `httpx`) | Intelligence |
 | [ngrok](#ngrok) | `TunnelBackend "ngrok"` | `pyngrok` | Infrastructure |
@@ -777,6 +778,53 @@ Both backends advertise the same connection parameters so the lights and shades 
 **Config action** — `test_connection`: connects to the repeater and reports the discovered light + shade counts.
 
 **Third-party deps** — `pylutron>=0.4.1`.
+
+---
+
+### mentra
+
+Smart-glasses platform — connects Gilbert to [MentraOS](https://mentra.glass), the manufacturer-agnostic smart-glasses OS. Same app runs across Even Realities G1, Vuzix Z100, Mentra Live, and future devices. The plugin is a **Python port of the upstream TypeScript `@mentra/sdk`** — JSON-over-WebSocket protocol layer + per-feature managers — so the entire integration lives in-process inside Gilbert with no Node sidecar.
+
+**Service registered** — `MentraService`, capabilities `mentra` + `mentra_webhook` + `ws_handlers`. Toggleable (default off). Implements `Configurable` + the `MentraWebhookEndpoint` Protocol that core's `/api/mentra/webhook` route resolves. Per-session state isolated by Mentra `sessionId`; no module-level mutable state.
+
+**Architecture (inverted from carrier plugins)** — Mentra Cloud is the initiator: user launches the Gilbert app from their phone, cloud POSTs a `session_request` webhook to our app, the plugin dials BACK to the cloud-supplied `websocketUrl` and authenticates via `x-api-key` header + a `tpa_connection_init` first frame. Cloud responds with `tpa_connection_ack` carrying current settings + device capabilities. Bidirectional JSON thereafter (binary frames for raw PCM audio in both directions).
+
+**Per-session flow**
+1. Webhook arrives → service looks up Mentra `userId` (email) in the `mentra_user_mappings` collection → refuses if no mapping (no auto-create).
+2. `WebSocketTransport` opens the back-channel; `MentraSession` runs the handshake.
+3. Cloud-side capabilities (`hasDisplay`, `hasCamera`, `hasMicrophone`, …) populate `session.capabilities`; manager methods that don't apply on a given device degrade gracefully.
+4. The plugin builds a `_MentraConversationSession` adapter (mic PCM in / TTS bytes out) and hands it to the core `voice_brain` `ConversationEngine`. The engine owns the transcription → AI → TTS loop, including echo suppression, local VAD, barge-in, and tool dispatch — same engine that drives phone calls and the wake-word voice agent.
+5. Engine-synthesized MP3 lands on a `_MentraAudioSink` which registers the bytes with the `audio_blob_store` capability and tells `session.speaker.play_url` to fetch `<public_base_url>/api/audio-blob/<id>`. Mentra Cloud's server-side fetcher pulls that URL and streams the audio to the glasses speaker. AI replies also surface on the heads-up display via the engine's `on_llm_turn` callback.
+
+**Managers shipped in v1**
+- `session.transcription.on_transcription(handler)` — final + interim transcripts
+- `session.button.on_button_press(handler)` — short / long press events
+- `session.display.show_text_wall / show_double_text_wall / show_reference_card / show_bitmap / clear` — foreground display
+- `session.dashboard.write_to_main / write_to_expanded / write` — persistent glance area
+- `session.speaker.speak / play_url / stop` — cloud-side TTS + audio URL playback
+
+Camera, LED, location, and livestream managers are stubbed for follow-up — the protocol layer carries all the message-type enums + stream definitions, only the wrapper classes need adding. Audio chunk streaming (binary PCM frames in / out) is plumbed at the transport layer but no manager surfaces it yet.
+
+**Configure** (Settings → Mentra → Mentra)
+- `enabled` — Toggle the service on. Defaults `false`.
+- `api_key` *(sensitive)* — Mentra app API key from the MentraOS developer console. Sent in the WebSocket upgrade headers (`x-api-key`) and the first JSON frame to authenticate this app instance.
+- `package_name` — Reverse-DNS app identifier registered in the Mentra developer console (e.g. `com.example.gilbert`).
+- `public_base_url` — Public HTTPS URL where Gilbert is reachable (e.g. `https://gilbert.example.com`). Must match the Server URL registered with the Mentra developer console. Mentra Cloud fetches `<this>/api/audio-blob/<id>` server-side for every TTS clip the `voice_brain` engine synthesizes, so the URL has to be reachable from the public internet — localhost / LAN-only values will not work. Empty string disables outbound TTS.
+- `display_duration_ms` — How long an AI reply stays on the heads-up display before auto-clearing (default `8000`, `0` for indefinite).
+- `system_prompt` *(AI prompt, multi-line)* — System prompt the engine passes to `AIProvider.chat()` for glasses-originated turns. Tuned for brevity (small display, audio readback).
+
+**User mappings** — Operators add rows to the `mentra_user_mappings` collection mapping each authorized Mentra email to a Gilbert user. Sessions for unmapped Mentra users are refused at the webhook stage. (A future UI panel will manage this; for now use the SPA's entity-store admin tools or seed via `gilbert.yaml`.)
+
+**Plugin UI** — `/mentra` admin page (`required_role="admin"`) for managing user mappings + watching live session activity. Backend-loaded today; SPA panel ships in a follow-up.
+
+**Webhook URL** — Configure your Mentra developer console to POST session lifecycle events to `<public-url>/api/mentra/webhook`. The route is mounted by core; the plugin only owns the `mentra_webhook` capability that dispatches the payloads.
+
+**AI tools (during voice sessions)**
+- `/see [focus]` — `look_at_what_im_seeing(focus)` — captures a photo through the glasses' camera and routes the bytes to Gilbert's vision or OCR backend. `focus="general"` (default) describes the scene; `focus="text"` extracts text via OCR (signs, menus, packaging); `focus="face"` falls back to general scene description today. ONLY available during an active glasses voice session — the tool is invisible to regular chat. Requires a vision or OCR backend depending on focus (the tool returns a friendly "ask admin to configure X" message if the needed backend isn't installed).
+
+**Third-party deps** — `websockets>=12`, `certifi`, `httpx` (downloads photo bytes from Mentra Cloud's short-lived photoUrl when the camera tool fires). All three are already part of Gilbert's core install.
+
+**Reference** — Upstream SDK source: [`Mentra-Community/MentraOS/cloud/packages/sdk`](https://github.com/Mentra-Community/MentraOS/tree/dev/cloud/packages/sdk). MIT license; the Python port mirrors message-type / stream-type / layout-type names verbatim so cross-referencing the canonical client when debugging a protocol mismatch stays trivial.
 
 ---
 

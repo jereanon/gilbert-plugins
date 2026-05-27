@@ -776,6 +776,25 @@ class VoiceAgentService(Service):
             originating_conv_id,
         )
 
+        # Cross-provider session-started event the /conversations
+        # SPA page subscribes to. Matches Mentra's shape.
+        if self._bus is not None:
+            from gilbert.interfaces.events import Event
+
+            await self._bus.publish(
+                Event(
+                    event_type="conversation.session_started",
+                    data={
+                        "provider": "voice_agent",
+                        "session_id": conversation_id,
+                        "user_id": user_id,
+                        "display_name": "",  # voice-agent doesn't carry a separate display name; SPA can resolve from user_id
+                        "started_at": _now_iso(),
+                    },
+                    source="voice_agent",
+                )
+            )
+
         # Mark the session ACTIVE so the engine fires its opening
         # policy (SPEAK_FIRST). Done after task creation so the
         # status loop is running when the event arrives.
@@ -1397,6 +1416,23 @@ class VoiceAgentService(Service):
                         source="voice_agent",
                     )
                 )
+                # Cross-provider event the /conversations SPA page
+                # subscribes to. Same shape as Mentra's so the UI
+                # only wires one event name.
+                await self._bus.publish(
+                    Event(
+                        event_type="conversation.transcript_turn",
+                        data={
+                            "provider": "voice_agent",
+                            "session_id": active.conversation_id,
+                            "user_id": active.user_id,
+                            "who": who,
+                            "text": text,
+                            "ts": ts_seconds,
+                        },
+                        source="voice_agent",
+                    )
+                )
 
         async def _on_speaking_done() -> None:
             """Fired by the engine after each TTS playback completes.
@@ -1552,6 +1588,32 @@ class VoiceAgentService(Service):
             # ``ctx.outcome["end_requested"]`` and the engine notices
             # after each chat() round.
             use_full_ai_service=True,
+            # Speaker-id echo suppression. Scribe v2 Realtime does
+            # NOT actually populate per-word ``speaker_id`` today —
+            # the field exists in the response schema but always
+            # comes back as ``None`` (verified live: every word
+            # in committed_transcript_with_timestamps showed
+            # ``speaker_id: None``). ElevenLabs' own docs confirm:
+            # "Scribe v2 handles batch processing with diarization;
+            # Scribe v2 Realtime handles streaming without it."
+            #
+            # Enabling ``diarize_speakers=True`` would gain zero
+            # filtering (classifier short-circuits on empty
+            # speaker_label) AND cost latency: Scribe emits
+            # ``committed_transcript_with_timestamps`` 20-30s AFTER
+            # the plain ``committed_transcript`` for the same
+            # utterance, which would either double-dispatch through
+            # the engine or push the UI's "user said X" render that
+            # far behind the actual speech. Off until ElevenLabs
+            # ships realtime diarization for real.
+            #
+            # Voice-agent today relies on local VAD for barge-in
+            # (works fine when the user wears headphones / has OS-
+            # level AEC) and the engine's speaking-state book for
+            # the rest of echo handling.
+            # diarize_speakers=True,  # TODO re-enable when Scribe
+            #                            Realtime gains real
+            #                            per-word speaker_id values
             # Tag the underlying ai.chat() conversation so it doesn't
             # clutter the chat sidebar. Voice-agent already persists
             # its own _VoiceConversationRecord (visible at /voice);
@@ -1629,6 +1691,24 @@ class VoiceAgentService(Service):
                         )
                         if outcome
                         else "",
+                    },
+                    source="voice_agent",
+                )
+            )
+            # Cross-provider event the /conversations page subscribes
+            # to. Mirrors Mentra's session_ended shape.
+            await self._bus.publish(
+                Event(
+                    event_type="conversation.session_ended",
+                    data={
+                        "provider": "voice_agent",
+                        "session_id": active.conversation_id,
+                        "user_id": active.user_id,
+                        "reason": (
+                            "end_conversation"
+                            if outcome and outcome.outcome.get("end_requested")
+                            else "closed"
+                        ),
                     },
                     source="voice_agent",
                 )
