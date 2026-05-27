@@ -196,9 +196,18 @@ class AnthropicAI(AIBackend):
         self._temperature: float = 0.7
 
     async def initialize(self, config: dict[str, Any]) -> None:
+        from .shared_key import register_anthropic_api_key
+
         api_key = config.get("api_key")
         if not api_key:
             raise ValueError("AnthropicAI requires 'api_key' in config")
+
+        # Seed the plugin-local shared key so sibling backends
+        # (Anthropic Vision in particular) can reuse it without the
+        # operator pasting the same key under multiple Settings
+        # pages. Vision's initialize() falls back to this when its
+        # own ``api_key`` config is empty.
+        register_anthropic_api_key(str(api_key), source="ai")
 
         self._model = str(config.get("model", _DEFAULT_MODEL))
         raw_enabled = config.get("enabled_models")

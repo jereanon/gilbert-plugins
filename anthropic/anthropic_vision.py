@@ -109,16 +109,43 @@ class AnthropicVision(VisionBackend):
         self._auth_failed: bool = False
 
     async def initialize(self, config: dict[str, Any]) -> None:
+        from .shared_key import (
+            get_shared_anthropic_api_key,
+            register_anthropic_api_key,
+        )
+
         self._api_key = str(config.get("api_key", ""))
         self._model = str(config.get("model", _DEFAULT_MODEL))
         self._max_tokens = int(config.get("max_tokens", 4096))
         self._auth_failed = False
         self._client = None
 
+        # Plugin-local key sharing: if vision was started without its
+        # own API key but the AI / OCR backend already has one from
+        # the same plugin, reuse it. Saves the operator from pasting
+        # the same Anthropic key into Settings → Vision when they've
+        # already set it under Settings → AI. The per-backend value
+        # always wins when both are set.
         if self._api_key:
-            logger.info("Anthropic Vision backend initialized (model=%s)", self._model)
+            register_anthropic_api_key(self._api_key, source="vision")
+            logger.info(
+                "Anthropic Vision backend initialized (model=%s)",
+                self._model,
+            )
         else:
-            logger.warning("Anthropic Vision backend: no API key configured")
+            shared = get_shared_anthropic_api_key()
+            if shared:
+                self._api_key = shared
+                logger.info(
+                    "Anthropic Vision backend initialized (model=%s, "
+                    "api_key sourced from a sibling Anthropic backend)",
+                    self._model,
+                )
+            else:
+                logger.warning(
+                    "Anthropic Vision backend: no API key configured "
+                    "(no sibling Anthropic backend had one to share)"
+                )
 
     async def close(self) -> None:
         self._client = None

@@ -16,7 +16,12 @@ if _pkg_name not in sys.modules:
     pkg.__package__ = _pkg_name
     sys.modules[_pkg_name] = pkg
 
-    for _mod_name in ("anthropic_ai", "anthropic_vision", "plugin"):
+    for _mod_name in (
+        "shared_key",
+        "anthropic_ai",
+        "anthropic_vision",
+        "plugin",
+    ):
         # Omit ``submodule_search_locations`` so intra-plugin relative
         # imports resolve against the plugin package, not the module
         # itself. See std-plugins/unifi/tests/conftest.py for the gory
