@@ -813,8 +813,143 @@ async def test_echo_suppressed_transcript_surfaced_in_debug_buffer(
     events = svc.get_recent_events("alice@example.com", limit=50)
     suppressed = [e for e in events if e["kind"] == "transcription_suppressed"]
     assert len(suppressed) == 1
-    assert "echo suppressed" in suppressed[0]["message"].lower()
+    assert "suppressed" in suppressed[0]["message"].lower()
     assert "hello" in suppressed[0]["message"]
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_known_user_speaker_id_bypasses_mute_barge_in(
+    monkeypatch: Any,
+) -> None:
+    """The whole point of the speaker-id classifier: once we've
+    confirmed a speaker_id is the user (it spoke OUTSIDE a mute
+    window), subsequent transcripts from that same id flow through
+    even when Gilbert is currently playing audio. This is what
+    enables barge-in — the user can interrupt Gilbert mid-sentence."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    conv_session, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    # 1. User speaks first (no mute active) — speaker_id='1' goes
+    #    into seen_outside_mute → "confirmed user".
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "first question", "isFinal": True, "speakerId": "1"},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert queue.get_nowait() == "first question"
+
+    # 2. Gilbert starts speaking — mute window arms.
+    await conv_session.audio_out.write(b"FAKE_MP3" * 10_000)
+    await conv_session.audio_out.flush()
+
+    # 3. User barges in DURING the mute, still speaker_id='1'.
+    #    Pre-classifier this would have been dropped; with the
+    #    classifier their confirmed status overrides the mute.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "wait, stop", "isFinal": True, "speakerId": "1"},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    text = queue.get_nowait()
+    assert text == "wait, stop"
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_gilbert_speaker_id_dropped_even_after_mute_expires(
+    monkeypatch: Any,
+) -> None:
+    """The other half of the classifier: once a speaker_id has
+    appeared during a mute window (and never outside one), it's
+    classified as Gilbert and dropped even if a late echo arrives
+    after the time-window mute has expired. Handles the case
+    where the cloud's playback runs longer than our flush-based
+    estimate."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    conv_session, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+
+    # Gilbert speaks — sink arms mute.
+    await conv_session.audio_out.write(b"FAKE_MP3" * 10_000)
+    await conv_session.audio_out.flush()
+
+    # Echo arrives during mute — speaker_id='2' goes into
+    # seen_inside_mute. Dropped via mute window.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "echo of gilbert", "isFinal": True, "speakerId": "2"},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert queue.empty()
+
+    # Fast-forward past the mute window. Patch ``time.monotonic``
+    # used inside the handler so it returns a value past the armed
+    # mute_until.
+    import time as _time
+
+    from gilbert_plugin_mentra import mentra_service as ms
+
+    real_monotonic = _time.monotonic
+    monkeypatch.setattr(
+        ms.time, "monotonic", lambda: real_monotonic() + 60.0
+    )
+
+    # Late echo arrives outside the mute window. speaker_id='2' was
+    # already classified as Gilbert on its first sighting (inside
+    # the mute), so the classifier drops it regardless of the
+    # current mute state.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "late echo of gilbert", "isFinal": True, "speakerId": "2"},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert queue.empty()
+
+    # A NEW speaker_id arriving outside mute is trusted as a user
+    # (no prior signal to suspect them) → dispatches.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "new user speaking", "isFinal": True, "speakerId": "3"},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert queue.get_nowait() == "new user speaking"
 
     brain.hold_until.set()
 

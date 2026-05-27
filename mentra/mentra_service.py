@@ -1065,22 +1065,45 @@ class MentraService(Service):
         # ContextVar — no bleed to sibling sessions.
         set_current_user(gilbert_user)
 
-        # Echo-suppression window. The glasses' mic picks up Gilbert's
-        # own TTS playback and Mentra Cloud transcribes it; without a
-        # guard the engine would treat Gilbert's voice as the user's
-        # next turn and reply to itself in an infinite loop (observed
-        # live: full self-conversation within seconds).
+        # Echo-suppression has two cooperating layers:
         #
-        # The window is armed from inside ``_MentraAudioSink.flush()``
-        # — every TTS clip (real reply AND engine filler) goes through
-        # there, so the mute fires uniformly regardless of which
-        # engine path produced the audio. Arming from on_llm_turn
-        # would miss fillers (they bypass that callback and would
-        # bleed through as cloud-transcribed "user turns").
+        # 1. **Per-speaker "first seen" classifier.** Mentra Cloud
+        #    diarizes its transcription stream — each detected
+        #    speaker gets a stable per-session ``speakerId``. Logs
+        #    show the user comes back consistently as ``"1"`` while
+        #    Gilbert's echoes get ``"0"`` / ``"2"`` etc. The IDs are
+        #    sequential, not semantic, so we LEARN per session by
+        #    classifying each NEW speaker_id the first time we see
+        #    it:
         #
-        # Single-element list so the inner closure can mutate without
-        # ``nonlocal`` plumbing across multiple defs.
+        #      - First sighting INSIDE a mute window → classify as
+        #        Gilbert (echo). The welcome speech fires immediately
+        #        on session admit, BEFORE the user has a chance to
+        #        speak, so Gilbert is reliably the first new speaker
+        #        we see during a mute.
+        #      - First sighting OUTSIDE any mute → classify as user
+        #        (anything making sound the cloud transcribes while
+        #        Gilbert isn't playing is human speech).
+        #
+        #    The classification STICKS for the session — once a
+        #    speaker_id is labelled "user", later transcripts from
+        #    them flow through even DURING a Gilbert mute, which
+        #    restores barge-in. Once labelled "gilbert", later
+        #    transcripts get dropped regardless of mute state, which
+        #    catches late-arriving echoes after the time-window
+        #    estimate runs out.
+        #
+        # 2. **Time-window mute (fallback for unclassified ids).**
+        #    Armed from inside ``_MentraAudioSink.flush()`` — every
+        #    TTS clip (real reply AND engine filler) goes through
+        #    there, so the mute fires uniformly. Covers the rare
+        #    case where the cloud assigns a brand-new speaker_id
+        #    during a Gilbert playback (e.g. it gives Gilbert a
+        #    different id mid-session); the mute drops it on first
+        #    sight and the classifier records it as Gilbert for
+        #    next time.
         mute_until_monotonic: list[float] = [0.0]
+        speaker_class: dict[str, str] = {}  # speaker_id -> "user" | "gilbert"
 
         def _arm_mute(seconds: float) -> None:
             mute_until_monotonic[0] = time.monotonic() + seconds
@@ -1140,49 +1163,82 @@ class MentraService(Service):
             text = (getattr(data, "text", "") or "").strip()
             if not text:
                 return
-            # Mentra Cloud's transcription payload carries extra
-            # metadata we should be paying attention to — log every
-            # field so we can tell from production logs what the
-            # cloud actually labels Gilbert's echo vs the user
-            # speaking. Without this we're guessing about whether
-            # speaker diarization is something we could be filtering
-            # on (decision-relevant for echo suppression beyond the
-            # time-window mute we have today).
             speaker_id = str(getattr(data, "speaker_id", "") or "")
             confidence = float(getattr(data, "confidence", 0.0) or 0.0)
             in_mute = time.monotonic() < mute_until_monotonic[0]
+
+            # First-seen classification. New speaker_id gets a
+            # sticky label based on whether their debut was during a
+            # mute window. Existing ids keep their prior label —
+            # critical for barge-in (user labelled "user" stays
+            # "user" even when they speak during a later mute).
+            known_class = speaker_class.get(speaker_id, "")
+            if speaker_id and not known_class:
+                known_class = "gilbert" if in_mute else "user"
+                speaker_class[speaker_id] = known_class
+                logger.info(
+                    "Mentra: new speaker_id=%r classified as %r "
+                    "(first seen %s mute, session=%s)",
+                    speaker_id,
+                    known_class,
+                    "inside" if in_mute else "outside",
+                    session.session_id,
+                )
+
+            # Decision tree:
+            #   user-labelled speaker → dispatch (barge-in works)
+            #   gilbert-labelled speaker → drop (echo)
+            #   unknown speaker + in mute → drop (almost certainly
+            #                                     Gilbert; the rare
+            #                                     edge case where it's
+            #                                     a genuine user
+            #                                     utterance arriving
+            #                                     inside the first
+            #                                     mute is recoverable
+            #                                     by re-launching the
+            #                                     session)
+            #   unknown speaker + outside mute → dispatch (trust)
+            drop_reason: str | None = None
+            if known_class == "user":
+                drop_reason = None
+            elif known_class == "gilbert":
+                drop_reason = "known Gilbert speaker_id"
+            elif in_mute:
+                drop_reason = "mute window (unclassified speaker)"
+
+            gilbert_ids = sorted(
+                sid for sid, cls in speaker_class.items() if cls == "gilbert"
+            )
+            user_ids = sorted(
+                sid for sid, cls in speaker_class.items() if cls == "user"
+            )
             logger.info(
                 "Mentra transcription %s — session=%s speaker_id=%r "
-                "confidence=%.2f len=%d text=%r",
-                "(MUTED)" if in_mute else "final",
+                "class=%r confidence=%.2f gilbert_ids=%s user_ids=%s "
+                "len=%d text=%r",
+                "DROPPED" if drop_reason else "final",
                 session.session_id,
                 speaker_id,
+                known_class or "<new>",
                 confidence,
+                gilbert_ids,
+                user_ids,
                 len(text),
                 text[:120],
             )
-            if in_mute:
-                # Almost certainly Gilbert's own voice echoing back
-                # through the glasses mic. Drop loudly so the log
-                # shows the suppression happening (otherwise it
-                # looks like "Gilbert ignored what I said").
-                #
-                # Surface the suppression in the debug webview too,
-                # WITH the speaker_id + confidence — if Mentra Cloud
-                # is labeling these distinctly from the user's
-                # speech, that's a much better signal than our
-                # blunt time-window mute and we should switch to
-                # filtering on it.
+
+            if drop_reason is not None:
                 self._record_event(
                     session.user_id,
                     "transcription_suppressed",
                     (
-                        f'(echo suppressed): "{text[:160]}" '
+                        f'(suppressed: {drop_reason}): "{text[:140]}" '
                         f"[speaker={speaker_id or '<none>'} "
                         f"conf={confidence:.2f}]"
                     ),
                 )
                 return
+
             # Surface every committed user transcript in the debug
             # webview. With ``disable_internal_stt=True`` the engine
             # never emits ``on_transcript_turn("them", ...)`` itself
