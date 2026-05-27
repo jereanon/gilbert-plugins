@@ -1040,11 +1040,21 @@ class MentraService(Service):
         # loop too. Without this the engine sits forever waiting for
         # an audio_in chunk that will never come.
         async def _on_disconnect(code: int, reason: str) -> None:
-            self._sessions.pop(session.session_id, None)
-            self._connected_at.pop(session.session_id, None)
+            # IDENTITY-CHECK the registry entries against the bound
+            # ``session`` before popping. Reconnect-with-same-id is a
+            # real flow (the cloud reuses session_id across drops),
+            # and an unguarded pop would evict the BRAND-NEW session
+            # that ``_handle_session_request`` just installed —
+            # killing its engine task and orphaning a live WS reader.
+            # Symptom: brief reconnect → mic & display silently dead
+            # until the user closes the app entirely.
+            sid = session.session_id
+            if self._sessions.get(sid) is session:
+                self._sessions.pop(sid, None)
+                self._connected_at.pop(sid, None)
             logger.info(
                 "Mentra session %s closed: code=%s reason=%r",
-                session.session_id,
+                sid,
                 code,
                 reason,
             )
@@ -1062,14 +1072,19 @@ class MentraService(Service):
                 "conversation.session_ended",
                 {
                     "provider": "mentra",
-                    "session_id": session.session_id,
+                    "session_id": sid,
                     "user_id": session.gilbert_user_id or "",
                     "reason": reason or f"ws_close_{code}",
                 },
             )
-            task = self._engine_tasks.pop(session.session_id, None)
-            if task is not None and not task.done():
-                task.cancel()
+            # Engine task gets the same identity check: only cancel
+            # the task we actually spawned for THIS session, not the
+            # one the reconnect just installed under the same id.
+            task = self._engine_tasks.get(sid)
+            if task is not None and getattr(task, "_mentra_session", None) is session:
+                self._engine_tasks.pop(sid, None)
+                if not task.done():
+                    task.cancel()
 
         session.on_disconnected(_on_disconnect)
 
@@ -1227,14 +1242,26 @@ class MentraService(Service):
             ),
             name=f"mentra-brain:{req.session_id}",
         )
+        # Tag the task with its owning session so the disconnect /
+        # done callbacks can identity-check before popping — if Mentra
+        # recycles ``session_id`` while an old engine task is still
+        # winding down, we must not let the old task's teardown evict
+        # the new session's registry entry.
+        engine_task._mentra_session = session  # type: ignore[attr-defined]
         self._engine_tasks[req.session_id] = engine_task
 
         # Pop the task off the registry when it finishes so we don't
-        # leak references after a clean disconnect.
+        # leak references after a clean disconnect. Identity-check so
+        # a stale task can't evict the new session's task entry.
         def _on_engine_done(
-            _t: asyncio.Task[Any], sid: str = req.session_id
+            t: asyncio.Task[Any], sid: str = req.session_id, owner: MentraSession = session
         ) -> None:
-            self._engine_tasks.pop(sid, None)
+            current = self._engine_tasks.get(sid)
+            if current is t or (
+                current is not None
+                and getattr(current, "_mentra_session", None) is owner
+            ):
+                self._engine_tasks.pop(sid, None)
 
         engine_task.add_done_callback(_on_engine_done)
 

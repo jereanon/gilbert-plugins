@@ -257,6 +257,17 @@ class MentraSession:
         # / BOOT_TIMEOUT). Cloud re-fires the webhook on the next
         # user-initiated open, so we don't need full auto-reconnect.
         self._permanent: bool = False
+        # Background tasks (subscription sync, etc.) need a strong
+        # reference held by us — ``asyncio`` only weakly references
+        # tasks, so an un-awaited ``create_task`` can be GC'd before
+        # it runs. Each task removes itself from this set when done.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        # If the WS closes (or the cloud sends CONNECTION_ERROR)
+        # before CONNECTION_ACK arrives, ``connect()`` should raise
+        # instead of returning silently. We stash the failure here so
+        # the waiter can re-raise it after ``_connected.wait()``
+        # unblocks.
+        self._connect_error: Exception | None = None
 
         # Wire transport callbacks into our dispatch.
         self._transport.on_text(self._on_text)
@@ -324,8 +335,11 @@ class MentraSession:
 
     async def connect(self) -> None:
         """Open the transport and send the connection-init frame.
-        Resolves when the cloud's ``CONNECTION_ACK`` has arrived (or
-        ``CONNECTION_ERROR`` raises)."""
+        Resolves when the cloud's ``CONNECTION_ACK`` has arrived. If
+        the transport closes or the cloud sends ``CONNECTION_ERROR``
+        before the ack, this raises ``ConnectionError`` rather than
+        returning a half-initialized session (no capabilities, no
+        settings) that callers will then try to use."""
         await self._transport.connect()
         await self.send_frame(
             build_connection_init(
@@ -334,11 +348,40 @@ class MentraSession:
             )
         )
         # Wait for the ack to populate settings/capabilities before
-        # returning control to the caller.
+        # returning control to the caller. If the transport closed
+        # or the cloud sent CONNECTION_ERROR during the wait, the
+        # respective handler stashed an error so we raise here
+        # instead of returning a half-initialized session.
         await self._connected.wait()
+        if self._connect_error is not None:
+            raise self._connect_error
 
     async def disconnect(self) -> None:
-        """Close the transport. Idempotent."""
+        """Close the transport. Idempotent.
+
+        Stops every owned manager first so any in-flight ``await``
+        on a per-manager future (camera capture, location poll, mic
+        wait, transcription final-text) fails fast with a clear
+        ``ConnectionError`` instead of hanging until its own timeout.
+        """
+        for mgr in (
+            self.camera,
+            self.location,
+            self.mic,
+            self.transcription,
+        ):
+            stop = getattr(mgr, "stop", None)
+            if stop is None:
+                continue
+            try:
+                result = stop()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "Mentra manager stop raised for %s",
+                    type(mgr).__name__,
+                )
         await self._transport.close()
 
     async def send_frame(self, frame: dict[str, Any]) -> None:
@@ -450,8 +493,16 @@ class MentraSession:
         await self.mic.handle_binary_audio(data)
 
     async def _on_close(self, code: int, reason: str) -> None:
-        # Mark connected event so a pending connect() raises rather
-        # than hanging forever on a failed handshake.
+        # If we close before CONNECTION_ACK, record the failure so a
+        # pending ``connect()`` raises rather than returning a
+        # half-initialized session whose first send_frame() will hit
+        # a closed socket.
+        if not self._connected.is_set():
+            self._connect_error = ConnectionError(
+                f"Mentra transport closed during handshake "
+                f"(code={code}, reason={reason!r})"
+            )
+        # Mark connected event so a pending connect() unblocks.
         self._connected.set()
         for handler in list(self._disconnected_handlers):
             try:
@@ -555,10 +606,27 @@ class MentraSession:
     async def _on_connection_error(self, message: dict[str, Any]) -> None:
         msg = str(message.get("message") or "connection error")
         logger.warning("Mentra cloud rejected connection: %s", msg)
+        # Stash the failure so ``connect()`` re-raises after the
+        # event unblocks, rather than returning a partially-built
+        # session whose first send_frame() will hit a closed socket.
+        if self._connect_error is None:
+            self._connect_error = ConnectionError(
+                f"Mentra cloud rejected connection: {msg}"
+            )
         self._connected.set()  # unblock any pending connect()
         await self._transport.close(code=1008, reason=msg[:120])
 
     # ── Subscriptions ──────────────────────────────────────────────
+
+    def _spawn_background(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
+        """Create a fire-and-forget task but keep a strong reference
+        until it finishes. ``asyncio`` only weak-refs tasks, so a
+        bare ``create_task`` can be garbage-collected before it runs
+        — see CPython issue #88831."""
+        task = asyncio.create_task(coro)  # type: ignore[arg-type]
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _add_subscription(self, stream_type: str) -> None:
         if stream_type in self._subs.subscriptions:
@@ -567,7 +635,7 @@ class MentraSession:
         self._subs.dirty = True
         if self.is_connected:
             # Fire-and-forget — order is irrelevant.
-            asyncio.create_task(self._sync_subscriptions())
+            self._spawn_background(self._sync_subscriptions())
 
     def _remove_subscription(self, stream_type: str) -> None:
         if stream_type not in self._subs.subscriptions:
@@ -575,7 +643,7 @@ class MentraSession:
         self._subs.subscriptions.discard(stream_type)
         self._subs.dirty = True
         if self.is_connected:
-            asyncio.create_task(self._sync_subscriptions())
+            self._spawn_background(self._sync_subscriptions())
 
     async def _sync_subscriptions(self) -> None:
         if not self._subs.dirty:

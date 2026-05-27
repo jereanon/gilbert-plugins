@@ -247,9 +247,11 @@ class _ScribeLiveStream(TranscriptionStream):
         # both committed_transcript (fast) and
         # committed_transcript_with_timestamps (delayed 20-30s) for
         # the same utterance. We keep only the first arrival per
-        # (text, end_seconds) pair so the engine doesn't dispatch
-        # the same user turn twice. See events() for the full story.
-        self._recent_final_keys: list[tuple[str, float]] = []
+        # (text, end_ms) pair so the engine doesn't dispatch the
+        # same user turn twice. Key uses integer milliseconds so a
+        # 1e-9 float-drift between the two variants doesn't defeat
+        # the match. See events() for the full story.
+        self._recent_final_keys: list[tuple[str, int]] = []
 
     async def send(self, chunk: bytes) -> None:
         if self._closed:
@@ -370,14 +372,26 @@ class _ScribeLiveStream(TranscriptionStream):
                 # duplicate AI replies / repeated TTS playback.
                 #
                 # Keep only the first-arriving variant per (text,
-                # end_seconds) tuple. The end-time disambiguator
-                # protects against the legitimate case where the
-                # user said the same words twice in a row.
+                # end_ms) tuple. The end-time disambiguator protects
+                # against the legitimate case where the user said
+                # the same words twice in a row; integer
+                # milliseconds protect against float-drift between
+                # the plain + timestamped variants of the same
+                # utterance (Scribe has been observed to round to
+                # different decimal places across the two).
                 final_text = str(
                     msg.get("text") or msg.get("transcript") or ""
                 )
                 end_seconds = float(msg.get("end", 0.0))
-                dedup_key = (final_text, end_seconds)
+                # Skip dedupe for empty finals — Scribe occasionally
+                # emits silence-only commits and we don't want them
+                # to poison the ring (or get yielded as empty
+                # FinalTranscripts that the engine then dispatches
+                # to the LLM as a no-op turn).
+                if not final_text:
+                    continue
+                end_ms = int(round(end_seconds * 1000))
+                dedup_key = (final_text, end_ms)
                 if dedup_key in self._recent_final_keys:
                     logger.info(
                         "Scribe Live: suppressing duplicate final "

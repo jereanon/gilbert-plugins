@@ -471,7 +471,10 @@ async def test_app_stopped_event_closes_transport_and_fires_handler() -> None:
 async def test_connection_error_unblocks_pending_connect() -> None:
     """``CONNECTION_ERROR`` (auth failure, invalid package name)
     must abort a pending ``connect()`` rather than hanging
-    forever waiting for the ack that's never coming."""
+    forever waiting for the ack that's never coming. The service
+    layer's catch-on-connect path relies on this raising rather
+    than silently returning a half-initialized session that would
+    then fail on its first send_frame()."""
     transport = _FakeTransport()
     session = _make_session(transport)
 
@@ -484,8 +487,6 @@ async def test_connection_error_unblocks_pending_connect() -> None:
             "code": "AUTH_FAILED",
         }
     )
-    # connect() returns (the ack-wait event was set even though we
-    # didn't actually connect) — service layer reads is_connected
-    # to detect the failed state.
-    await asyncio.wait_for(connect_task, timeout=1.0)
+    with pytest.raises(ConnectionError, match="invalid api key"):
+        await asyncio.wait_for(connect_task, timeout=1.0)
     assert session.is_connected is False
