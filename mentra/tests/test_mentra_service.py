@@ -655,10 +655,10 @@ async def test_echo_during_gilbert_playback_is_dropped(
     turn → infinite self-talk loop. Regression test for the live
     failure observed end-to-end on the glasses.
 
-    Mute window opens when the engine fires ``on_llm_turn``
-    (Gilbert is about to speak); transcripts arriving during the
-    window are dropped at the plugin layer before they reach the
-    engine's inject queue."""
+    The mute window is armed by the audio sink's flush (after every
+    utterance — real reply OR engine filler), so any cloud-side
+    transcript arriving inside the window gets dropped at the
+    plugin layer before reaching the engine."""
     brain = _FakeVoiceBrain()
     brain.hold_until = asyncio.Event()
     svc, _, _, _, _ = await _start_service(brain=brain)
@@ -666,13 +666,14 @@ async def test_echo_during_gilbert_playback_is_dropped(
     for _ in range(3):
         await asyncio.sleep(0)
 
-    _, config = brain.calls[0]
+    conv_session, config = brain.calls[0]
     queue = config.inject_synthetic_user_turn_queue
-    assert config.on_llm_turn is not None
 
-    # Engine signals "about to speak a 100-char reply" — that arms
-    # the mute window in the plugin.
-    await config.on_llm_turn("hello! " * 14, [])
+    # Engine wrote a TTS clip + flushed (this is the sink path —
+    # same path engine filler clips take). Sink fires
+    # ``on_playback_armed`` which sets the mute window.
+    await conv_session.audio_out.write(b"FAKE_MP3" * 10_000)
+    await conv_session.audio_out.flush()
 
     # Simulate Mentra Cloud sending a transcript of Gilbert's own
     # voice while the playback is still in flight.
@@ -689,26 +690,53 @@ async def test_echo_during_gilbert_playback_is_dropped(
     # The transcript was dropped — the engine's queue stayed empty.
     assert queue.empty()
 
-    # Engine signals playback complete — mute clears (modulo a
-    # small post-roll). After a beat, a fresh user utterance flows
-    # through normally.
-    assert config.on_speaking_done is not None
-    await config.on_speaking_done()
-    # Wait past the 0.5s post-roll buffer.
-    await asyncio.sleep(0.6)
+    brain.hold_until.set()
 
+
+@pytest.mark.asyncio
+async def test_engine_filler_arms_mute_via_sink(
+    monkeypatch: Any,
+) -> None:
+    """When the engine speaks a filler clip (\"hmm, let me check\")
+    during slow LLM thinking, the clip flows through the audio sink
+    same as any other utterance — so the sink's mute-arming covers
+    it. Without this, the cloud would transcribe \"hmm\" as a user
+    turn and the engine would reply to its own filler.
+
+    Verified via the same sink → mute path as the real-reply test;
+    we don't need a separate engine-internal hook."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    conv_session, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+    # Filler config is wired so the engine actually has phrases to
+    # choose from — voice-agent's defaults are reused.
+    assert config.filler_threshold_seconds > 0
+    assert len(config.filler_phrases) > 0
+
+    # Sink path representing a small filler clip — only a few KB,
+    # like a 1-2 second "hmm".
+    await conv_session.audio_out.write(b"FILLER" * 500)
+    await conv_session.audio_out.flush()
+
+    # Echo of the filler arrives before user can speak.
     await fake.inject(
         {
             "type": "data_stream",
             "streamType": "transcription",
-            "data": {"text": "actually what's on my calendar", "isFinal": True},
+            "data": {"text": "hmm hmm", "isFinal": True},
         }
     )
     for _ in range(3):
         await asyncio.sleep(0)
 
-    text = queue.get_nowait()
-    assert text == "actually what's on my calendar"
+    # Dropped — same protection as the real-reply path.
+    assert queue.empty()
 
     brain.hold_until.set()
 
@@ -765,9 +793,11 @@ async def test_echo_suppressed_transcript_surfaced_in_debug_buffer(
     for _ in range(3):
         await asyncio.sleep(0)
 
-    _, config = brain.calls[0]
-    # Arm the mute window.
-    await config.on_llm_turn("hello hello", [])
+    conv_session, _ = brain.calls[0]
+    # Arm the mute window via the sink (the canonical path — engine
+    # writes audio via the sink, sink arms the mute).
+    await conv_session.audio_out.write(b"FAKE_MP3" * 5_000)
+    await conv_session.audio_out.flush()
 
     # Echo arrives during the mute.
     await fake.inject(

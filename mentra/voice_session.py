@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +74,7 @@ class _MentraAudioSink:
         public_base_url: str,
         mime: str = "audio/mpeg",
         session_id_for_log: str = "",
+        on_playback_armed: Callable[[float], None] | None = None,
     ) -> None:
         self._blob_store = blob_store
         self._speaker = speaker
@@ -82,6 +83,18 @@ class _MentraAudioSink:
         self._session_id = session_id_for_log
         self._buffer = bytearray()
         self._utterances_sent = 0
+        # Fires on successful flush with an estimated number of
+        # seconds the cloud-side playback is expected to last (synth
+        # time has already happened by flush; this is fetch + actual
+        # speaker playback + a safety margin). The plugin uses this
+        # to arm an echo-suppression window so Gilbert's own TTS,
+        # captured by the glasses mic and cloud-transcribed, doesn't
+        # loop back as a "user turn".
+        #
+        # Critical that this fires for EVERY flush — including engine
+        # filler clips ("hmm, let me check"), which would otherwise
+        # not arm the mute (engine fillers bypass on_llm_turn).
+        self._on_playback_armed = on_playback_armed
 
     async def write(self, chunk: bytes) -> None:
         self._buffer.extend(chunk)
@@ -162,6 +175,29 @@ class _MentraAudioSink:
                 self._session_id,
                 url,
             )
+            return
+
+        # Arm the echo-suppression window. Estimate playback
+        # duration from MP3 bytes: ElevenLabs's default MP3 bitrate
+        # is ~128 kbps (= 16 KB/s). Conservative — better to slightly
+        # over-mute than to let echo through.
+        #
+        # Plus a 2.5s safety margin covering cloud HTTPS fetch + WS
+        # transit to the glasses + speaker startup latency. Capped
+        # at 15s so a freakish long clip can't lock the user out for
+        # half a minute.
+        if self._on_playback_armed is not None:
+            est_playback = len(payload) / 16_000.0
+            window = min(15.0, est_playback + 2.5)
+            try:
+                self._on_playback_armed(window)
+            except Exception:
+                logger.debug(
+                    "MentraAudioSink.flush: on_playback_armed raised "
+                    "(session=%s)",
+                    self._session_id,
+                    exc_info=True,
+                )
 
 
 @dataclass

@@ -116,7 +116,46 @@ _DEFAULT_SYSTEM_PROMPT = (
     "to send the rest to their phone or chat — the user can ask "
     "\"send the full thing\" to get it. Don't dump paragraphs onto "
     "the glasses display."
+    "\n\n"
+    "Skip opening filler ('great question', 'happy to') and just "
+    "answer. Do NOT start with 'hmm' / 'let me check' / 'one sec' — "
+    "the runtime handles that automatically when a tool call is "
+    "going to make you slow. If you open with a filler of your own, "
+    "the user hears it TWICE."
 )
+
+
+# Short interjections the engine speaks while the LLM is still
+# thinking, so the user doesn't sit in silence wondering if Gilbert
+# heard them. Kicks in only when chat() takes longer than the
+# threshold below (i.e. typically only on tool-using turns). Same
+# pattern voice-agent uses.
+_DEFAULT_FILLER_PHRASES = [
+    "Hmm.",
+    "Hmm, let me check.",
+    "One sec.",
+    "Let me look that up.",
+    "Give me a moment.",
+    "Hmm, looking.",
+    "Just a sec.",
+]
+
+# Spoken if the LLM ends the conversation via an end_conversation
+# tool call without including its own goodbye line. Casual register
+# — the user is talking to their own assistant, no need for formal
+# call-sign-off etiquette.
+_DEFAULT_GOODBYE_PHRASES = [
+    "Talk to you later!",
+    "Catch you later.",
+    "See you soon!",
+    "Alright, later then.",
+    "Bye for now!",
+]
+
+# How slow the LLM must be (in seconds) before the engine speaks a
+# filler. 3.0s skips tool-free Q&A (typical ~1.5-2.5s end-to-end at
+# Sonnet) but covers every knowledge.search / MCP call.
+_FILLER_THRESHOLD_SECONDS = 3.0
 
 
 class _NoopBrainToolProvider:
@@ -1026,6 +1065,32 @@ class MentraService(Service):
         # ContextVar — no bleed to sibling sessions.
         set_current_user(gilbert_user)
 
+        # Echo-suppression window. The glasses' mic picks up Gilbert's
+        # own TTS playback and Mentra Cloud transcribes it; without a
+        # guard the engine would treat Gilbert's voice as the user's
+        # next turn and reply to itself in an infinite loop (observed
+        # live: full self-conversation within seconds).
+        #
+        # The window is armed from inside ``_MentraAudioSink.flush()``
+        # — every TTS clip (real reply AND engine filler) goes through
+        # there, so the mute fires uniformly regardless of which
+        # engine path produced the audio. Arming from on_llm_turn
+        # would miss fillers (they bypass that callback and would
+        # bleed through as cloud-transcribed "user turns").
+        #
+        # Single-element list so the inner closure can mutate without
+        # ``nonlocal`` plumbing across multiple defs.
+        mute_until_monotonic: list[float] = [0.0]
+
+        def _arm_mute(seconds: float) -> None:
+            mute_until_monotonic[0] = time.monotonic() + seconds
+            logger.info(
+                "Mentra: muting transcription for %.1fs while "
+                "Gilbert speaks (session=%s)",
+                seconds,
+                session.session_id,
+            )
+
         # Build the adapter session — the engine will read inbound
         # mic chunks from its audio_in queue and write TTS bytes
         # via the sink.
@@ -1035,6 +1100,7 @@ class MentraService(Service):
             public_base_url=self._public_base_url,
             mime="audio/mpeg",
             session_id_for_log=session.session_id,
+            on_playback_armed=_arm_mute,
         )
         conv_session = _MentraConversationSession(
             session_id=session.session_id,
@@ -1065,25 +1131,6 @@ class MentraService(Service):
         # identically to an STT-driven turn from the engine's
         # perspective.
         inject_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
-
-        # Echo-suppression window. The glasses' mic picks up Gilbert's
-        # own TTS playback and Mentra Cloud transcribes it; without a
-        # guard the engine would treat Gilbert's voice as the user's
-        # next turn and reply to itself in an infinite loop (observed
-        # live: full self-conversation within seconds).
-        #
-        # Approach: set ``mute_until_monotonic`` when ``on_llm_turn``
-        # fires (engine is about to synthesize + play). Window length
-        # estimates synth + cloud fetch + playback + safety margin.
-        # Transcripts arriving inside the window are dropped at the
-        # WS-handler layer (never reach the engine). Reset on
-        # ``on_speaking_done`` so a real user utterance right after
-        # Gilbert finishes isn't held hostage to the worst-case
-        # estimate.
-        #
-        # Single-element list so the inner closures can mutate without
-        # ``nonlocal`` plumbing across multiple defs.
-        mute_until_monotonic: list[float] = [0.0]
 
         async def _on_transcription(data: Any) -> None:
             # Only commit on isFinal — partials are noise, the engine
@@ -1162,33 +1209,15 @@ class MentraService(Service):
             )
 
         async def _on_llm_turn(text: str, tool_names: list[str]) -> None:
-            if not text:
-                return
-            # Arm the echo-suppression window. Estimate covers:
-            #   - TTS synth (~1s for ElevenLabs on a short reply)
-            #   - Blob register + cloud HTTPS fetch (~1-2s)
-            #   - Actual playback through the speaker (~text/10 sec
-            #     at ElevenLabs's natural pace)
-            #   - Post-roll safety margin (1s) so the very tail end
-            #     of Gilbert's voice doesn't slip past the window.
-            # 12s ceiling so a freakish long answer doesn't lock
-            # the user out of speaking for half a minute. on_speaking_done
-            # below resets to a short post-roll the moment the
-            # engine reports playback complete, so for normal replies
-            # the cap rarely matters.
-            playback_seconds = len(text) / 10.0
-            window = min(12.0, max(2.5, playback_seconds + 3.0))
-            mute_until_monotonic[0] = time.monotonic() + window
-            logger.info(
-                "Mentra: muting transcription for %.1fs while "
-                "Gilbert speaks (session=%s text_chars=%d)",
-                window,
-                session.session_id,
-                len(text),
-            )
-
             # Surface the reply on the heads-up display (if device
             # has one). Truncated so it fits the small screen.
+            #
+            # The echo-suppression mute is armed by the audio sink
+            # on flush (not here) so engine filler clips ("hmm, let
+            # me check") — which bypass on_llm_turn — also trigger
+            # the mute.
+            if not text:
+                return
             if caps is not None and not caps.has_display:
                 return
             snippet = _summarize_for_display(text)
@@ -1208,15 +1237,6 @@ class MentraService(Service):
                     session.session_id,
                     exc_info=True,
                 )
-
-        async def _on_speaking_done() -> None:
-            # Engine reports its estimate of playback ending. The
-            # cloud's actual playback can lag a bit further, so
-            # leave a short post-roll buffer (0.5s) for the tail
-            # before we accept transcripts again. This shortens
-            # the mute window for normal replies so the user can
-            # speak as soon as Gilbert finishes.
-            mute_until_monotonic[0] = time.monotonic() + 0.5
 
         async def _on_status_change(
             status: ConversationStatus, reason: str
@@ -1262,7 +1282,17 @@ class MentraService(Service):
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
             on_llm_turn=_on_llm_turn,
-            on_speaking_done=_on_speaking_done,
+            # Filler ("hmm, let me check…") plays automatically when
+            # the LLM is still thinking past the threshold. Without
+            # it the user sits in silence on every tool-using turn
+            # (knowledge.search, MCP calls, agent dispatch) wondering
+            # if Gilbert heard them. The engine also injects the
+            # filler through ``audio_out`` like a regular utterance —
+            # so the audio sink's mute-arming covers it for free, no
+            # extra plumbing needed.
+            filler_threshold_seconds=_FILLER_THRESHOLD_SECONDS,
+            filler_phrases=list(_DEFAULT_FILLER_PHRASES),
+            default_goodbye_phrases=list(_DEFAULT_GOODBYE_PHRASES),
             # MP3 + no realtime pacing: Mentra Cloud fetches the
             # whole clip in one shot and plays it; per-chunk pacing
             # would stretch a 5s clip into 10s of buffering for no
