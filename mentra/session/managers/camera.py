@@ -203,7 +203,51 @@ class CameraManager:
 
     # ── Internal handlers ──────────────────────────────────────────
 
+    def resolve_pending_photo_from_upload(
+        self,
+        *,
+        request_id: str,
+        photo_bytes: bytes,
+        mime_type: str,
+        error_code: str = "",
+        error_message: str = "",
+    ) -> bool:
+        """Resolve a pending ``take_photo()`` from an HTTP-pushed
+        photo upload (Mentra Live's default path — cloud POSTs the
+        bytes to ``/api/mentra/photo-upload`` instead of responding
+        on the WS).
+
+        Returns True when the request_id matched a pending future
+        and was resolved; False otherwise (timeout, session ended,
+        or wrong session). Routing happens at the service layer —
+        which iterates sessions and calls this on each manager until
+        one returns True.
+        """
+        future = self._pending_photos.get(request_id)
+        if future is None or future.done():
+            return False
+        if error_code or error_message or not photo_bytes:
+            future.set_exception(
+                RuntimeError(
+                    f"{error_code or 'PHOTO_FAILED'}: "
+                    f"{error_message or 'no photo bytes received'}"
+                )
+            )
+            return True
+        future.set_result(
+            PhotoData(
+                url="",
+                data=photo_bytes,
+                mime_type=mime_type or "image/jpeg",
+                request_id=request_id,
+            )
+        )
+        return True
+
     async def _on_photo_response(self, message: dict[str, Any]) -> None:
+        """Legacy: WS-delivered photo_response carrying a hosted URL
+        (Cloud-host pattern). Coexists with the HTTP-upload path —
+        whichever arrives first wins."""
         request_id = str(message.get("requestId") or "")
         future = self._pending_photos.get(request_id)
         if future is None or future.done():

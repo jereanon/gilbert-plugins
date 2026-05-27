@@ -147,6 +147,7 @@ async def execute_camera_tool(
     vision: VisionProvider | None,
     ocr: OCRProvider | None,
     http_client_factory: Any | None = None,
+    record_event: Any | None = None,    # Callable[[user_id, kind, msg, *, level], None]
 ) -> str:
     """Run the ``look_at_what_im_seeing`` tool against ``session``.
 
@@ -155,14 +156,35 @@ async def execute_camera_tool(
     call. Tests inject a stub that returns canned bytes without a
     network round-trip.
 
+    ``record_event`` is the MentraService's debug-webview ring buffer
+    sink. Optional — None disables the event annotations. The
+    plugin passes ``self._record_event`` so camera-tool activity
+    surfaces in the phone webview alongside the existing
+    transcription / TTS / audio_play events.
+
     Returns a user-friendly string that becomes part of the LLM's
     tool-result context. Errors are returned as user-friendly strings
     too (not raised) — the LLM should be able to apologize naturally
     rather than getting a traceback it can't reason about.
     """
+    user_id = getattr(session, "user_id", "") or ""
+
+    def _event(kind: str, msg: str, level: str = "info") -> None:
+        if record_event is None or not user_id:
+            return
+        try:
+            record_event(user_id, kind, msg, level=level)
+        except Exception:
+            logger.debug("camera_tool: record_event raised", exc_info=True)
+
     # ── Guard rails ─────────────────────────────────────────────
     caps = getattr(session, "capabilities", None)
     if caps is not None and not getattr(caps, "has_camera", False):
+        _event(
+            "photo_skipped",
+            "Camera tool called but this device has no camera.",
+            "warning",
+        )
         return (
             "Your glasses don't have a camera, so I can't take a "
             "photo. (Mentra Live has one; pure-display models like "
@@ -171,6 +193,11 @@ async def execute_camera_tool(
 
     camera = getattr(session, "camera", None)
     if camera is None:
+        _event(
+            "photo_skipped",
+            "Camera tool called but session has no camera manager.",
+            "warning",
+        )
         return (
             "I can't access your glasses' camera right now — the "
             "session isn't fully wired up."
@@ -188,12 +215,22 @@ async def execute_camera_tool(
         focus_raw = FOCUS_GENERAL
 
     if focus_raw == FOCUS_TEXT and ocr is None:
+        _event(
+            "photo_skipped",
+            "Camera tool called with focus=text but no OCR backend.",
+            "warning",
+        )
         return (
             "I don't have an OCR backend configured, so I can't "
             "read text from photos. Ask the admin to enable an OCR "
             "service in Settings."
         )
     if focus_raw in (FOCUS_GENERAL, FOCUS_FACE) and vision is None:
+        _event(
+            "photo_skipped",
+            f"Camera tool called with focus={focus_raw} but no vision backend.",
+            "warning",
+        )
         return (
             "I don't have a vision backend configured, so I can't "
             "describe what's in the photo. Ask the admin to enable "
@@ -201,14 +238,24 @@ async def execute_camera_tool(
         )
 
     # ── Capture ─────────────────────────────────────────────────
+    _event(
+        "photo_requested",
+        f"📷 Asking glasses to snap a photo (focus={focus_raw})…",
+    )
     try:
         photo = await camera.take_photo(timeout=_PHOTO_TIMEOUT_S)
     except TimeoutError:
+        _event(
+            "photo_error",
+            f"Camera didn't respond within {_PHOTO_TIMEOUT_S}s.",
+            "error",
+        )
         return (
             "The camera didn't respond in time. The user's glasses "
             "might be off-line or the cloud is slow right now."
         )
     except RuntimeError as exc:
+        _event("photo_error", f"Camera refused: {exc}", "error")
         return f"Camera refused the shot: {exc}"
     except Exception as exc:
         logger.exception(
@@ -216,37 +263,70 @@ async def execute_camera_tool(
             "(session=%s)",
             getattr(session, "session_id", "?"),
         )
+        _event("photo_error", f"take_photo raised: {exc}", "error")
         return f"I couldn't take a photo: {exc}"
 
+    # Prefer the bytes the cloud HTTP-pushed to us
+    # (``/api/mentra/photo-upload``) over downloading from a hosted
+    # URL. The push path is the default on Mentra Live; only the
+    # legacy cloud-hosted path falls back to the URL fetch.
+    push_bytes = bytes(getattr(photo, "data", b"") or b"")
+    push_mime = str(getattr(photo, "mime_type", "") or "")
     photo_url = str(getattr(photo, "url", "") or "")
-    if not photo_url:
+
+    if push_bytes:
+        image_bytes = push_bytes
+        media_type = push_mime or "image/jpeg"
+    elif photo_url:
+        try:
+            image_bytes, media_type = await _download_photo(
+                photo_url, http_client_factory=http_client_factory
+            )
+        except Exception as exc:
+            logger.exception(
+                "look_at_what_im_seeing: photo download failed url=%s",
+                photo_url,
+            )
+            _event(
+                "photo_error",
+                f"Failed to download photo from {photo_url}: {exc}",
+                "error",
+            )
+            return f"I couldn't download the photo from the cloud: {exc}"
+    else:
+        _event(
+            "photo_error",
+            "Cloud accepted the request but returned no bytes and no URL.",
+            "error",
+        )
         return (
             "The cloud accepted the photo request but didn't return "
-            "a URL to download it from. Try again."
+            "anything to look at. Try again."
         )
-
-    # ── Download bytes ──────────────────────────────────────────
-    try:
-        image_bytes, media_type = await _download_photo(
-            photo_url, http_client_factory=http_client_factory
-        )
-    except Exception as exc:
-        logger.exception(
-            "look_at_what_im_seeing: photo download failed url=%s",
-            photo_url,
-        )
-        return f"I couldn't download the photo from the cloud: {exc}"
 
     if not image_bytes:
+        _event(
+            "photo_error",
+            "Photo arrived but was empty.",
+            "error",
+        )
         return "The cloud returned an empty photo. Try again."
 
     logger.info(
         "look_at_what_im_seeing: captured photo session=%s "
-        "focus=%s bytes=%d media_type=%s",
+        "focus=%s bytes=%d media_type=%s via=%s",
         getattr(session, "session_id", "?"),
         focus_raw,
         len(image_bytes),
         media_type,
+        "push" if push_bytes else "url",
+    )
+    _event(
+        "photo_processing",
+        (
+            f"Got photo ({len(image_bytes)} bytes, {media_type}) — "
+            f"routing to {'OCR' if focus_raw == FOCUS_TEXT else 'vision'}…"
+        ),
     )
 
     # ── Dispatch to vision / OCR ────────────────────────────────
@@ -256,13 +336,19 @@ async def execute_camera_tool(
             text = await ocr.extract_text(image_bytes)
         except Exception as exc:
             logger.exception("OCR extract_text raised")
+            _event("photo_error", f"OCR failed: {exc}", "error")
             return f"OCR failed: {exc}"
         text = (text or "").strip()
         if not text:
+            _event("photo_processed", "OCR returned no text.", "warning")
             return (
                 "I took the photo but couldn't read any text in it. "
                 "Try aiming closer to the text, or in better light."
             )
+        _event(
+            "photo_processed",
+            f'OCR extracted: "{text[:120]}{"…" if len(text) > 120 else ""}"',
+        )
         return text
 
     # FOCUS_GENERAL / FOCUS_FACE — both routed to vision today.
@@ -273,13 +359,25 @@ async def execute_camera_tool(
         description = await vision.describe_image(image_bytes, media_type)
     except Exception as exc:
         logger.exception("Vision describe_image raised")
+        _event(
+            "photo_error", f"Vision describe_image failed: {exc}", "error"
+        )
         return f"I couldn't analyze the photo: {exc}"
     description = (description or "").strip()
     if not description:
+        _event(
+            "photo_processed",
+            "Vision returned an empty description.",
+            "warning",
+        )
         return (
             "I took the photo but couldn't describe it. Try again "
             "with a clearer view."
         )
+    _event(
+        "photo_processed",
+        f'Vision said: "{description[:120]}{"…" if len(description) > 120 else ""}"',
+    )
     return description
 
 

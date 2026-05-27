@@ -644,6 +644,11 @@ class MentraService(Service):
             arguments=arguments,
             vision=self._vision,
             ocr=self._ocr,
+            # Surface tool activity in the per-user debug webview
+            # ring buffer so the operator can see request → photo
+            # arrival → OCR/vision result inline with transcripts
+            # and TTS events.
+            record_event=self._record_event,
         )
 
     async def start(self, resolver: ServiceResolver) -> None:
@@ -860,6 +865,92 @@ class MentraService(Service):
         logger.warning("Mentra webhook with unknown type=%r", msg_type)
         return WebhookResponse(
             status="error", message=f"unknown webhook type: {msg_type}"
+        )
+
+    async def deliver_photo_upload(
+        self,
+        *,
+        request_id: str,
+        photo_bytes: bytes,
+        mime_type: str,
+        error_code: str = "",
+        error_message: str = "",
+    ) -> WebhookResponse:
+        """Resolve a pending camera ``take_photo()`` from the
+        cloud's HTTP photo-upload push (Mentra Live's default path).
+
+        request_id is globally unique per ``photo_request`` we sent,
+        so we walk every live session's CameraManager until one
+        matches. Always returns a ``WebhookResponse`` (never raises)
+        so the route can return 200 / 404 cleanly.
+        """
+        # Surface the inbound upload in EVERY active session's debug
+        # webview ring buffer — without knowing which session owns
+        # the request_id yet, we annotate against the matched session
+        # below. Logged at INFO so production journals show the round-
+        # trip even if no debug consumer is reading the webview.
+        for sid, session in list(self._sessions.items()):
+            camera = getattr(session, "camera", None)
+            if camera is None:
+                continue
+            if not hasattr(camera, "resolve_pending_photo_from_upload"):
+                continue
+            try:
+                matched = camera.resolve_pending_photo_from_upload(
+                    request_id=request_id,
+                    photo_bytes=photo_bytes,
+                    mime_type=mime_type,
+                    error_code=error_code,
+                    error_message=error_message,
+                )
+            except Exception:
+                logger.exception(
+                    "Mentra deliver_photo_upload: resolver raised "
+                    "(session=%s request_id=%s)",
+                    sid,
+                    request_id,
+                )
+                continue
+            if not matched:
+                continue
+            # Annotate the matched session's debug feed so the
+            # operator's webview shows the inbound photo arriving
+            # in real time (paired with the camera_tool's own
+            # photo_requested / photo_processed events).
+            if error_code or error_message:
+                self._record_event(
+                    session.user_id,
+                    "photo_error",
+                    (
+                        f"Photo capture FAILED — code={error_code or '<none>'} "
+                        f"msg={error_message or '<none>'} "
+                        f"(request_id={request_id[:24]}…)"
+                    ),
+                    level="error",
+                )
+            else:
+                self._record_event(
+                    session.user_id,
+                    "photo_received",
+                    (
+                        f"Photo received — {len(photo_bytes)} bytes "
+                        f"mime={mime_type or 'image/jpeg'} "
+                        f"(request_id={request_id[:24]}…)"
+                    ),
+                )
+            return WebhookResponse(
+                status="success",
+                message=f"resolved against session {sid}",
+            )
+        logger.info(
+            "Mentra deliver_photo_upload: no session matched "
+            "request_id=%s (live sessions=%d)",
+            request_id,
+            len(self._sessions),
+        )
+        return WebhookResponse(
+            status="error",
+            message="no pending photo request found for request_id",
         )
 
     async def _handle_session_request(
