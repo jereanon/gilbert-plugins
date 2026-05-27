@@ -819,7 +819,10 @@ Camera, LED, location, and livestream managers are stubbed for follow-up — the
 
 **Webhook URL** — Configure your Mentra developer console to POST session lifecycle events to `<public-url>/api/mentra/webhook`. The route is mounted by core; the plugin only owns the `mentra_webhook` capability that dispatches the payloads.
 
-**Third-party deps** — `websockets>=12` (already a Gilbert dep, used by the voice brain). No native code, no MP3 encoder yet (deferred until SpeakerManager-side TTS lands).
+**AI tools (during voice sessions)**
+- `/see [focus]` — `look_at_what_im_seeing(focus)` — captures a photo through the glasses' camera and routes the bytes to Gilbert's vision or OCR backend. `focus="general"` (default) describes the scene; `focus="text"` extracts text via OCR (signs, menus, packaging); `focus="face"` falls back to general scene description today. ONLY available during an active glasses voice session — the tool is invisible to regular chat. Requires a vision or OCR backend depending on focus (the tool returns a friendly "ask admin to configure X" message if the needed backend isn't installed).
+
+**Third-party deps** — `websockets>=12`, `certifi`, `httpx` (downloads photo bytes from Mentra Cloud's short-lived photoUrl when the camera tool fires). All three are already part of Gilbert's core install.
 
 **Reference** — Upstream SDK source: [`Mentra-Community/MentraOS/cloud/packages/sdk`](https://github.com/Mentra-Community/MentraOS/tree/dev/cloud/packages/sdk). MIT license; the Python port mirrors message-type / stream-type / layout-type names verbatim so cross-referencing the canonical client when debugging a protocol mismatch stays trivial.
 

@@ -232,6 +232,13 @@ class MentraService(Service):
         # Short-lived blob cache so engine-synthesized MP3 bytes get
         # an HTTPS URL Mentra Cloud can fetch server-side.
         self._blob_store: AudioBlobStore | None = None
+        # Vision + OCR capabilities power the ``look_at_what_im_seeing``
+        # AI tool — the LLM can ask the glasses to snap a photo and
+        # routes the bytes through these. Optional: if neither is
+        # configured, the tool reports a friendly error to the LLM
+        # instead of misbehaving.
+        self._vision: Any = None    # VisionProvider | None
+        self._ocr: Any = None       # OCRProvider | None
         self._bus: Any = None
 
         # ── Live session registry — keyed by Mentra sessionId ─────
@@ -257,8 +264,14 @@ class MentraService(Service):
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="mentra",
+            # ``ai_tools`` advertises the ToolProvider impl below
+            # (``look_at_what_im_seeing`` — the LLM tool that snaps
+            # photos through the glasses camera). The AI service
+            # discovers it during chat() dispatch via isinstance
+            # against the ToolProvider Protocol on every registered
+            # service.
             capabilities=frozenset(
-                {"mentra", "mentra_webhook", "ws_handlers"}
+                {"mentra", "mentra_webhook", "ws_handlers", "ai_tools"}
             ),
             # ``voice_brain`` runs the conversation loop;
             # ``audio_blob_store`` exposes engine TTS to Mentra Cloud
@@ -275,7 +288,13 @@ class MentraService(Service):
                     "ai_chat",
                 }
             ),
-            optional=frozenset({"configuration", "event_bus"}),
+            # ``vision`` / ``ocr`` power the look_at_what_im_seeing
+            # tool. Optional — the tool reports the specific gap to
+            # the LLM if either is absent rather than disabling
+            # itself; the mentra plugin can still run without them.
+            optional=frozenset(
+                {"configuration", "event_bus", "vision", "ocr"}
+            ),
             toggleable=True,
             toggle_description=(
                 "Mentra smart-glasses platform — heads-up Gilbert on "
@@ -541,6 +560,92 @@ class MentraService(Service):
             "sessions": sessions,
         }
 
+    # ── ToolProvider — camera tool for the AI ────────────────────
+    #
+    # When a glasses voice session is active, the LLM gets a new
+    # tool: ``look_at_what_im_seeing(focus)``. It snaps a photo
+    # through the glasses' camera and routes the bytes to the
+    # configured vision / OCR backend, returning the description /
+    # extracted text as a string the LLM weaves into its next reply.
+    # Voice-agent's ``end_conversation`` is the structural model —
+    # tool gating via ``get_current_conversation_ctx()`` so the
+    # camera tool never appears in regular chat (where there's no
+    # active glasses session to point the camera at).
+
+    @property
+    def tool_provider_name(self) -> str:
+        return "mentra"
+
+    def get_tools(self, user_ctx: Any = None) -> list[Any]:
+        # Lazy imports so the tool surface stays optional — if a
+        # user disabled the AI or vision/ocr aren't installed, we
+        # still load cleanly.
+        from gilbert.interfaces.conversation import (
+            get_current_conversation_ctx,
+        )
+
+        from .camera_tool import camera_tool_definition
+
+        ctx = get_current_conversation_ctx()
+        if ctx is None:
+            # Not in a voice session → tool invisible to regular chat.
+            return []
+        # Only the matched-Mentra-session path makes sense for this
+        # tool. If voice-agent (or any other modality) is what
+        # produced this conversation context, the user is NOT
+        # wearing glasses we can point a camera through, so the
+        # tool would just error. Better to hide it.
+        try:
+            session_id = ctx.session.session_id
+        except AttributeError:
+            return []
+        if session_id not in self._sessions:
+            return []
+        return [camera_tool_definition()]
+
+    async def execute_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> str:
+        from gilbert.interfaces.conversation import (
+            get_current_conversation_ctx,
+        )
+
+        from .camera_tool import TOOL_NAME, execute_camera_tool
+
+        if name != TOOL_NAME:
+            raise KeyError(f"mentra has no tool {name!r}")
+
+        ctx = get_current_conversation_ctx()
+        if ctx is None:
+            return (
+                "I can only see through the glasses' camera during "
+                "an active voice session. You're not in one right "
+                "now — put on the glasses and try again."
+            )
+
+        # Resolve the Mentra session that owns this conversation
+        # context. get_tools() guarantees this lookup hits something,
+        # but a race is possible if the user disconnected between
+        # the tool being offered and being called — handle gracefully.
+        try:
+            session_id = ctx.session.session_id
+        except AttributeError:
+            return "I lost track of the glasses session — try again."
+        session = self._sessions.get(session_id)
+        if session is None:
+            return (
+                "The glasses session that was active a moment ago "
+                "has ended — I can't take a photo from a session "
+                "that's no longer connected."
+            )
+
+        return await execute_camera_tool(
+            session=session,
+            arguments=arguments,
+            vision=self._vision,
+            ocr=self._ocr,
+        )
+
     async def start(self, resolver: ServiceResolver) -> None:
         self._resolver = resolver
 
@@ -553,6 +658,18 @@ class MentraService(Service):
         blob_svc = resolver.get_capability("audio_blob_store")
         if isinstance(blob_svc, AudioBlobStore):
             self._blob_store = blob_svc
+        # Optional: vision + OCR power the look_at_what_im_seeing
+        # tool. Missing either is non-fatal — the tool reports the
+        # specific gap back to the LLM instead of silently failing.
+        from gilbert.interfaces.ocr import OCRProvider
+        from gilbert.interfaces.vision import VisionProvider
+
+        vision_svc = resolver.get_capability("vision")
+        if isinstance(vision_svc, VisionProvider):
+            self._vision = vision_svc
+        ocr_svc = resolver.get_capability("ocr")
+        if isinstance(ocr_svc, OCRProvider):
+            self._ocr = ocr_svc
         bus_svc = resolver.get_capability("event_bus")
         if isinstance(bus_svc, EventBusProvider):
             self._bus = bus_svc.bus
