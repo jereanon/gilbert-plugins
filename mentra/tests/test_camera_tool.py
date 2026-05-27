@@ -69,13 +69,24 @@ class _StubVision:
     def __init__(
         self, response: str = "A red exit sign.", available: bool = True
     ) -> None:
-        self.calls: list[tuple[bytes, str]] = []
+        # (bytes, media_type, prompt) — exposing prompt lets tests
+        # assert the camera_tool passed a focus-aware instruction
+        # rather than letting the backend's operator-tuned default
+        # leak in (which is what broke the live system: the default
+        # said "return empty if no technical content").
+        self.calls: list[tuple[bytes, str, str]] = []
         self.response = response
         self.raise_on_call: Exception | None = None
         self.available = available
 
-    async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
-        self.calls.append((image_bytes, media_type))
+    async def describe_image(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        *,
+        prompt: str = "",
+    ) -> str:
+        self.calls.append((image_bytes, media_type, prompt))
         if self.raise_on_call is not None:
             raise self.raise_on_call
         return self.response
@@ -213,6 +224,13 @@ async def test_focus_general_routes_to_vision() -> None:
     assert len(vision.calls) == 1
     assert vision.calls[0][0] == b"FAKEJPEGBYTES"
     assert vision.calls[0][1] == "image/jpeg"
+    # Must pass a focus-aware prompt — never letting the backend's
+    # operator-tuned default leak in. The general-scene prompt
+    # specifically tells the model NOT to return empty (the prior
+    # PDF-extraction default did, which broke this entire flow).
+    general_prompt = vision.calls[0][2]
+    assert general_prompt
+    assert "never return an empty response" in general_prompt.lower()
     assert ocr.calls == []
 
 
@@ -256,6 +274,37 @@ async def test_unknown_focus_falls_back_to_general() -> None:
     assert len(vision.calls) == 1
     assert ocr.calls == []
     assert result  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_face_focus_uses_face_prompt() -> None:
+    """``focus='face'`` should pass the face-focused prompt (people
+    descriptions + identity caveats) to vision, not the general
+    scene-description prompt. This is a regression guard against the
+    earlier bug where the backend's hardcoded technical-extraction
+    prompt leaked into every call."""
+    session = _StubSession()
+    vision = _StubVision(response="A man in a blue shirt smiling.")
+    ocr = _StubOCR()
+
+    result = await execute_camera_tool(
+        session=session,
+        arguments={"focus": "face"},
+        vision=vision,
+        ocr=ocr,
+        http_client_factory=_http_factory(),
+    )
+
+    assert result == "A man in a blue shirt smiling."
+    assert len(vision.calls) == 1
+    face_prompt = vision.calls[0][2]
+    # Face prompt mentions people / identity-handling explicitly.
+    assert any(
+        kw in face_prompt.lower()
+        for kw in ("people", "person", "identity", "wearing")
+    )
+    # Same non-empty-response guarantee as the general path.
+    assert "never return an empty response" in face_prompt.lower()
 
 
 @pytest.mark.asyncio
@@ -486,8 +535,16 @@ async def test_backend_without_available_attr_assumed_ready() -> None:
     availability check."""
 
     class _LegacyVision:
-        # No ``available`` attribute on purpose.
-        async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
+        # No ``available`` attribute on purpose. ``prompt`` is the
+        # new kwarg — even legacy fakes must accept it now since the
+        # camera tool always passes one.
+        async def describe_image(
+            self,
+            image_bytes: bytes,
+            media_type: str,
+            *,
+            prompt: str = "",
+        ) -> str:
             return "A clear scene."
 
     session = _StubSession()

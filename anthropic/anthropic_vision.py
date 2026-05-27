@@ -17,6 +17,31 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 
+# The default prompt is intentionally **general-purpose** — it works
+# for smart-glasses scene description, surveillance camera snapshots,
+# and ad-hoc "what's in this picture?" calls. Callers with a more
+# specific use case (PDF knowledge indexing wants strict technical-
+# content extraction; face-recognition wants identity + features)
+# pass their own ``prompt=`` to ``describe_image`` and override this.
+#
+# Critically, this default does NOT say "respond with empty string"
+# for any condition — early versions did (inherited from a PDF-only
+# extraction prompt) and it caused every general-photo call to come
+# back empty, breaking the Mentra camera_tool entirely. If you tune
+# this, keep "always return SOMETHING" as a non-negotiable.
+_DEFAULT_PROMPT = (
+    "Describe what's visible in this image in plain language. Be "
+    "concrete and specific: name the objects, people, scenery, "
+    "actions, and notable details you can see. If there's any text "
+    "in the image — signs, menus, labels, screens, packaging, "
+    "documents — transcribe it exactly as it appears. Keep the "
+    "description natural and conversational, as if you were "
+    "narrating the scene for someone who can't see it. If the image "
+    "is too blurry, dark, or obscured to make out clearly, say so "
+    "and describe whatever you CAN see — never return an empty "
+    "response."
+)
+
 
 class AnthropicVision(VisionBackend):
     """Vision backend using the Anthropic Messages API with image content."""
@@ -44,6 +69,23 @@ class AnthropicVision(VisionBackend):
                 type=ToolParameterType.INTEGER,
                 description="Maximum tokens in vision response.",
                 default=4096,
+            ),
+            ConfigParam(
+                key="prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Default instruction to Claude when describing an "
+                    "image. Used when a caller doesn't pass its own "
+                    "prompt (most consumers don't — they rely on this "
+                    "default). Tune it if you want a particular tone, "
+                    "level of detail, or domain focus across every "
+                    "vision call. NEVER tell Claude to return an "
+                    "empty string under any condition — callers "
+                    "interpret empty as failure."
+                ),
+                default=_DEFAULT_PROMPT,
+                multiline=True,
+                ai_prompt=True,
             ),
         ]
 
@@ -100,6 +142,7 @@ class AnthropicVision(VisionBackend):
         self._api_key: str = ""
         self._model: str = _DEFAULT_MODEL
         self._max_tokens: int = 4096
+        self._default_prompt: str = _DEFAULT_PROMPT
         self._client: Any = None
         # Latched on the first 401 we see. Causes ``available`` to flip
         # to False so the PDF indexing loop (which checks per page) stops
@@ -117,6 +160,12 @@ class AnthropicVision(VisionBackend):
         self._api_key = str(config.get("api_key", ""))
         self._model = str(config.get("model", _DEFAULT_MODEL))
         self._max_tokens = int(config.get("max_tokens", 4096))
+        # Empty / whitespace-only config falls back to the bundled
+        # default — never run the model with no instructions at all
+        # (Claude defaults to "the user wants a vague description"
+        # which is rarely what callers want).
+        configured_prompt = str(config.get("prompt", "") or "").strip()
+        self._default_prompt = configured_prompt or _DEFAULT_PROMPT
         self._auth_failed = False
         self._client = None
 
@@ -179,9 +228,21 @@ class AnthropicVision(VisionBackend):
             self._client_key = key
         return self._client
 
-    async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
+    async def describe_image(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        *,
+        prompt: str = "",
+    ) -> str:
         if not self._effective_api_key() or self._auth_failed:
             return ""
+
+        # Caller's prompt wins when present; empty means "use the
+        # operator-configured default". Whitespace-only is treated as
+        # empty so an accidentally-blank textarea in Settings doesn't
+        # silently break vision for every caller.
+        effective_prompt = (prompt or "").strip() or self._default_prompt
 
         try:
             client = self._get_client()
@@ -205,16 +266,7 @@ class AnthropicVision(VisionBackend):
                             },
                             {
                                 "type": "text",
-                                "text": (
-                                    "Extract ALL technical content from this page image as plain structured text. "
-                                    "Include: pinout tables, wiring diagrams, connector assignments, component "
-                                    "specifications, part numbers, voltage/current ratings, communication protocols, "
-                                    "dimensions, torque specs, and any other technical data. Reproduce tables as "
-                                    "aligned text columns. Label diagram elements clearly (e.g., 'Pin 1: CAN_H, "
-                                    "Pin 2: CAN_L'). Do NOT describe the visual layout — extract the information "
-                                    "content only. If the page contains no technical content, respond with an "
-                                    "empty string."
-                                ),
+                                "text": effective_prompt,
                             },
                         ],
                     }

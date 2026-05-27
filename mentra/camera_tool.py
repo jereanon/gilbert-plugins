@@ -79,6 +79,41 @@ _PHOTO_TIMEOUT_S = 15.0
 _PHOTO_DOWNLOAD_TIMEOUT_S = 10.0
 
 
+# Focus-specific prompts. We pass these to ``vision.describe_image``
+# so the camera_tool's behavior is independent of how the operator
+# tuned Settings → Vision → Prompt for unrelated callers (PDF
+# knowledge indexing, surveillance cameras). Critically, NONE of
+# these tell the model to return empty under any condition — the
+# previous default (inherited from a PDF-extraction prompt) said
+# "respond with empty string if no technical content" which made
+# every general-photo call come back blank and broke this tool
+# entirely.
+_GENERAL_SCENE_PROMPT = (
+    "The user is wearing smart glasses and just asked you to look "
+    "at what's in front of them. Describe what you see in plain, "
+    "natural language — be specific about objects, people, "
+    "actions, scenery, and notable details. If there's any text "
+    "visible (signs, menus, screens, labels, packaging), transcribe "
+    "it exactly. Keep it conversational and concise — the response "
+    "will be spoken aloud through the glasses' speaker. If the "
+    "image is too blurry or dark to make out, describe whatever "
+    "you CAN see and say so. Never return an empty response."
+)
+_FACE_PROMPT = (
+    "The user is wearing smart glasses and asked who they're "
+    "looking at. Describe any people visible: estimated age range, "
+    "what they're wearing, hair color/style, expression, body "
+    "language, and what they're doing. If you recognize a clearly "
+    "identifiable public figure (e.g. a sitting head of state, a "
+    "very famous athlete or entertainer in a context that makes "
+    "the identification reliable), say so — otherwise do NOT "
+    "speculate about identity, just describe what's visible. If no "
+    "people are in frame, say that and describe the scene instead. "
+    "Keep it conversational and concise — the response is spoken "
+    "aloud. Never return an empty response."
+)
+
+
 def camera_tool_definition() -> ToolDefinition:
     """The ``ToolDefinition`` MentraService.get_tools() returns when
     the LLM is mid-glasses-session and the active session has a
@@ -396,10 +431,17 @@ async def execute_camera_tool(
 
     # FOCUS_GENERAL / FOCUS_FACE — both routed to vision today.
     # When a face-recognition backend gets added, branch on FOCUS_FACE
-    # here before the vision fallback.
+    # here before the vision fallback. Each focus passes its own
+    # prompt so the vision backend's operator-tuned default doesn't
+    # accidentally apply (and so the camera_tool's behavior doesn't
+    # silently drift when an admin tweaks Settings → Vision → Prompt
+    # for some unrelated caller).
+    vision_prompt = _FACE_PROMPT if focus_raw == FOCUS_FACE else _GENERAL_SCENE_PROMPT
     assert vision is not None  # guarded above
     try:
-        description = await vision.describe_image(image_bytes, media_type)
+        description = await vision.describe_image(
+            image_bytes, media_type, prompt=vision_prompt
+        )
     except Exception as exc:
         logger.exception("Vision describe_image raised")
         _event(
