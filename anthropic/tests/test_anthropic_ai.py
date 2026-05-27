@@ -405,6 +405,11 @@ def test_build_tools() -> None:
 
 
 def test_build_request_body_includes_system() -> None:
+    """System prompt arrives as a content-block list (not a bare
+    string) so the cache_control marker can attach to it. This is the
+    prompt-caching prerequisite: a bare string can't carry a
+    cache_control marker, and without that marker the system prompt
+    isn't part of the cached prefix."""
     backend = AnthropicAI()
     backend._model = "test-model"
     backend._max_tokens = 100
@@ -414,7 +419,11 @@ def test_build_request_body_includes_system() -> None:
         system_prompt="Be helpful",
     )
     body = backend._build_request_body(request)
-    assert body["system"] == "Be helpful"
+    assert isinstance(body["system"], list)
+    assert len(body["system"]) == 1
+    assert body["system"][0]["type"] == "text"
+    assert body["system"][0]["text"] == "Be helpful"
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert body["model"] == "test-model"
     assert body["max_tokens"] == 100
     assert body["temperature"] == 0.3
@@ -1245,3 +1254,128 @@ async def test_generate_stream_max_tokens_stop_reason(backend: AnthropicAI) -> N
     assert final_response.message.content == "truncated"
 
     await backend.close()
+
+
+# --- Prompt caching ───────────────────────────────────────────────────────
+#
+# The win we're paying for: Anthropic prompt caching cuts input-token cost
+# by ~10x on cached reads. These tests pin where the cache_control markers
+# go in the request body so a future refactor can't silently remove them.
+
+
+def test_build_tools_sorts_by_name_for_cache_stability() -> None:
+    """Tools must serialize in a deterministic order — Anthropic's
+    cache invalidates if the tools block differs by even one byte
+    between calls. Python's dict iteration is technically insertion-
+    ordered, but discovery upstream may reorder under concurrency.
+    Sorting by name removes the entire class of race."""
+    tools = [
+        ToolDefinition(name="zebra", description="z"),
+        ToolDefinition(name="apple", description="a"),
+        ToolDefinition(name="mango", description="m"),
+    ]
+    result = AnthropicAI._build_tools(tools)
+    assert [t["name"] for t in result] == ["apple", "mango", "zebra"]
+
+
+def test_build_tools_marks_last_tool_cacheable() -> None:
+    """The LAST tool gets ``cache_control: ephemeral``. Anthropic
+    caches the prefix up to and including that marker — with ~190
+    tools at ~15-25k tokens combined, this is the single biggest
+    cache win in the request."""
+    tools = [
+        ToolDefinition(name="a", description="a"),
+        ToolDefinition(name="b", description="b"),
+        ToolDefinition(name="c", description="c"),
+    ]
+    result = AnthropicAI._build_tools(tools)
+    # Only the last (sorted: "c") has the marker.
+    assert "cache_control" not in result[0]
+    assert "cache_control" not in result[1]
+    assert result[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_build_tools_empty_list_does_not_crash() -> None:
+    """Edge case — agents that disable tools entirely. Empty list
+    must round-trip without an IndexError trying to mark a [-1]
+    that doesn't exist."""
+    assert AnthropicAI._build_tools([]) == []
+
+
+def test_system_prompt_is_a_content_block_list() -> None:
+    """System prompt arrives as a list of content blocks (not a
+    bare string) so the cache_control marker can attach. Anthropic
+    accepts both shapes; only the list form is cacheable."""
+    backend = AnthropicAI()
+    backend._model = "m"
+    backend._max_tokens = 100
+    backend._temperature = 0.3
+    request = AIRequest(
+        messages=[Message(role=MessageRole.USER, content="hi")],
+        system_prompt="You are Gilbert.",
+    )
+    body = backend._build_request_body(request)
+    sys = body["system"]
+    assert isinstance(sys, list)
+    assert sys[0]["type"] == "text"
+    assert sys[0]["text"] == "You are Gilbert."
+    assert sys[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_last_user_message_gets_cache_marker() -> None:
+    """The cache marker on the last message extends the cached
+    prefix to cover the entire conversation history. Next call within
+    5 minutes reads system + tools + history at the 0.1× cache rate;
+    only the new turn after this marker is fresh input."""
+    backend = AnthropicAI()
+    backend._model = "m"
+    backend._max_tokens = 100
+    backend._temperature = 0.3
+    request = AIRequest(
+        messages=[
+            Message(role=MessageRole.USER, content="What's the weather?"),
+            Message(role=MessageRole.ASSISTANT, content="Let me check..."),
+            Message(role=MessageRole.USER, content="Today specifically."),
+        ],
+    )
+    body = backend._build_request_body(request)
+    last_msg = body["messages"][-1]
+    content = last_msg["content"]
+    # String content gets promoted to a single text block carrying
+    # the marker.
+    assert isinstance(content, list)
+    assert content[-1]["cache_control"] == {"type": "ephemeral"}
+    # Earlier messages stay un-tagged — Anthropic only allows 4
+    # markers total and we're not wasting any on prior turns.
+    earlier = body["messages"][:-1]
+    for m in earlier:
+        c = m.get("content")
+        if isinstance(c, list):
+            for block in c:
+                if isinstance(block, dict):
+                    assert "cache_control" not in block
+
+
+def test_last_message_with_list_content_tags_last_block() -> None:
+    """When the last message is already a list of content blocks
+    (multimodal turn — text + image), the marker attaches to the
+    LAST block. Anthropic caches the prefix up to and including the
+    marker, so trailing position is what we want."""
+    backend = AnthropicAI()
+    backend._model = "m"
+    backend._max_tokens = 100
+    backend._temperature = 0.3
+    request = AIRequest(
+        messages=[
+            Message(
+                role=MessageRole.USER,
+                content="What's in this image?",
+                attachments=[],  # text-only, but shapes the list form
+            ),
+        ],
+    )
+    body = backend._build_request_body(request)
+    last = body["messages"][-1]
+    content = last["content"]
+    assert isinstance(content, list)
+    assert content[-1].get("cache_control") == {"type": "ephemeral"}
