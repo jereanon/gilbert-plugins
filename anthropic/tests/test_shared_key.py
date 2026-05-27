@@ -139,3 +139,34 @@ async def test_vision_registers_its_own_key_too() -> None:
     await vision.initialize({"api_key": "sk-ant-vision-first"})
 
     assert get_shared_anthropic_api_key() == "sk-ant-vision-first"
+
+
+@pytest.mark.asyncio
+async def test_vision_picks_up_shared_key_seeded_after_init() -> None:
+    """Live regression: backend start order can have Vision
+    initialize BEFORE AI (saw it in production logs). Vision then
+    has no key at init time AND no shared key to fall back to.
+    AI initializes ~2s later and seeds the shared registry — Vision
+    should pick it up on the next call WITHOUT a restart.
+
+    This works because Vision now resolves the effective key at
+    each ``available`` check and each ``describe_image`` call, not
+    only at ``initialize()`` time.
+    """
+    from gilbert_plugin_anthropic.anthropic_vision import AnthropicVision
+    from gilbert_plugin_anthropic.shared_key import (
+        register_anthropic_api_key,
+    )
+
+    vision = AnthropicVision()
+    # Start with nothing — Vision came up before AI in the boot
+    # order; shared registry is empty.
+    await vision.initialize({"api_key": ""})
+    assert vision.available is False
+
+    # AI starts ~2s later, seeds the registry.
+    register_anthropic_api_key("sk-ant-late-seed", source="ai")
+
+    # Vision should now report available WITHOUT needing a restart.
+    assert vision.available is True
+    assert vision._effective_api_key() == "sk-ant-late-seed"

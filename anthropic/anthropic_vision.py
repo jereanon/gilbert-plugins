@@ -150,19 +150,37 @@ class AnthropicVision(VisionBackend):
     async def close(self) -> None:
         self._client = None
 
+    def _effective_api_key(self) -> str:
+        """Read-time key resolution: own config wins; fall back to
+        the plugin-shared registry. Done at every call rather than
+        only at initialize() so backend-start order doesn't matter
+        — Vision started before AI is fine, the first vision call
+        after AI init picks up the key automatically (no restart).
+        """
+        if self._api_key:
+            return self._api_key
+        from .shared_key import get_shared_anthropic_api_key
+
+        return get_shared_anthropic_api_key()
+
     @property
     def available(self) -> bool:
-        return bool(self._api_key) and not self._auth_failed
+        return bool(self._effective_api_key()) and not self._auth_failed
 
     def _get_client(self) -> Any:
-        if self._client is None:
+        # Always rebuild when the effective key changed under us
+        # (sibling backend just seeded the registry). Cheap — the
+        # SDK client constructor doesn't make any network calls.
+        key = self._effective_api_key()
+        if self._client is None or getattr(self, "_client_key", "") != key:
             import anthropic
 
-            self._client = anthropic.Anthropic(api_key=self._api_key)
+            self._client = anthropic.Anthropic(api_key=key)
+            self._client_key = key
         return self._client
 
     async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
-        if not self._api_key or self._auth_failed:
+        if not self._effective_api_key() or self._auth_failed:
             return ""
 
         try:
