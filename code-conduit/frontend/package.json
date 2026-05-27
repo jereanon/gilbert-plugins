@@ -1,0 +1,12 @@
+{
+  "name": "@gilbert-plugin/code-conduit-frontend",
+  "private": true,
+  "version": "0.3.0",
+  "description": "Code Conduit SPA panel — live inbound-event feed + outbound compose form.",
+  "type": "module",
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "lucide-react": "^1.0.0"
+  }
+}

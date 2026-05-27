@@ -49,6 +49,10 @@ from gilbert.interfaces.configuration import (
     ConfigurationReader,
 )
 from gilbert.interfaces.events import Event, EventBus, EventBusProvider
+from gilbert.interfaces.notifications import (
+    NotificationProvider,
+    NotificationUrgency,
+)
 from gilbert.interfaces.service import Service, ServiceInfo, ServiceResolver
 from gilbert.interfaces.tools import (
     ToolDefinition,
@@ -106,12 +110,28 @@ class CodeConduitService(Service):
         self._recent_events: deque[CodingAgentEvent] = deque(
             maxlen=_RECENT_EVENT_CAP
         )
+        # Notification fan-out. When the operator pins a recipient
+        # user_id via the config, every non-``info`` event from the
+        # coding agent gets routed through Gilbert's notification
+        # service — which handles in-app delivery, push-provider
+        # fan-out (ntfy/pushover/discord-webhook/telegram), and
+        # mobile pings. Empty user_id = bus events only, no
+        # notifications.
+        self._notifier: NotificationProvider | None = None
+        self._notify_user_id: str = ""
+        # Shared secret the inbound webhook validates. Empty means
+        # the endpoint is disabled (returns 503). Push-style
+        # backends (Claude Code stop hook) can't deliver events
+        # until the operator sets this.
+        self._webhook_secret: str = ""
 
     def service_info(self) -> ServiceInfo:
         return ServiceInfo(
             name="code_conduit",
-            capabilities=frozenset({"code_conduit", "ai_tools"}),
-            optional=frozenset({"configuration", "event_bus"}),
+            capabilities=frozenset(
+                {"code_conduit", "ai_tools", "ws_handlers"}
+            ),
+            optional=frozenset({"configuration", "event_bus", "notifications"}),
             toggleable=True,
             toggle_description=(
                 "Relay messages between Gilbert and a coding agent "
@@ -137,6 +157,15 @@ class CodeConduitService(Service):
         bus_svc = resolver.get_capability("event_bus")
         if isinstance(bus_svc, EventBusProvider):
             self._bus = bus_svc.bus
+
+        # Notification fan-out — optional. When wired AND
+        # ``notify_user_id`` is set, every notable coding-agent
+        # event routes through Gilbert's notification service for
+        # cross-channel delivery (in-app badge, push providers,
+        # mobile pings).
+        notifier_svc = resolver.get_capability("notifications")
+        if isinstance(notifier_svc, NotificationProvider):
+            self._notifier = notifier_svc
 
         self._enabled = True
         await self._apply_config(section)
@@ -210,6 +239,42 @@ class CodeConduitService(Service):
                 default="",
                 multiline=True,
             ),
+            ConfigParam(
+                key="notify_user_id",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Gilbert user_id to receive notifications when "
+                    "the coding agent finishes / errors / asks for "
+                    "input. Empty means bus events only — no "
+                    "in-app or push notifications. Single-tenant "
+                    "deploys typically pin this to the operator's "
+                    "user_id so coding-agent activity surfaces in "
+                    "the notification badge + configured push "
+                    "providers (ntfy / pushover / discord-webhook). "
+                    "Per-backend severities map to "
+                    "NotificationUrgency: error+attention → urgent "
+                    "(sound, flash); done → normal (badge bump); "
+                    "info → skipped."
+                ),
+                default="",
+            ),
+            ConfigParam(
+                key="webhook_secret",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Shared secret the inbound webhook "
+                    "(``POST /api/code-conduit/inbound``) validates "
+                    "via the ``X-Code-Conduit-Secret`` header. "
+                    "Required when using a push-style backend like "
+                    "Claude Code (whose ``Stop`` / ``Notification`` "
+                    "hooks POST events here). Empty disables the "
+                    "endpoint — webhook returns 503 — to prevent "
+                    "an unauthenticated wide-open intake on a "
+                    "deploy that hasn't been configured yet."
+                ),
+                sensitive=True,
+                default="",
+            ),
         ]
 
         # Forward the active backend's params under ``settings.<key>``.
@@ -244,6 +309,15 @@ class CodeConduitService(Service):
         self._project_aliases = self._parse_aliases(
             str(config.get("project_aliases", "") or "")
         )
+        # Live-tunable so the operator can flip notifications on/off
+        # or change the recipient without restarting the whole
+        # service (and re-establishing the SSE consumer).
+        self._notify_user_id = str(
+            config.get("notify_user_id", "") or ""
+        ).strip()
+        self._webhook_secret = str(
+            config.get("webhook_secret", "") or ""
+        ).strip()
 
     # --- ConfigActionProvider ───────────────────────────────────────
 
@@ -499,6 +573,66 @@ class CodeConduitService(Service):
             new_session=new_session,
         )
 
+    def verify_webhook_secret(self, presented: str) -> bool:
+        """Constant-time compare ``presented`` (header value from the
+        webhook request) against the configured secret. Returns
+        False when no secret is configured (rather than auto-passing
+        — an empty configured secret means the endpoint is OFF).
+
+        Lives on the service so the web route doesn't need to peek
+        at private state and so the timing-safe compare happens in
+        one place. ``hmac.compare_digest`` is the standard recipe
+        for header secrets.
+        """
+        if not self._webhook_secret or not presented:
+            return False
+        import hmac
+
+        return hmac.compare_digest(
+            self._webhook_secret.encode("utf-8"),
+            presented.encode("utf-8"),
+        )
+
+    @property
+    def webhook_enabled(self) -> bool:
+        """True iff the inbound webhook will accept events — i.e.
+        a secret is configured. The web route checks this to
+        decide between 503 (off) vs 401 (configured but rejected
+        the credential)."""
+        return bool(self._webhook_secret)
+
+    async def deliver_inbound_event(
+        self,
+        *,
+        event: CodingAgentEvent,
+    ) -> None:
+        """Public entry point for push-style inbound events
+        (Claude Code stop-hook webhook → core route → this
+        method). Routes the event through the same fan-out the
+        pull-style OpenCode consumer uses: ring buffer, bus
+        publish, user notification, per-event log line.
+
+        Implements ``CodingConduitInboundEndpoint`` from the
+        interface module. Web routes resolve the capability with
+        ``resolver.get_capability("code_conduit")`` +
+        ``isinstance(svc, CodingConduitInboundEndpoint)``.
+
+        Service-disabled / backend-not-started is a no-op rather
+        than a raise — the webhook validates auth before reaching
+        us, so by the time we get here we just want to drop the
+        event quietly. ``info``-level log so an operator who's
+        re-installed Claude Code's stop hook on a Gilbert that
+        hasn't been re-enabled sees what's happening.
+        """
+        if not self._enabled:
+            logger.info(
+                "Code Conduit: inbound event dropped — service "
+                "not enabled (raw_type=%s)",
+                event.raw_type or "?",
+            )
+            return
+        await self._ingest_event(event)
+
     def recent_events(
         self,
         *,
@@ -545,32 +679,7 @@ class CodeConduitService(Service):
             return
         try:
             async for event in self._backend.stream_events():
-                self._recent_events.append(event)
-                if self._bus is not None:
-                    await self._publish_event(event)
-                # Log notable events at INFO so journalctl shows
-                # the live signal; ``info`` (default) events stay
-                # at DEBUG so a chatty agent doesn't flood the log.
-                if event.kind in (
-                    EVENT_KIND_DONE,
-                    EVENT_KIND_ERROR,
-                    EVENT_KIND_ATTENTION,
-                ):
-                    logger.info(
-                        "Code Conduit event: kind=%s session=%s "
-                        "raw_type=%s — %s",
-                        event.kind,
-                        event.session_id or "?",
-                        event.raw_type or "?",
-                        event.summary[:120],
-                    )
-                else:
-                    logger.debug(
-                        "Code Conduit event (info): raw_type=%s "
-                        "session=%s",
-                        event.raw_type or "?",
-                        event.session_id or "?",
-                    )
+                await self._ingest_event(event)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -582,6 +691,105 @@ class CodeConduitService(Service):
                 "Code Conduit inbound event pump exited "
                 "unexpectedly — inbound notifications are OFF "
                 "until the service restarts"
+            )
+
+    async def _ingest_event(self, event: CodingAgentEvent) -> None:
+        """Common ingest path for ANY inbound event — whether it
+        came from the active backend's ``stream_events`` (OpenCode
+        SSE) or a webhook receiver (Claude Code's stop hook).
+
+        Buffers the event, publishes the bus notification, fires
+        the user notification when configured, and emits the
+        per-event log line. Single entry point so backends with
+        push-style inbound channels get the same fan-out as the
+        pull-style OpenCode consumer.
+        """
+        self._recent_events.append(event)
+        if self._bus is not None:
+            await self._publish_event(event)
+        await self._maybe_notify_user(event)
+        # Log notable events at INFO so journalctl shows
+        # the live signal; ``info`` (default) events stay
+        # at DEBUG so a chatty agent doesn't flood the log.
+        if event.kind in (
+            EVENT_KIND_DONE,
+            EVENT_KIND_ERROR,
+            EVENT_KIND_ATTENTION,
+        ):
+            logger.info(
+                "Code Conduit event: kind=%s session=%s "
+                "raw_type=%s — %s",
+                event.kind,
+                event.session_id or "?",
+                event.raw_type or "?",
+                event.summary[:120],
+            )
+        else:
+            logger.debug(
+                "Code Conduit event (info): raw_type=%s "
+                "session=%s",
+                event.raw_type or "?",
+                event.session_id or "?",
+            )
+
+    async def _maybe_notify_user(self, event: CodingAgentEvent) -> None:
+        """Fire a Gilbert notification when the operator pinned a
+        recipient + the event is notable. ``info``-grade events
+        skip — those are tool calls / progress, not user-facing.
+
+        Severity mapping:
+        - ``error`` / ``attention`` → ``urgent`` (sound + flash on
+          the desktop, push provider fan-out at the operator's
+          configured urgency floor).
+        - ``done`` → ``normal`` (badge bump, no sound).
+        - ``info`` → skipped entirely.
+
+        ``source_ref`` carries the session_id + project so the
+        frontend can deep-link from the notification panel to the
+        future ``/coding`` feed entry.
+        """
+        if self._notifier is None or not self._notify_user_id:
+            return
+        if event.kind not in (
+            EVENT_KIND_DONE,
+            EVENT_KIND_ERROR,
+            EVENT_KIND_ATTENTION,
+        ):
+            return
+
+        urgency = (
+            NotificationUrgency.URGENT
+            if event.kind in (EVENT_KIND_ERROR, EVENT_KIND_ATTENTION)
+            else NotificationUrgency.NORMAL
+        )
+        # Prefix the message with the project name when known so
+        # the user can tell at a glance which session the notice
+        # came from. The notifications panel renders a 1-line
+        # message; verbose payloads get truncated by the UI anyway.
+        prefix = ""
+        if event.project_path:
+            label = self._friendly_label_for(event.project_path)
+            prefix = f"[{label}] "
+        message = f"{prefix}{event.summary}"
+
+        try:
+            await self._notifier.notify_user(
+                user_id=self._notify_user_id,
+                message=message[:280],
+                urgency=urgency,
+                source="code_conduit",
+                source_ref={
+                    "session_id": event.session_id,
+                    "project_path": event.project_path,
+                    "kind": event.kind,
+                    "raw_type": event.raw_type,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Code Conduit: failed to fire notification — "
+                "bus event still published, ring buffer still has "
+                "the entry"
             )
 
     async def _publish_event(self, event: CodingAgentEvent) -> None:
@@ -677,6 +885,83 @@ class CodeConduitService(Service):
             lines.append(f"- {e.kind.upper()}{project_tag}: {e.summary}")
         return "\n".join(lines)
 
+    # --- WS handlers (SPA backend) ──────────────────────────────────
+
+    def get_ws_handlers(self) -> dict[str, Any]:
+        """Expose the data the ``/coding`` SPA page polls.
+
+        Two RPC frames:
+        - ``code.events.list`` — returns the in-memory ring buffer
+          (newest first) with optional ``limit`` + ``kind`` filters.
+          Same source as the ``code_recent_activity`` AI tool but
+          structured JSON for the frontend to render.
+        - ``code.send`` — fire an outbound relay from the SPA's
+          compose form. Mirrors the ``code_send`` AI tool's
+          argument shape so the page is functionally a typed
+          terminal for the same flow voice uses.
+        """
+        return {
+            "code.events.list": self._ws_events_list,
+            "code.send": self._ws_send,
+        }
+
+    async def _ws_events_list(
+        self,
+        conn: Any,
+        frame: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = frame.get("payload") or frame
+        try:
+            limit = max(1, int(payload.get("limit", 50)))
+        except (TypeError, ValueError):
+            limit = 50
+        kind = str(payload.get("kind", "") or "").strip().lower()
+        events = self.recent_events(limit=limit, kind=kind)
+        return {
+            "type": "code.events.list.result",
+            "ref": frame.get("id"),
+            "events": [_event_to_dict(e) for e in events],
+            "enabled": self._enabled,
+        }
+
+    async def _ws_send(
+        self,
+        conn: Any,
+        frame: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = frame.get("payload") or frame
+        message = str(payload.get("message", "") or "").strip()
+        if not message:
+            return {
+                "type": "code.send.result",
+                "ref": frame.get("id"),
+                "ok": False,
+                "error": "message is required",
+            }
+        project = str(payload.get("project", "") or "").strip()
+        new_session = bool(payload.get("new_session", False))
+        try:
+            result = await self.send_message(
+                message=message,
+                project=project,
+                new_session=new_session,
+            )
+        except Exception as exc:
+            return {
+                "type": "code.send.result",
+                "ref": frame.get("id"),
+                "ok": False,
+                "error": str(exc),
+            }
+        return {
+            "type": "code.send.result",
+            "ref": frame.get("id"),
+            "ok": True,
+            "session_id": result.session_id,
+            "project_path": result.project_path,
+            "backend": self._backend_name,
+        }
+
     # --- Internals ──────────────────────────────────────────────────
 
     async def _apply_config(self, section: dict[str, Any]) -> None:
@@ -690,6 +975,12 @@ class CodeConduitService(Service):
         self._project_aliases = self._parse_aliases(
             str(section.get("project_aliases", "") or "")
         )
+        self._notify_user_id = str(
+            section.get("notify_user_id", "") or ""
+        ).strip()
+        self._webhook_secret = str(
+            section.get("webhook_secret", "") or ""
+        ).strip()
 
         registered = CodingAgentBackend.registered_backends()
         backend_cls = registered.get(self._backend_name)
@@ -782,3 +1073,21 @@ class CodeConduitService(Service):
                 continue
             result[alias] = path
         return result
+
+
+# ── Module helpers ────────────────────────────────────────────────────
+
+
+def _event_to_dict(event: CodingAgentEvent) -> dict[str, Any]:
+    """Serialise a CodingAgentEvent for the SPA. Mirrors the bus
+    event's ``data`` shape so frontend code can render either
+    source the same way."""
+    return {
+        "kind": event.kind,
+        "summary": event.summary,
+        "detail": event.detail,
+        "session_id": event.session_id,
+        "project_path": event.project_path,
+        "timestamp": event.timestamp,
+        "raw_type": event.raw_type,
+    }

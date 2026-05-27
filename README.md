@@ -32,7 +32,7 @@ The table below is an index — jump to each plugin's detail section for configu
 | [arr](#arr) | `radarr` service, `sonarr` service | — (uses `httpx`) | Media |
 | [bedrock](#bedrock) | `AIBackend "bedrock"` | `boto3` | Intelligence |
 | [browser](#browser) | `browser` service (headless Chrome tools, credential manager, VNC live login) | `playwright`, `cryptography` | Automation |
-| [code-conduit](#code-conduit) | `code_conduit` service (`code_send` + `code_recent_activity` AI tools, `/code send` + `/code recent` slash commands, `code.notification` bus events) — relay to OpenCode (`opencode serve`); Claude Code planned | — (uses `httpx`) | Developer tools |
+| [code-conduit](#code-conduit) | `code_conduit` service (`code_send` + `code_recent_activity` AI tools, `/code send` + `/code recent` slash commands, `code.notification` bus events, `/coding` SPA page, notification fan-out, OpenCode + Claude Code backends, `/api/code-conduit/inbound` webhook) | — (uses `httpx`) | Developer tools |
 | [deepgram](#deepgram) | `StreamingTranscriptionBackend "deepgram"` | — (uses `websockets`) | Speech |
 | [deepseek](#deepseek) | `AIBackend "deepseek"` | — (uses `httpx`) | Intelligence |
 | [discord-webhook](#discord-webhook) | `PushNotificationBackend "discord-webhook"` | — (uses `httpx`) | Notifications |
@@ -280,10 +280,10 @@ The doctor reads `Plugin.runtime_dependencies()` (see `CLAUDE.md`). With Docker 
 
 ### code-conduit
 
-Gilbert as a *conduit* between the user (typically over voice via the Mentra glasses or the chat UI) and a coding agent the user runs on their own machine. The plugin never edits code, never reviews diffs, and never makes editorial judgments — it just relays messages in **both directions**: outbound ("tell Claude to write tests") via the agent's HTTP API, inbound ("Claude finished the test suite") via the agent's event stream republished onto Gilbert's bus. Currently speaks [OpenCode](https://github.com/sst/opencode) via `opencode serve`; Claude Code planned for Phase 3.
+Gilbert as a *conduit* between the user (typically over voice via the Mentra glasses or the chat UI) and a coding agent the user runs on their own machine. The plugin never edits code, never reviews diffs, and never makes editorial judgments — it just relays messages in **both directions**: outbound ("tell Claude to write tests") via the agent's HTTP API or a `claude -p` subprocess, inbound ("Claude finished the test suite") via the agent's event stream (OpenCode SSE) or a stop-hook webhook (Claude Code). All inbound events fan out to a `code.notification` bus event AND a Gilbert notification (in-app badge + push-provider delivery via the configured user's notification routes). Ships with backends for both [OpenCode](https://github.com/sst/opencode) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 **Service registered**
-- `CodeConduitService` — capabilities `code_conduit`, `ai_tools`. Wraps a `CodingAgentBackend` (currently only `OpenCodeBackend`), implements the `CodingConduitProvider` capability protocol so other services can drop messages into the agent without depending on the concrete class, and runs a background event pump that consumes the backend's inbound stream and publishes `code.notification` bus events for downstream subscribers (voice-brain, Mentra, push notifications, future SPA feed).
+- `CodeConduitService` — capabilities `code_conduit`, `ai_tools`, `ws_handlers`. Wraps a `CodingAgentBackend` (OpenCode or Claude Code), implements the `CodingConduitProvider` capability protocol so other services can drop messages into the agent without depending on the concrete class, implements the `CodingConduitInboundEndpoint` protocol so the core webhook route can push push-style events back through the same fan-out path, and runs a background event pump that consumes the active backend's inbound stream + publishes `code.notification` bus events for downstream subscribers (voice-brain, Mentra, push notifications, the SPA feed).
 
 **Slash commands** (under the `code` namespace)
 - `/code send <message> [project=<alias>] [new_session=true|false]` — relay `message` to the active coding agent on the named project (or the operator-configured default). Returns immediately with a `"sent"` acknowledgment; the agent's eventual response surfaces via `code.notification` bus events.
@@ -294,32 +294,80 @@ Gilbert as a *conduit* between the user (typically over voice via the Mentra gla
 - `code_recent_activity(limit?, kind?)` — what the LLM fires when the user asks *"what has the coding agent been up to?"* / *"is Claude still working on that?"* / *"any progress on the gilbert branch?"*. Returns a headline + per-event bullets summarising recent notifications.
 
 **Bus events published**
-- `code.notification` (source `code_conduit`) — every inbound coding-agent event, normalised into a severity bucket (`done` / `error` / `attention` / `info`). Event `data` carries `kind`, `summary` (TTS-friendly one-liner), `detail`, `session_id`, `project_path`, `timestamp`, `raw_type` (backend's native event-type name), and `backend`. Subscribers decide their own notification policy: voice-brain might announce `error`/`attention` immediately and `done` only when the voice loop is idle; the SPA `/coding` feed (Phase 3) renders every event.
+- `code.notification` (source `code_conduit`) — every inbound coding-agent event, normalised into a severity bucket (`done` / `error` / `attention` / `info`). Event `data` carries `kind`, `summary` (TTS-friendly one-liner), `detail`, `session_id`, `project_path`, `timestamp`, `raw_type` (backend's native event-type name), and `backend`. Subscribers decide their own notification policy: voice-brain might announce `error`/`attention` immediately and `done` only when the voice loop is idle; the SPA `/coding` feed renders every event.
+
+**Notification fan-out** — when `notify_user_id` is set, every notable (non-`info`) event also fires through Gilbert's `NotificationProvider`. Severity mapping: `error` + `attention` → `NotificationUrgency.URGENT` (sound + flash on the desktop, surfaces against push providers' urgency floors); `done` → `NormalUrgency` (badge bump, no sound); `info` → skipped. The notification's `source_ref` deep-links back to the event (session_id, project_path, kind, raw_type) so the panel can navigate to the SPA feed entry. Configured user receives delivery across whatever notification routes they've set on `/account/notifications` (ntfy / pushover / discord-webhook / telegram).
+
+**SPA page** (`/coding`) — admin-visible at user role, hidden when the service capability isn't advertised. Two-column layout: severity-filtered activity feed on the left (polls `code.events.list` every 5s, color-coded by kind, expandable detail) + a compose form on the right (mirrors `code_send` parameters; same path as the AI tool and slash command).
+
+**Webhook** (`POST /api/code-conduit/inbound`) — push-style event intake for any caller that can fire a JSON POST. Required header `X-Code-Conduit-Secret` validated with `hmac.compare_digest` against the operator-configured `webhook_secret`. Returns:
+- `200` — accepted, event ingested through the same fan-out path as pull-style events.
+- `400` — body wasn't JSON or wasn't an object.
+- `401` — secret missing or didn't match (response body doesn't echo the presented value).
+- `503` — plugin not loaded OR `webhook_secret` not configured.
+
+Payload schema (all fields optional, sensible defaults):
+```
+{
+  "kind": "done|error|attention|info",
+  "summary": "short voice-friendly one-liner",
+  "detail": "longer prose for the SPA feed",
+  "session_id": "...", "project_path": "...",
+  "timestamp": "ISO-8601", "raw_type": "stop_hook"
+}
+```
+
+Unknown `kind` values coerce to `info` rather than 400 — preserves whatever the caller sent in `raw_type` so a future daemon variant doesn't get silently dropped.
 
 **Configure** (Settings → Integrations → Code Conduit)
 - `enabled` — required, off by default. Service toggle exposed under Settings → Services.
-- `backend` *(restart_required)* — `opencode` (the only shipped backend today).
+- `backend` *(restart_required)* — `opencode` or `claude_code`.
 - `default_project_alias` — alias to use when the user doesn't name a project. Must match a key in `project_aliases`.
 - `project_aliases` *(multiline)* — newline-separated `alias=/abs/path` pairs. Lets the user say "the gilbert project" instead of pasting a full path. Lines starting with `#` and blanks are ignored.
+- `notify_user_id` — Gilbert user_id to receive notifications when the coding agent finishes / errors / asks for input. Empty = bus events only. Single-tenant deploys typically pin this to the operator. Severity mapping in the **Notification fan-out** section above.
+- `webhook_secret` *(sensitive)* — shared secret the inbound webhook validates. Empty = webhook is OFF (returns 503). Required for Claude Code (whose stop hook is the only inbound channel) and any other push-style integration.
+
+**OpenCode backend** (`backend = opencode`)
 - `settings.server_url` *(restart_required)* — URL of the user's `opencode serve` daemon. Defaults to `http://127.0.0.1:4096`. For a typical setup (Gilbert on a server, OpenCode on the user's laptop), run `opencode serve --hostname <tailnet-ip>` on the laptop and put the resulting Tailscale URL here.
 - `settings.server_password` *(sensitive, restart_required)* — password configured via `OPENCODE_SERVER_PASSWORD` when starting `opencode serve`. HTTP Basic auth with user `opencode`.
-- `settings.timeout_seconds` *(restart_required)* — HTTP timeout for OpenCode round-trips. Default 10s; doesn't gate the agent's response (that's fire-and-forget) — only the round-trip to the daemon itself.
+- `settings.timeout_seconds` *(restart_required)* — HTTP timeout for OpenCode round-trips. Default 10s.
 
-**Config action** — `test_connection`: lists one session via the configured backend. Confirms the URL is reachable, the password is correct, and the API is responding without sending a real prompt.
+**Claude Code backend** (`backend = claude_code`)
+- `settings.binary_path` *(restart_required)* — absolute path to the `claude` binary. Empty = use PATH-resolved `claude` on the Gilbert host. Required when Gilbert runs on a different machine than the one Claude Code is installed on — the integration spawns subprocesses so the binary must live on the Gilbert host's filesystem.
+- `settings.default_session_id` *(restart_required)* — optional Claude Code session id to resume by default. Get it from `claude --resume` (copy from the picker). Pinning this turns one long-lived Claude Code conversation into the canonical "work session" Gilbert nudges.
+- `settings.extra_args` *(restart_required)* — extra flags appended to every `claude -p` invocation, space-separated. Useful for forcing a model (`--model claude-opus-4-7`) or disabling tools.
 
-**Operator setup for OpenCode**
+**Config action** — `test_connection`: lists one session via the configured backend. Confirms reachability + auth without sending a real prompt.
+
+**Operator setup — OpenCode**
 1. On the laptop where dev work happens, install OpenCode and start the daemon bound to the Tailscale interface:
    ```
    OPENCODE_SERVER_PASSWORD=<set-a-strong-one> opencode serve --hostname <tailnet-ip>
    ```
-2. In Gilbert's Settings → Integrations → Code Conduit, paste `http://<tailnet-ip>:4096` and the password.
+2. In Gilbert's Settings → Integrations → Code Conduit, set `backend=opencode`, paste `http://<tailnet-ip>:4096` and the password.
 3. Click *Test connection*. Once it returns green, the LLM tool `code_send` is live — try *"tell Claude to add error handling to the new endpoint"* via chat or voice.
 
-**Scope notes** — Phases 1 + 2 ship in this release: outbound relay (`code_send`) and inbound notifications (`code.notification` bus events + `code_recent_activity` tool). What's still out of scope:
+**Operator setup — Claude Code**
+1. Install `claude` on the Gilbert host. If using a version manager, set `settings.binary_path` to the absolute path.
+2. Optional but recommended: pin a `default_session_id` so every send continues one canonical conversation rather than spawning a fresh one-shot each time.
+3. Set `webhook_secret` to a strong random string. Inbound channel is OFF until this is filled.
+4. On the Gilbert host, add a `Stop` hook in `~/.claude/settings.json` that POSTs to Gilbert's inbound endpoint:
+   ```json
+   {
+     "hooks": {
+       "Stop": [{
+         "command": "curl -fsS -X POST http://<gilbert-host>:8400/api/code-conduit/inbound -H 'Content-Type: application/json' -H 'X-Code-Conduit-Secret: <your-secret>' -d '{\"kind\":\"done\",\"summary\":\"Claude Code finished a turn.\",\"raw_type\":\"stop_hook\"}'"
+       }]
+     }
+   }
+   ```
+   Or use any other tool capable of firing an authenticated HTTP POST.
 
-- **SPA `/coding` feed** (Phase 3 polish) — a live two-column view of outbound messages and inbound notifications. Skeleton landed in the plugin layout but no panel is registered yet.
-- **Claude Code backend** (Phase 3) — outbound via background `claude -p --resume`, inbound via the Claude Code stop-hook posting to a Gilbert webhook. The `code.notification` bus event shape is already generic enough to accept Claude Code events without changes.
-- **Voice-brain integration** — subscribing to `code.notification` and routing severities into TTS interrupt-now / wait-for-quiet / silent buckets. Lives in `voice-agent` / `mentra`, not here. The bus events are published; consumers haven't been wired yet.
+**Scope notes** — Phases 1, 2, and 3 all ship in this release: outbound relay (`code_send`), inbound notifications (`code.notification` bus events + `code_recent_activity` tool), notification fan-out, Claude Code backend, webhook receiver, SPA `/coding` feed. What's still out of scope:
+
+- **Voice-brain TTS routing** — subscribing to `code.notification` from `voice-agent` / `mentra` so urgent events interrupt an active voice session and "done" events queue for the next quiet moment. Bus events are published; the consumer-side policy needs wiring in the voice plugins.
+- **Live tail in the SPA feed** — `/coding` polls every 5s rather than subscribing to a WS push. Good enough for a notification panel; live tail can come later if the latency becomes annoying.
+- **Multi-user routing** — single notify_user_id today. Per-Gilbert-user agent configs (multi-tenant) would need additional plumbing.
 
 ---
 

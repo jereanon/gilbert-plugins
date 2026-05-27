@@ -26,6 +26,7 @@ if _pkg_name not in sys.modules:
     # entry point.
     for _mod_name in (
         "opencode_backend",
+        "claude_code_backend",
         "code_conduit_service",
         "plugin",
     ):
