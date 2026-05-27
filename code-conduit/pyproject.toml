@@ -1,0 +1,11 @@
+[project]
+name = "gilbert-plugin-code-conduit"
+version = "0.1.0"
+description = "Relay messages between Gilbert and a coding agent (OpenCode, Claude Code)"
+requires-python = ">=3.12"
+# httpx ships in Gilbert core; no extra deps. Listed empty so uv
+# workspace resolution doesn't complain about a missing key.
+dependencies = []
+
+[tool.uv]
+package = false

@@ -1,0 +1,10 @@
+name: code-conduit
+version: "0.1.0"
+description: "Relay messages between Gilbert and a coding agent (OpenCode, Claude Code)"
+
+provides:
+  - code_conduit
+  - opencode
+
+requires: []
+depends_on: []
