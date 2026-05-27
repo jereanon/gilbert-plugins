@@ -217,24 +217,67 @@ async def execute_camera_tool(
     if focus_raw == FOCUS_TEXT and ocr is None:
         _event(
             "photo_skipped",
-            "Camera tool called with focus=text but no OCR backend.",
+            "Camera tool called with focus=text but no OCR service "
+            "is registered.",
             "warning",
         )
         return (
-            "I don't have an OCR backend configured, so I can't "
-            "read text from photos. Ask the admin to enable an OCR "
-            "service in Settings."
+            "I don't have an OCR service registered, so I can't read "
+            "text from photos. Ask the admin to enable an OCR service "
+            "in Settings."
         )
     if focus_raw in (FOCUS_GENERAL, FOCUS_FACE) and vision is None:
         _event(
             "photo_skipped",
-            f"Camera tool called with focus={focus_raw} but no vision backend.",
+            f"Camera tool called with focus={focus_raw} but no vision "
+            f"service is registered.",
             "warning",
         )
         return (
-            "I don't have a vision backend configured, so I can't "
-            "describe what's in the photo. Ask the admin to enable "
-            "a vision service in Settings."
+            "I don't have a vision service registered, so I can't "
+            "describe what's in the photo. Ask the admin to enable a "
+            "vision service in Settings."
+        )
+
+    # Both services exist, but the underlying backend might not be
+    # ready (most common: API key missing from Settings → Vision /
+    # Settings → OCR). The capability's ``available`` property is
+    # the canonical signal — read via getattr so plugins / stubs
+    # that don't expose it default to True (and surface real failure
+    # later if the call returns empty).
+    if focus_raw == FOCUS_TEXT and not getattr(ocr, "available", True):
+        _event(
+            "photo_skipped",
+            "OCR service registered but backend isn't ready (likely "
+            "missing API key / install).",
+            "warning",
+        )
+        return (
+            "The OCR service is installed but isn't fully configured "
+            "— likely missing an API key or the underlying tool isn't "
+            "installed. Ask the admin to check Settings → OCR."
+        )
+    if (
+        focus_raw in (FOCUS_GENERAL, FOCUS_FACE)
+        and not getattr(vision, "available", True)
+    ):
+        _event(
+            "photo_skipped",
+            "Vision service registered but backend isn't ready "
+            "(likely missing API key).",
+            "warning",
+        )
+        # Concrete advice — the most common cause by a long way is a
+        # missing Anthropic API key, since that's the only Vision
+        # backend Gilbert ships today.
+        return (
+            "I have a vision service registered but its backend isn't "
+            "configured — almost always a missing API key. Ask the "
+            "admin to set Settings → Vision → API key (the same "
+            "Anthropic key the chat AI uses works fine). For now, "
+            "if you only need to read text from a sign / menu / "
+            "document, you can ask me again with 'what does this "
+            "say?' and I'll route to the OCR backend instead."
         )
 
     # ── Capture ─────────────────────────────────────────────────

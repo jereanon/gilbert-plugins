@@ -66,10 +66,13 @@ class _StubSession:
 
 
 class _StubVision:
-    def __init__(self, response: str = "A red exit sign.") -> None:
+    def __init__(
+        self, response: str = "A red exit sign.", available: bool = True
+    ) -> None:
         self.calls: list[tuple[bytes, str]] = []
         self.response = response
         self.raise_on_call: Exception | None = None
+        self.available = available
 
     async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
         self.calls.append((image_bytes, media_type))
@@ -79,10 +82,13 @@ class _StubVision:
 
 
 class _StubOCR:
-    def __init__(self, response: str = "EXIT") -> None:
+    def __init__(
+        self, response: str = "EXIT", available: bool = True
+    ) -> None:
         self.calls: list[bytes] = []
         self.response = response
         self.raise_on_call: Exception | None = None
+        self.available = available
 
     async def extract_text(self, image_bytes: bytes) -> str:
         self.calls.append(image_bytes)
@@ -411,3 +417,88 @@ async def test_missing_photo_url_returns_friendly_error() -> None:
 
     assert "url" in result.lower() or "try again" in result.lower()
     assert ocr.calls == []
+
+
+@pytest.mark.asyncio
+async def test_vision_not_available_returns_admin_guidance() -> None:
+    """Vision service registered but ``available=False`` (most common
+    cause: Anthropic API key missing). Return concrete guidance
+    pointing the admin at Settings → Vision rather than the
+    ambiguous 'try again with a clearer view' message we used to
+    return when describe_image returned empty bytes."""
+    session = _StubSession()
+    vision = _StubVision(available=False)
+    ocr = _StubOCR()
+
+    result = await execute_camera_tool(
+        session=session,
+        arguments={},
+        vision=vision,
+        ocr=ocr,
+        http_client_factory=_http_factory(),
+    )
+
+    # Concrete admin-action guidance + a useful fallback hint for
+    # the user (OCR works for text-on-things questions).
+    msg = result.lower()
+    assert "vision" in msg
+    assert "api key" in msg or "settings" in msg
+    # OCR routing hint so the user has a way to get value out of
+    # their session even while vision is broken.
+    assert "ocr" in msg or "this say" in msg
+    # describe_image MUST NOT have been called — we short-circuited
+    # on the availability check.
+    assert vision.calls == []
+    # Photo MUST NOT have been taken either — no point capturing
+    # bytes we know we can't process.
+    assert session.camera.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ocr_not_available_returns_admin_guidance() -> None:
+    """OCR registered but backend not ready (e.g. missing language
+    pack). Surface as admin-actionable error, not 'try again with
+    better light'."""
+    session = _StubSession()
+    vision = _StubVision()
+    ocr = _StubOCR(available=False)
+
+    result = await execute_camera_tool(
+        session=session,
+        arguments={"focus": "text"},
+        vision=vision,
+        ocr=ocr,
+        http_client_factory=_http_factory(),
+    )
+
+    msg = result.lower()
+    assert "ocr" in msg
+    assert "configured" in msg or "settings" in msg or "api key" in msg
+    assert ocr.calls == []
+    assert session.camera.calls == []
+
+
+@pytest.mark.asyncio
+async def test_backend_without_available_attr_assumed_ready() -> None:
+    """Plugins / older backends might not expose an ``available``
+    property. The tool defaults to True via getattr so it doesn't
+    accidentally regress consumers that didn't opt into the
+    availability check."""
+
+    class _LegacyVision:
+        # No ``available`` attribute on purpose.
+        async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
+            return "A clear scene."
+
+    session = _StubSession()
+    result = await execute_camera_tool(
+        session=session,
+        arguments={},
+        vision=_LegacyVision(),
+        ocr=None,
+        http_client_factory=_http_factory(),
+    )
+
+    # Legacy backend was called; tool didn't bail out on the missing
+    # availability check.
+    assert result == "A clear scene."
