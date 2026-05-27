@@ -243,6 +243,13 @@ class _ScribeLiveStream(TranscriptionStream):
         # Telemetry — first send + first recv are the diagnostic
         # gold for "is the pipe actually moving."
         self._sent_count = 0
+        # Dedupe ring for FinalTranscript emission — Scribe sends
+        # both committed_transcript (fast) and
+        # committed_transcript_with_timestamps (delayed 20-30s) for
+        # the same utterance. We keep only the first arrival per
+        # (text, end_seconds) pair so the engine doesn't dispatch
+        # the same user turn twice. See events() for the full story.
+        self._recent_final_keys: list[tuple[str, float]] = []
 
     async def send(self, chunk: bytes) -> None:
         if self._closed:
@@ -353,10 +360,43 @@ class _ScribeLiveStream(TranscriptionStream):
                 "committed_transcript_with_timestamps",
                 "final",
             ):
+                # Dedupe across the plain + timestamped variants of
+                # the same utterance. Scribe Realtime emits BOTH:
+                # ``committed_transcript`` fires fast at end-of-VAD,
+                # then ``committed_transcript_with_timestamps`` for
+                # the same text 20-30s later (verified live —
+                # observed gap was 27s). Without dedupe the engine
+                # dispatches the user's turn TWICE, producing
+                # duplicate AI replies / repeated TTS playback.
+                #
+                # Keep only the first-arriving variant per (text,
+                # end_seconds) tuple. The end-time disambiguator
+                # protects against the legitimate case where the
+                # user said the same words twice in a row.
+                final_text = str(
+                    msg.get("text") or msg.get("transcript") or ""
+                )
+                end_seconds = float(msg.get("end", 0.0))
+                dedup_key = (final_text, end_seconds)
+                if dedup_key in self._recent_final_keys:
+                    logger.info(
+                        "Scribe Live: suppressing duplicate final "
+                        "(%s) for text=%r end=%.2f",
+                        kind,
+                        final_text[:80],
+                        end_seconds,
+                    )
+                    continue
+                self._recent_final_keys.append(dedup_key)
+                # Bounded ring so memory stays flat even across long
+                # sessions. 32 deep covers every reasonable
+                # plain+timestamped pairing while staying tiny.
+                if len(self._recent_final_keys) > 32:
+                    self._recent_final_keys.pop(0)
                 yield FinalTranscript(
-                    text=str(msg.get("text") or msg.get("transcript") or ""),
+                    text=final_text,
                     start_seconds=float(msg.get("start", 0.0)),
-                    end_seconds=float(msg.get("end", 0.0)),
+                    end_seconds=end_seconds,
                     speaker_label=_aggregate_speaker_id(msg),
                 )
             elif kind in ("speech_started", "vad_speech_start"):

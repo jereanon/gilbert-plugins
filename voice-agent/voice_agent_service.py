@@ -1552,22 +1552,32 @@ class VoiceAgentService(Service):
             # ``ctx.outcome["end_requested"]`` and the engine notices
             # after each chat() round.
             use_full_ai_service=True,
-            # Speaker-id echo suppression. Voice-agent's typical
-            # setup (laptop mic + laptop speakers, or any open-air
-            # setup) bleeds Gilbert's TTS straight back into the mic
-            # and Scribe transcribes it as a "user turn" → infinite
-            # self-talk loop. With diarize_speakers=True the engine
-            # asks Scribe Realtime for per-utterance speaker labels,
-            # then classifies first sightings: any speaker_label
-            # heard while ``speaking.active`` becomes Gilbert (echo)
-            # and gets dropped from then on. Confirmed-user speakers
-            # still flow through during Gilbert's TTS → barge-in
-            # works exactly as before.
+            # Speaker-id echo suppression. Scribe v2 Realtime does
+            # NOT actually populate per-word ``speaker_id`` today —
+            # the field exists in the response schema but always
+            # comes back as ``None`` (verified live: every word
+            # in committed_transcript_with_timestamps showed
+            # ``speaker_id: None``). ElevenLabs' own docs confirm:
+            # "Scribe v2 handles batch processing with diarization;
+            # Scribe v2 Realtime handles streaming without it."
             #
-            # Backend cost: Scribe Realtime gets ``include_timestamps=true``
-            # in its query string, which gives back per-word
-            # ``speaker_id`` fields the engine aggregates.
-            diarize_speakers=True,
+            # Enabling ``diarize_speakers=True`` would gain zero
+            # filtering (classifier short-circuits on empty
+            # speaker_label) AND cost latency: Scribe emits
+            # ``committed_transcript_with_timestamps`` 20-30s AFTER
+            # the plain ``committed_transcript`` for the same
+            # utterance, which would either double-dispatch through
+            # the engine or push the UI's "user said X" render that
+            # far behind the actual speech. Off until ElevenLabs
+            # ships realtime diarization for real.
+            #
+            # Voice-agent today relies on local VAD for barge-in
+            # (works fine when the user wears headphones / has OS-
+            # level AEC) and the engine's speaking-state book for
+            # the rest of echo handling.
+            # diarize_speakers=True,  # TODO re-enable when Scribe
+            #                            Realtime gains real
+            #                            per-word speaker_id values
             # Tag the underlying ai.chat() conversation so it doesn't
             # clutter the chat sidebar. Voice-agent already persists
             # its own _VoiceConversationRecord (visible at /voice);

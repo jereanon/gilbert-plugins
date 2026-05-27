@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -317,11 +318,11 @@ async def test_diarize_false_omits_include_timestamps_query_param(
 async def test_committed_transcript_with_timestamps_populates_speaker_label(
     live,
 ) -> None:
-    """End-to-end through the event parser: a Scribe Realtime
-    ``committed_transcript_with_timestamps`` frame carrying per-word
-    speaker_id values must emerge as a ``FinalTranscript`` with the
-    aggregated speaker_label set. Without this the engine's
-    classifier has nothing to filter on."""
+    """When a ``committed_transcript_with_timestamps`` arrives
+    standalone (no preceding plain commit for the same text), it
+    must yield a FinalTranscript with the aggregated speaker_label
+    set. This is the path that would matter if ElevenLabs ever
+    populates per-word speaker_id in realtime."""
     await live.initialize({"api_key": "el-test"})
 
     class _FakeWs:
@@ -376,5 +377,158 @@ async def test_committed_transcript_with_timestamps_populates_speaker_label(
         assert len(finals) == 1
         assert finals[0].text == "hello there"
         assert finals[0].speaker_label == "1"
+
+        await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_committed_transcript_is_suppressed(
+    live,
+) -> None:
+    """Live observation: Scribe Realtime sends BOTH
+    ``committed_transcript`` (fast) and
+    ``committed_transcript_with_timestamps`` (delayed 20-30s) for the
+    same utterance when ``include_timestamps=true``. Without dedupe
+    the parser yields two FinalTranscript events and the engine
+    dispatches the user's turn twice — Gilbert repeats himself.
+
+    Regression test: a plain commit followed by a timestamped commit
+    with the same text + end_seconds must only emit ONE
+    FinalTranscript."""
+    await live.initialize({"api_key": "el-test"})
+
+    class _FakeWs:
+        def __init__(self) -> None:
+            self._queue: asyncio.Queue = asyncio.Queue()
+
+        async def send(self, data): pass
+
+        async def recv(self):
+            item = await self._queue.get()
+            if item is None:
+                raise ConnectionError("closed")
+            return item
+
+        async def close(self): pass
+
+        def push(self, frame): self._queue.put_nowait(frame)
+
+    fake_ws = _FakeWs()
+    with patch("websockets.connect", new=AsyncMock(return_value=fake_ws)):
+        stream = await live.open_stream(
+            StreamConfig(
+                format=AudioFormat(AudioEncoding.PCM_S16LE),
+                diarize=True,
+            )
+        )
+
+        # Plain commit first (fast path).
+        fake_ws.push(
+            json.dumps(
+                {
+                    "message_type": "committed_transcript",
+                    "text": "what time is it",
+                    "start": 1.0,
+                    "end": 2.5,
+                }
+            )
+        )
+        # Same text, same end time, timestamped variant — typical
+        # Scribe pattern. Engine MUST NOT see this as a fresh turn.
+        fake_ws.push(
+            json.dumps(
+                {
+                    "message_type": "committed_transcript_with_timestamps",
+                    "text": "what time is it",
+                    "start": 1.0,
+                    "end": 2.5,
+                    "words": [
+                        {"text": "what", "speaker_id": None},
+                        {"text": "time", "speaker_id": None},
+                        {"text": "is", "speaker_id": None},
+                        {"text": "it", "speaker_id": None},
+                    ],
+                }
+            )
+        )
+
+        finals: list = []
+        async def _drain():
+            # Wait long enough to be sure no second final ever fires.
+            with contextlib.suppress(asyncio.TimeoutError):
+                async with asyncio.timeout(0.3):
+                    async for ev in stream.events():
+                        if isinstance(ev, FinalTranscript):
+                            finals.append(ev)
+
+        await _drain()
+        assert len(finals) == 1
+        assert finals[0].text == "what time is it"
+
+        await stream.close()
+
+
+@pytest.mark.asyncio
+async def test_same_text_different_end_time_is_not_deduped(
+    live,
+) -> None:
+    """The dedupe key includes ``end_seconds`` so a user who says
+    the same words twice in a row (legitimately) still gets two
+    dispatches — only the plain+timestamped pairing collapses."""
+    await live.initialize({"api_key": "el-test"})
+
+    class _FakeWs:
+        def __init__(self) -> None:
+            self._queue: asyncio.Queue = asyncio.Queue()
+
+        async def send(self, data): pass
+
+        async def recv(self):
+            item = await self._queue.get()
+            if item is None:
+                raise ConnectionError("closed")
+            return item
+
+        async def close(self): pass
+
+        def push(self, frame): self._queue.put_nowait(frame)
+
+    fake_ws = _FakeWs()
+    with patch("websockets.connect", new=AsyncMock(return_value=fake_ws)):
+        stream = await live.open_stream(
+            StreamConfig(format=AudioFormat(AudioEncoding.PCM_S16LE))
+        )
+
+        fake_ws.push(
+            json.dumps(
+                {
+                    "message_type": "committed_transcript",
+                    "text": "hello",
+                    "start": 0.0,
+                    "end": 0.5,
+                }
+            )
+        )
+        fake_ws.push(
+            json.dumps(
+                {
+                    "message_type": "committed_transcript",
+                    "text": "hello",
+                    "start": 1.0,
+                    "end": 1.5,  # different end → different utterance
+                }
+            )
+        )
+
+        finals: list = []
+        async def _drain():
+            with contextlib.suppress(asyncio.TimeoutError):
+                async with asyncio.timeout(0.3):
+                    async for ev in stream.events():
+                        if isinstance(ev, FinalTranscript):
+                            finals.append(ev)
+
+        await _drain()
+        assert len(finals) == 2
 
         await stream.close()
