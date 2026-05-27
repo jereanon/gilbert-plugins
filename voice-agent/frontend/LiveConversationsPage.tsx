@@ -14,18 +14,11 @@
  * provider published an event, only that the event arrived. Adding
  * a new voice modality (phone, kiosk, etc.) requires nothing here
  * as long as the new plugin publishes the same three event types.
- *
- * Layout:
- *   - Sidebar (left): list of sessions, newest first. Provider badge,
- *     user id / display name, status pill (live / ended), preview
- *     of the last turn.
- *   - Main pane (right): full transcript of the selected session.
- *     Auto-scrolls as new turns arrive. Read-only — this is a
- *     monitor, not a chat input.
  */
 
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 
+import { Card } from "@/components/ui/card";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
 type Provider = "mentra" | "voice_agent" | string;
@@ -62,18 +55,17 @@ function providerLabel(p: Provider): string {
   }
 }
 
-function providerColor(p: Provider): string {
-  // Tailwind hex-ish badge tints. Aim for distinct hues so
-  // multi-provider sessions stand out at a glance.
+function providerBadgeClass(p: Provider): string {
+  // Token-based so it works in light + dark themes consistently.
   switch (p) {
     case "mentra":
-      return "bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-200";
+      return "bg-purple-500/15 text-purple-700 dark:text-purple-300";
     case "voice_agent":
-      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200";
+      return "bg-blue-500/15 text-blue-700 dark:text-blue-300";
     case "phone_call":
-      return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200";
+      return "bg-green-500/15 text-green-700 dark:text-green-300";
     default:
-      return "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200";
+      return "bg-muted text-muted-foreground";
   }
 }
 
@@ -83,14 +75,24 @@ function whoLabel(who: string): string {
   return "System";
 }
 
-function whoStyle(who: string): string {
-  if (who === "them") {
-    return "bg-gray-50 dark:bg-gray-800 border-l-4 border-gray-400";
+function whoTurnClass(who: string): string {
+  // Card-style turn rows that work against the design system's
+  // surface color. Border-left coloring distinguishes speakers
+  // without needing a separate background color.
+  const base = "px-3 py-2 rounded-md border-l-4";
+  if (who === "them") return `${base} border-foreground/30 bg-muted/30`;
+  if (who === "us") return `${base} border-blue-500 bg-blue-500/5`;
+  return `${base} border-amber-500 bg-amber-500/5 italic text-sm`;
+}
+
+function fmtTime(iso: string): string {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString();
+  } catch {
+    return "—";
   }
-  if (who === "us") {
-    return "bg-blue-50 dark:bg-blue-900/30 border-l-4 border-blue-500";
-  }
-  return "bg-yellow-50 dark:bg-yellow-900/30 border-l-4 border-yellow-500 italic text-sm";
 }
 
 export function LiveConversationsPage(): ReactElement {
@@ -101,8 +103,7 @@ export function LiveConversationsPage(): ReactElement {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
-  // session_started — add (or overwrite, in case a stale ended
-  // session existed) a new entry.
+  // session_started — add (or overwrite a stale ended) entry.
   useEffect(() => {
     const unsub = subscribe(
       "conversation.session_started",
@@ -138,10 +139,8 @@ export function LiveConversationsPage(): ReactElement {
     return unsub;
   }, [subscribe]);
 
-  // transcript_turn — append the turn to the matching session's
-  // transcript. If the session_started event was missed (page loaded
-  // mid-conversation), synthesize a stub session entry so the
-  // transcript still renders rather than getting dropped.
+  // transcript_turn — append the turn to the matching session.
+  // Synthesize a stub entry if session_started was missed.
   useEffect(() => {
     const unsub = subscribe(
       "conversation.transcript_turn",
@@ -171,9 +170,7 @@ export function LiveConversationsPage(): ReactElement {
           const next = new Map(prev);
           let entry = next.get(sessionId);
           if (!entry) {
-            // Late-join recovery: stub a session entry so the turn
-            // has a home. The user-visible metadata is sparse but
-            // at least the conversation surfaces.
+            // Late-join recovery — page loaded after session start.
             entry = {
               sessionId,
               provider,
@@ -192,18 +189,14 @@ export function LiveConversationsPage(): ReactElement {
           return next;
         });
 
-        // Auto-select if nothing's selected, so the first user
-        // utterance in a freshly-loaded page immediately renders
-        // somewhere visible.
         setSelectedId((prev) => prev ?? sessionId);
       }
     );
     return unsub;
   }, [subscribe]);
 
-  // session_ended — mark the session ended in place (don't remove
-  // immediately so the operator can still scroll back through the
-  // final transcript).
+  // session_ended — mark ended in place; don't remove so the
+  // operator can still scroll back through the final transcript.
   useEffect(() => {
     const unsub = subscribe(
       "conversation.session_ended",
@@ -230,8 +223,7 @@ export function LiveConversationsPage(): ReactElement {
   }, [subscribe]);
 
   // Newest-first session order. Live sessions sort above ended ones;
-  // within each bucket sort by start time descending so the most
-  // recent admit floats to the top.
+  // within each bucket the most recent start floats to the top.
   const orderedSessions = useMemo(() => {
     const arr = Array.from(sessions.values());
     arr.sort((a, b) => {
@@ -245,111 +237,117 @@ export function LiveConversationsPage(): ReactElement {
 
   const selected = selectedId ? sessions.get(selectedId) ?? null : null;
 
-  // Auto-scroll the transcript pane to the bottom as new turns
-  // arrive on the currently-selected session.
+  // Auto-scroll the transcript pane as new turns arrive.
   useEffect(() => {
     if (!selected) return;
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [selected, selected?.turns.length]);
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="border-b border-gray-200 dark:border-gray-800 px-6 py-4">
-        <h1 className="text-xl font-semibold">Live Conversations</h1>
-        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-          Real-time transcripts from every active voice conversation —
-          glasses, browser, phone, anything that publishes the standard
-          conversation events. Read-only.
-          {!connected && (
-            <span className="ml-2 text-amber-600">
-              (WebSocket disconnected — events not flowing)
-            </span>
-          )}
-        </p>
-      </header>
+    <div className="container mx-auto max-w-6xl py-8 px-4">
+      <h1 className="text-2xl font-semibold mb-2">Live Conversations</h1>
+      <p className="text-muted-foreground mb-6">
+        Real-time transcripts from every active voice conversation —
+        glasses, browser, phone, or any modality that publishes the
+        standard conversation events. Read-only.
+        {!connected && (
+          <span className="ml-2 text-amber-600 dark:text-amber-400">
+            (WebSocket disconnected — events not flowing)
+          </span>
+        )}
+      </p>
 
-      <div className="flex-1 flex min-h-0">
+      <div className="grid grid-cols-1 md:grid-cols-[20rem_1fr] gap-6">
         {/* Sidebar: session list */}
-        <aside className="w-80 border-r border-gray-200 dark:border-gray-800 overflow-y-auto">
+        <div>
+          <h2 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+            Sessions
+          </h2>
           {orderedSessions.length === 0 ? (
-            <div className="p-6 text-sm text-gray-500 dark:text-gray-400">
+            <Card className="p-4 text-sm text-muted-foreground">
               No active conversations.
               <p className="mt-2">
                 Start a session in the Voice page, or put on a paired
-                Mentra glasses device. New conversations appear here
+                Mentra glasses device — new conversations appear here
                 automatically.
               </p>
-            </div>
+            </Card>
           ) : (
-            <ul className="divide-y divide-gray-200 dark:divide-gray-800">
+            <div className="space-y-2">
               {orderedSessions.map((s) => {
                 const lastTurn = s.turns[s.turns.length - 1];
                 const isSelected = s.sessionId === selectedId;
                 const isLive = s.endedAt == null;
                 return (
-                  <li key={s.sessionId}>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedId(s.sessionId)}
-                      className={`w-full text-left px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-900 ${
-                        isSelected
-                          ? "bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500"
-                          : ""
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 mb-1">
-                        <span
-                          className={`inline-block text-xs font-semibold px-2 py-0.5 rounded ${providerColor(s.provider)}`}
-                        >
-                          {providerLabel(s.provider)}
+                  <button
+                    key={s.sessionId}
+                    type="button"
+                    onClick={() => setSelectedId(s.sessionId)}
+                    className={`w-full text-left rounded-lg border p-3 transition-colors hover:bg-muted/50 ${
+                      isSelected
+                        ? "border-blue-500 bg-blue-500/10"
+                        : "border-border bg-card"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span
+                        className={`inline-block text-xs font-semibold px-2 py-0.5 rounded ${providerBadgeClass(
+                          s.provider
+                        )}`}
+                      >
+                        {providerLabel(s.provider)}
+                      </span>
+                      {isLive ? (
+                        <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                          live
                         </span>
-                        {isLive ? (
-                          <span className="inline-flex items-center gap-1 text-xs text-green-700 dark:text-green-300">
-                            <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-                            live
-                          </span>
-                        ) : (
-                          <span className="text-xs text-gray-500 dark:text-gray-400">
-                            ended
-                          </span>
-                        )}
-                        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400">
-                          {s.turns.length} turn
-                          {s.turns.length === 1 ? "" : "s"}
+                      ) : (
+                        <span className="text-xs text-muted-foreground">
+                          ended
                         </span>
-                      </div>
-                      <div className="font-medium text-sm truncate">
-                        {s.displayName || s.userId || "(unknown user)"}
-                      </div>
-                      {lastTurn && (
-                        <div className="text-xs text-gray-600 dark:text-gray-400 mt-1 truncate">
-                          <span className="font-medium">
-                            {whoLabel(lastTurn.who)}:
-                          </span>{" "}
-                          {lastTurn.text}
-                        </div>
                       )}
-                    </button>
-                  </li>
+                      <span className="ml-auto text-xs text-muted-foreground">
+                        {s.turns.length} turn
+                        {s.turns.length === 1 ? "" : "s"}
+                      </span>
+                    </div>
+                    <div className="font-medium text-sm truncate">
+                      {s.displayName || s.userId || "(unknown user)"}
+                    </div>
+                    {lastTurn && (
+                      <div className="text-xs text-muted-foreground mt-1 truncate">
+                        <span className="font-medium">
+                          {whoLabel(lastTurn.who)}:
+                        </span>{" "}
+                        {lastTurn.text}
+                      </div>
+                    )}
+                  </button>
                 );
               })}
-            </ul>
+            </div>
           )}
-        </aside>
+        </div>
 
-        {/* Main pane: selected session's transcript */}
-        <main className="flex-1 overflow-y-auto p-6">
+        {/* Main pane: selected session transcript */}
+        <div>
+          <h2 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wide">
+            Transcript
+          </h2>
           {!selected ? (
-            <div className="h-full flex items-center justify-center text-gray-500 dark:text-gray-400 text-sm">
+            <Card className="p-6 text-sm text-muted-foreground text-center">
               Select a conversation from the sidebar to view its
               transcript.
-            </div>
+            </Card>
           ) : (
-            <div className="max-w-3xl mx-auto">
-              <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-800">
-                <div className="flex items-center gap-2 mb-1">
+            <Card className="p-4">
+              <div className="mb-4 pb-3 border-b">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span
-                    className={`inline-block text-xs font-semibold px-2 py-0.5 rounded ${providerColor(selected.provider)}`}
+                    className={`inline-block text-xs font-semibold px-2 py-0.5 rounded ${providerBadgeClass(
+                      selected.provider
+                    )}`}
                   >
                     {providerLabel(selected.provider)}
                   </span>
@@ -359,50 +357,46 @@ export function LiveConversationsPage(): ReactElement {
                       "(unknown user)"}
                   </span>
                   {selected.endedAt ? (
-                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                    <span className="text-xs text-muted-foreground">
                       ended ({selected.endedReason || "closed"})
                     </span>
                   ) : (
-                    <span className="inline-flex items-center gap-1 text-xs text-green-700 dark:text-green-300">
+                    <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
                       <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
                       live
                     </span>
                   )}
                 </div>
-                <div className="text-xs text-gray-500 dark:text-gray-400">
-                  session {selected.sessionId} · started{" "}
-                  {selected.startedAt}
+                <div className="text-xs text-muted-foreground font-mono">
+                  {selected.sessionId} · started {fmtTime(selected.startedAt)}
                 </div>
               </div>
 
               {selected.turns.length === 0 ? (
-                <div className="text-sm text-gray-500 dark:text-gray-400 italic">
+                <div className="text-sm text-muted-foreground italic">
                   Waiting for first turn…
                 </div>
               ) : (
-                <div className="space-y-2">
+                <div className="space-y-2 max-h-[60vh] overflow-y-auto">
                   {selected.turns.map((t) => (
-                    <div
-                      key={t.key}
-                      className={`px-3 py-2 rounded ${whoStyle(t.who)}`}
-                    >
-                      <div className="text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1">
+                    <div key={t.key} className={whoTurnClass(t.who)}>
+                      <div className="text-xs font-semibold text-muted-foreground mb-1">
                         {whoLabel(t.who)}{" "}
-                        <span className="text-gray-400">
+                        <span className="opacity-60">
                           · t+{t.ts.toFixed(1)}s
                         </span>
                       </div>
-                      <div className="text-sm whitespace-pre-wrap">
+                      <div className="text-sm whitespace-pre-wrap break-words">
                         {t.text}
                       </div>
                     </div>
                   ))}
+                  <div ref={transcriptEndRef} />
                 </div>
               )}
-              <div ref={transcriptEndRef} />
-            </div>
+            </Card>
           )}
-        </main>
+        </div>
       </div>
     </div>
   );
