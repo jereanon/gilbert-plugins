@@ -647,6 +647,73 @@ async def test_cloud_transcription_finals_enqueued_for_engine(
 
 
 @pytest.mark.asyncio
+async def test_echo_during_gilbert_playback_is_dropped(
+    monkeypatch: Any,
+) -> None:
+    """Glasses speaker bleeds into glasses mic → Mentra Cloud
+    transcribes Gilbert's own voice → engine treats it as a user
+    turn → infinite self-talk loop. Regression test for the live
+    failure observed end-to-end on the glasses.
+
+    Mute window opens when the engine fires ``on_llm_turn``
+    (Gilbert is about to speak); transcripts arriving during the
+    window are dropped at the plugin layer before they reach the
+    engine's inject queue."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    _, config = brain.calls[0]
+    queue = config.inject_synthetic_user_turn_queue
+    assert config.on_llm_turn is not None
+
+    # Engine signals "about to speak a 100-char reply" — that arms
+    # the mute window in the plugin.
+    await config.on_llm_turn("hello! " * 14, [])
+
+    # Simulate Mentra Cloud sending a transcript of Gilbert's own
+    # voice while the playback is still in flight.
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "hello hello hello", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # The transcript was dropped — the engine's queue stayed empty.
+    assert queue.empty()
+
+    # Engine signals playback complete — mute clears (modulo a
+    # small post-roll). After a beat, a fresh user utterance flows
+    # through normally.
+    assert config.on_speaking_done is not None
+    await config.on_speaking_done()
+    # Wait past the 0.5s post-roll buffer.
+    await asyncio.sleep(0.6)
+
+    await fake.inject(
+        {
+            "type": "data_stream",
+            "streamType": "transcription",
+            "data": {"text": "actually what's on my calendar", "isFinal": True},
+        }
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    text = queue.get_nowait()
+    assert text == "actually what's on my calendar"
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
 async def test_partial_transcription_does_not_enqueue(
     monkeypatch: Any,
 ) -> None:

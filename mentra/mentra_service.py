@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections import deque
 from datetime import UTC, datetime
@@ -1065,6 +1066,25 @@ class MentraService(Service):
         # perspective.
         inject_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
 
+        # Echo-suppression window. The glasses' mic picks up Gilbert's
+        # own TTS playback and Mentra Cloud transcribes it; without a
+        # guard the engine would treat Gilbert's voice as the user's
+        # next turn and reply to itself in an infinite loop (observed
+        # live: full self-conversation within seconds).
+        #
+        # Approach: set ``mute_until_monotonic`` when ``on_llm_turn``
+        # fires (engine is about to synthesize + play). Window length
+        # estimates synth + cloud fetch + playback + safety margin.
+        # Transcripts arriving inside the window are dropped at the
+        # WS-handler layer (never reach the engine). Reset on
+        # ``on_speaking_done`` so a real user utterance right after
+        # Gilbert finishes isn't held hostage to the worst-case
+        # estimate.
+        #
+        # Single-element list so the inner closures can mutate without
+        # ``nonlocal`` plumbing across multiple defs.
+        mute_until_monotonic: list[float] = [0.0]
+
         async def _on_transcription(data: Any) -> None:
             # Only commit on isFinal — partials are noise, the engine
             # would re-think on every keystroke.
@@ -1072,6 +1092,18 @@ class MentraService(Service):
                 return
             text = (getattr(data, "text", "") or "").strip()
             if not text:
+                return
+            if time.monotonic() < mute_until_monotonic[0]:
+                # Almost certainly Gilbert's own voice echoing back
+                # through the glasses mic. Drop loudly so the log
+                # shows the suppression happening (otherwise it
+                # looks like "Gilbert ignored what I said").
+                logger.info(
+                    "Mentra: dropping echo-suspect transcript during "
+                    "Gilbert's TTS playback (session=%s text=%r)",
+                    session.session_id,
+                    text[:80],
+                )
                 return
             logger.info(
                 "Mentra transcription final — session=%s len=%d text=%r",
@@ -1111,10 +1143,33 @@ class MentraService(Service):
             )
 
         async def _on_llm_turn(text: str, tool_names: list[str]) -> None:
-            # Surface the reply on the heads-up display (if device
-            # has one). Truncated so it fits the small screen.
             if not text:
                 return
+            # Arm the echo-suppression window. Estimate covers:
+            #   - TTS synth (~1s for ElevenLabs on a short reply)
+            #   - Blob register + cloud HTTPS fetch (~1-2s)
+            #   - Actual playback through the speaker (~text/10 sec
+            #     at ElevenLabs's natural pace)
+            #   - Post-roll safety margin (1s) so the very tail end
+            #     of Gilbert's voice doesn't slip past the window.
+            # 12s ceiling so a freakish long answer doesn't lock
+            # the user out of speaking for half a minute. on_speaking_done
+            # below resets to a short post-roll the moment the
+            # engine reports playback complete, so for normal replies
+            # the cap rarely matters.
+            playback_seconds = len(text) / 10.0
+            window = min(12.0, max(2.5, playback_seconds + 3.0))
+            mute_until_monotonic[0] = time.monotonic() + window
+            logger.info(
+                "Mentra: muting transcription for %.1fs while "
+                "Gilbert speaks (session=%s text_chars=%d)",
+                window,
+                session.session_id,
+                len(text),
+            )
+
+            # Surface the reply on the heads-up display (if device
+            # has one). Truncated so it fits the small screen.
             if caps is not None and not caps.has_display:
                 return
             snippet = _summarize_for_display(text)
@@ -1134,6 +1189,15 @@ class MentraService(Service):
                     session.session_id,
                     exc_info=True,
                 )
+
+        async def _on_speaking_done() -> None:
+            # Engine reports its estimate of playback ending. The
+            # cloud's actual playback can lag a bit further, so
+            # leave a short post-roll buffer (0.5s) for the tail
+            # before we accept transcripts again. This shortens
+            # the mute window for normal replies so the user can
+            # speak as soon as Gilbert finishes.
+            mute_until_monotonic[0] = time.monotonic() + 0.5
 
         async def _on_status_change(
             status: ConversationStatus, reason: str
@@ -1179,6 +1243,7 @@ class MentraService(Service):
             on_status_change=_on_status_change,
             on_transcript_turn=_on_transcript_turn,
             on_llm_turn=_on_llm_turn,
+            on_speaking_done=_on_speaking_done,
             # MP3 + no realtime pacing: Mentra Cloud fetches the
             # whole clip in one shot and plays it; per-chunk pacing
             # would stretch a 5s clip into 10s of buffering for no
