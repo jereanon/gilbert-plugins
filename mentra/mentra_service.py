@@ -46,11 +46,6 @@ from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
-# Per-user ring-buffer cap for debug events. 50 is enough to cover the
-# full session-admit → first-utterance → AI-reply → audio-response
-# loop on the in-glasses-app companion webview without burning memory.
-_EVENTS_PER_USER = 50
-
 from gilbert.interfaces.ai import AIProvider
 from gilbert.interfaces.auth import UserContext
 from gilbert.interfaces.configuration import (
@@ -82,6 +77,12 @@ logger = logging.getLogger(__name__)
 
 # Storage collection for the email → user_id mapping.
 _MAPPINGS_COLLECTION = "mentra_user_mappings"
+
+# Per-user ring-buffer cap for debug events. 50 is enough to cover
+# the full session-admit → first-utterance → AI-reply → audio-
+# response loop on the in-glasses-app companion webview without
+# burning memory.
+_EVENTS_PER_USER = 50
 
 
 _DEFAULT_SYSTEM_PROMPT = (
@@ -753,6 +754,46 @@ class MentraService(Service):
             CloudToAppMessageType.AUDIO_PLAY_RESPONSE.value,
             _on_audio_response,
         )
+
+        # Watch settings updates for the ``useOnboardMic`` flag. When
+        # it's ``false`` on Mentra Live + iOS, the cloud uses the
+        # PHONE'S mic, and iOS's audio session rules force the
+        # speaker output to MATCH the mic device — i.e. audio comes
+        # out of the phone speaker (which is usually muted in
+        # everyday use), NOT the glasses. This is a well-known
+        # Mentra bug per upstream issue #1631 / #2275. We can't fix
+        # it from our app, but we CAN surface the warning so the
+        # operator knows to flip the setting in the MentraOS phone
+        # app.
+        async def _on_settings_update(message: dict[str, Any]) -> None:
+            mentraos = message.get("mentraosSettings") or message.get("settings")
+            if not isinstance(mentraos, dict):
+                return
+            use_onboard = mentraos.get("useOnboardMic")
+            if use_onboard is False:
+                self._record_event(
+                    req.user_id,
+                    "settings_warning",
+                    (
+                        "useOnboardMic is FALSE — the MentraOS phone "
+                        "app is using your phone's mic, which forces "
+                        "iOS to route speaker output to the phone "
+                        "(not the glasses). Enable 'Use onboard mic' "
+                        "in the MentraOS phone app's audio settings "
+                        "to hear Gilbert through the glasses."
+                    ),
+                    level="warning",
+                )
+
+        session.on_message(
+            CloudToAppMessageType.SETTINGS_UPDATE.value, _on_settings_update
+        )
+        # The connection_ack also carries mentraosSettings — capture
+        # it on the initial admit too so the warning fires
+        # immediately without waiting for a later settings_update.
+        session.on_message(
+            CloudToAppMessageType.CONNECTION_ACK.value, _on_settings_update
+        )
         # Welcome the user — display + speaker, gated on whichever
         # surfaces the device actually has. Mentra Live has no
         # display (audio is the only feedback channel); Even
@@ -778,16 +819,9 @@ class MentraService(Service):
                 )
         if self._tts_via_cloud and (caps is None or caps.has_speaker):
             try:
-                # ``stop_other_audio=True`` forces the cloud into
-                # "blocking" mode where it WILL send an
-                # ``audio_play_response`` event with success or
-                # failure data — fire-and-forget mode silently
-                # drops on this device. Critical diagnostic for the
-                # first deploy where the welcome was getting no
-                # audio AND no response.
-                await session.speaker.speak(welcome_text, stop_other_audio=True)
+                await session.speaker.speak(welcome_text)
                 logger.info(
-                    "Mentra welcome speech sent (TTS, blocking) for session=%s",
+                    "Mentra welcome speech sent for session=%s",
                     req.session_id,
                 )
                 self._record_event(

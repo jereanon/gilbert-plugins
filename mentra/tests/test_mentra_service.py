@@ -471,9 +471,7 @@ async def test_final_transcription_dispatches_to_ai_with_mapped_user(
 
     qs = parse_qs(urlparse(audio_frames[-1]["audioUrl"]).query)
     assert qs["text"] == ["hello from gilbert"]
-    # Default speak() track is 0 (speaker) — see SpeakerManager
-    # docstring for the Mentra Live track-routing finding.
-    assert audio_frames[-1]["trackId"] == 0
+    assert audio_frames[-1]["trackId"] == 2  # TTS track
     # Welcome speech is the first audio frame; verify it carries
     # the right text.
     welcome_qs = parse_qs(urlparse(audio_frames[0]["audioUrl"]).query)

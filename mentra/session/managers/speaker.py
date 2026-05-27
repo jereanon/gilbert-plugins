@@ -110,24 +110,26 @@ class SpeakerManager:
         voice_settings: dict[str, float] | None = None,
         volume: float = 1.0,
         stop_other_audio: bool = False,
-        track_id: int = _TRACK_SPEAKER,
+        track_id: int = _TRACK_TTS,
     ) -> None:
-        """Server-side TTS. Builds the cloud's ``/api/tts`` URL with
-        the text + optional voice settings, then dispatches it as a
-        normal ``play_url`` call.
+        """Server-side TTS. Builds ``/api/tts`` against the app's
+        own Server URL (Mentra Cloud fetches this endpoint to get
+        the actual audio bytes) and dispatches via ``play_url`` on
+        the TTS track.
 
-        ``track_id`` defaults to ``_TRACK_SPEAKER`` (0) rather than
-        ``_TRACK_TTS`` (2). On Mentra Live the cloud appears to route
-        only track-0 audio to the physical speaker (testing shows
-        ``trackId=2`` returns ``audio_play_response: success`` with a
-        non-zero duration but no actual audio reaches the user's ear).
-        Override to ``_TRACK_TTS`` only when you specifically want TTS
-        to coexist with music on track 0.
+        **The app must host ``/api/tts`` itself** — undocumented in
+        the SDK but confirmed by reading the upstream v2-compat
+        ``SpeakerManager`` source (``const ttsUrl = baseUrl +
+        '/api/tts?...'``). Mentra Cloud doesn't generate TTS for
+        third-party apps; it just fetches whatever the app returns
+        and pipes it through to the glasses. Gilbert exposes
+        ``/api/tts`` from ``web/routes/tts.py`` (core), which
+        delegates to the TTS service (ElevenLabs / Kokoro / etc.).
 
         Voice settings dict keys mirror ElevenLabs:
         ``stability`` / ``similarity_boost`` / ``style`` / ``speed``
         (all floats 0–1 except speed which is a multiplier).
-        Default voice + settings: server picks.
+        Default voice + settings: the TTS service's configured default.
         """
         if not text:
             return

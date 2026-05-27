@@ -335,11 +335,12 @@ async def test_speaker_speak_emits_audio_play_request_with_tts_url() -> None:
     assert af["requestId"].startswith("audio_req_")
     assert af["volume"] == 1.0
     assert af["stopOtherAudio"] is False
-    # Defaults to track 0 (speaker) — on Mentra Live the cloud only
-    # actually routes audio to the user's ear from track 0; track 2
-    # silently dropped despite ``success`` responses. See
-    # ``SpeakerManager.speak`` docstring for the full reasoning.
-    assert af["trackId"] == 0
+    # Track 2 is the dedicated TTS track per the upstream SDK
+    # convention — keeps speech from preempting music on track 0.
+    # (We briefly defaulted to 0 during the audio-output hunt
+    # before discovering the real culprit was a missing
+    # ``/api/tts`` endpoint on the app side.)
+    assert af["trackId"] == 2
 
 
 @pytest.mark.asyncio
