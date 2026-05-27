@@ -242,6 +242,11 @@ async def _start_service(
             "enabled": enabled,
             "api_key": api_key,
             "package_name": package_name,
+            # ``speak()`` needs an absolute base — without it
+            # SpeakerManager skips the call (Mentra Cloud can't
+            # fetch a relative path). Set a stub so the service
+            # tests exercise the full TTS path.
+            "public_base_url": "https://gilbert.example.com",
             "tts_via_cloud": True,
             "display_duration_ms": 8000,
         }

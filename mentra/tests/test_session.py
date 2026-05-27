@@ -90,6 +90,11 @@ def _make_session(transport: _FakeTransport) -> Any:
         session_id="sess_001",
         user_id="user@example.com",
         gilbert_user_id="usr_alice",
+        # ``speak()`` requires an absolute base URL — Mentra Cloud
+        # fetches ``<base>/api/tts?...`` server-side, so a relative
+        # path would just fail. Set a plausible value so the session
+        # tests exercise the full URL-building path.
+        public_base_url="https://gilbert.example.com",
     )
     return MentraSession(config=cfg, transport=transport)
 
@@ -324,7 +329,13 @@ async def test_speaker_speak_emits_audio_play_request_with_tts_url() -> None:
     af = aud_frames[-1]
     # No inline text — must be in the audioUrl query param.
     assert "text" not in af
-    assert af["audioUrl"].startswith("/api/tts?")
+    # URL must be absolute (with the configured base) so Mentra Cloud
+    # has a host to fetch from — relative paths are silently dropped
+    # on the cloud side. Regression test for the second audio-output
+    # hunt where ``/api/tts?...`` worked from curl but speak() didn't
+    # play through the glasses because the cloud got "/api/tts?..."
+    # with no host.
+    assert af["audioUrl"].startswith("https://gilbert.example.com/api/tts?")
     parsed = urlparse(af["audioUrl"])
     qs = parse_qs(parsed.query)
     assert qs["text"] == ["good morning"]
@@ -365,6 +376,40 @@ async def test_speaker_play_url_passes_required_wire_fields() -> None:
     assert af["volume"] == 0.5
     assert af["stopOtherAudio"] is True
     assert af["trackId"] == 0  # default = speaker track
+
+
+@pytest.mark.asyncio
+async def test_speaker_speak_skips_when_public_base_url_unset() -> None:
+    """An operator who hasn't configured ``public_base_url`` would
+    otherwise get silent failure — the cloud drops relative-path
+    fetches. The manager must skip the call (no frame sent) and log
+    a warning so the misconfiguration shows up in logs."""
+    from gilbert_plugin_mentra.session.session import (
+        MentraSession,
+        MentraSessionConfig,
+    )
+
+    transport = _FakeTransport()
+    cfg = MentraSessionConfig(
+        package_name="com.example.gilbert",
+        api_key="key_test",
+        session_id="sess_001",
+        user_id="user@example.com",
+        gilbert_user_id="usr_alice",
+        public_base_url="",  # explicit empty → speak() should skip
+    )
+    session = MentraSession(config=cfg, transport=transport)
+
+    connect_task = asyncio.create_task(session.connect())
+    await asyncio.sleep(0)
+    await transport.inject({"type": "tpa_connection_ack", "sessionId": "sess_001"})
+    await connect_task
+
+    await session.speaker.speak("nothing to see here")
+    aud_frames = [
+        f for f in transport.sent if f.get("type") == "audio_play_request"
+    ]
+    assert aud_frames == []
 
 
 @pytest.mark.asyncio

@@ -120,6 +120,7 @@ class MentraService(Service):
         self._enabled: bool = False
         self._api_key: str = ""
         self._package_name: str = ""
+        self._public_base_url: str = ""
         self._tts_via_cloud: bool = True
         self._system_prompt: str = _DEFAULT_SYSTEM_PROMPT
         self._display_duration_ms: int = 8000
@@ -453,10 +454,18 @@ class MentraService(Service):
             return
 
         logger.info(
-            "Mentra service started — package=%s tts_via_cloud=%s",
+            "Mentra service started — package=%s public_base_url=%r tts_via_cloud=%s",
             self._package_name,
+            self._public_base_url or "<unset>",
             self._tts_via_cloud,
         )
+        if self._tts_via_cloud and not self._public_base_url:
+            logger.warning(
+                "Mentra TTS-via-cloud is on but public_base_url is "
+                "unset — speak() calls will be skipped. Set "
+                "Settings → Mentra → public_base_url to the Server "
+                "URL registered with the Mentra developer console."
+            )
 
     async def stop(self) -> None:
         # Close every live session before the service goes away.
@@ -507,6 +516,21 @@ class MentraService(Service):
                 default="",
             ),
             ConfigParam(
+                key="public_base_url",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Public HTTPS URL where Gilbert is reachable "
+                    '(e.g. "https://gilbert.example.com"). Must match '
+                    "the Server URL registered with the Mentra "
+                    "developer console. Mentra Cloud fetches "
+                    "``<this>/api/tts?text=...`` server-side to get "
+                    "TTS audio when AI replies are spoken, so the URL "
+                    "has to be reachable from the public internet — "
+                    "localhost / LAN-only values will not work."
+                ),
+                default="",
+            ),
+            ConfigParam(
                 key="tts_via_cloud",
                 type=ToolParameterType.BOOLEAN,
                 description=(
@@ -550,6 +574,7 @@ class MentraService(Service):
     async def _apply_config(self, section: dict[str, Any]) -> None:
         self._api_key = str(section.get("api_key") or "")
         self._package_name = str(section.get("package_name") or "")
+        self._public_base_url = str(section.get("public_base_url") or "")
         self._tts_via_cloud = bool(section.get("tts_via_cloud", True))
         try:
             self._display_duration_ms = int(
@@ -660,6 +685,7 @@ class MentraService(Service):
             session_id=req.session_id,
             user_id=req.user_id,
             gilbert_user_id=gilbert_user.user_id,
+            public_base_url=self._public_base_url,
         )
         session = MentraSession(config=config, transport=transport)
 

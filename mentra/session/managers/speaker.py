@@ -133,6 +133,21 @@ class SpeakerManager:
         """
         if not text:
             return
+        base = (self._deps.public_base_url or "").rstrip("/")
+        if not base:
+            # Without an absolute URL Mentra Cloud has no host to
+            # fetch from — the relative path is silently dropped on
+            # the cloud side and the user hears nothing. Loud warn
+            # so the misconfiguration shows up in logs instead of
+            # presenting as "audio mysteriously broken."
+            logger.warning(
+                "SpeakerManager.speak: public_base_url is empty — "
+                "set Settings → Mentra → public_base_url to the "
+                "Server URL registered with Mentra developer console. "
+                "Skipping speak(text=%r).",
+                text[:60],
+            )
+            return
         params: list[tuple[str, str]] = [("text", text)]
         if voice_id:
             params.append(("voice_id", voice_id))
@@ -140,7 +155,7 @@ class SpeakerManager:
             params.append(("model_id", model_id))
         if voice_settings:
             params.append(("voice_settings", json.dumps(voice_settings)))
-        tts_url = f"/api/tts?{urlencode(params)}"
+        tts_url = f"{base}/api/tts?{urlencode(params)}"
         await self.play_url(
             tts_url,
             volume=volume,

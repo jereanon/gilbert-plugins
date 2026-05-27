@@ -88,6 +88,11 @@ class MentraSessionConfig:
     # to it directly — it's surfaced here so handlers in the service
     # layer can grab it without re-querying storage.
     gilbert_user_id: str = ""
+    # Public Server URL the operator registered with Mentra Cloud,
+    # used by ``SpeakerManager.speak()`` to build the absolute
+    # ``/api/tts`` URL Mentra Cloud fetches. Sourced from
+    # ``Settings → Mentra → public_base_url``.
+    public_base_url: str = ""
 
 
 class _MessageHandlerRegistry:
@@ -268,6 +273,7 @@ class MentraSession:
             remove_subscription=self._remove_subscription,
             register_message_handler=self._messages.register,
             register_stream_handler=self._streams.on,
+            public_base_url=config.public_base_url,
         )
         self.transcription = TranscriptionManager(deps)
         self.button = ButtonManager(deps)

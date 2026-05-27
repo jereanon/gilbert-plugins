@@ -49,3 +49,10 @@ class ManagerDeps:
     remove_subscription: RemoveSubscription
     register_message_handler: RegisterMessageHandler
     register_stream_handler: RegisterStreamHandler
+    # Public Server URL the operator registered with Mentra Cloud
+    # (e.g. ``https://gilbert.possiblyfaulty.com``). Used by
+    # ``SpeakerManager.speak()`` to build the absolute ``/api/tts``
+    # URL that Mentra Cloud fetches server-side. Empty string means
+    # "not configured" — ``speak()`` then logs a warning and skips
+    # the call (a relative URL would just fail at the cloud).
+    public_base_url: str = ""
