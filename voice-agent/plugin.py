@@ -61,6 +61,35 @@ class VoiceAgentPlugin(Plugin):
                 # standalone "Voice" leaf with the mic icon, same
                 # shape as Calendar / Feeds / Tasks etc.
             ),
+            UIRoute(
+                path="/conversations",
+                panel_id="voice_agent.live_conversations",
+                label="Live Conversations",
+                description=(
+                    "Watch every active voice conversation in real time "
+                    "— Mentra smart-glasses sessions, browser voice-"
+                    "agent sessions, and any future modality that "
+                    "publishes the standard ``conversation.*`` bus "
+                    "events. Live transcripts stream in as users speak "
+                    "and Gilbert replies."
+                ),
+                icon="message-square",
+                required_role="user",
+                # Hosted by voice-agent but subscribes to provider-
+                # agnostic ``conversation.*`` bus events — Mentra,
+                # voice-agent, and any future modality that publishes
+                # those events surface here automatically with zero
+                # plugin coupling.
+                #
+                # Gated on the voice_agent capability so the route
+                # hides when no voice service is loaded. (If
+                # voice-agent is disabled but Mentra is on, this
+                # page won't appear; the alternative is multi-cap
+                # gating which UIRoute doesn't support, and Mentra
+                # without voice-agent is the rarer setup.)
+                requires_capability="voice_agent",
+                add_to_nav=True,
+            ),
         ]
 
 

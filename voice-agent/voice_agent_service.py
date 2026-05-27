@@ -776,6 +776,25 @@ class VoiceAgentService(Service):
             originating_conv_id,
         )
 
+        # Cross-provider session-started event the /conversations
+        # SPA page subscribes to. Matches Mentra's shape.
+        if self._bus is not None:
+            from gilbert.interfaces.events import Event
+
+            await self._bus.publish(
+                Event(
+                    event_type="conversation.session_started",
+                    data={
+                        "provider": "voice_agent",
+                        "session_id": conversation_id,
+                        "user_id": user_id,
+                        "display_name": "",  # voice-agent doesn't carry a separate display name; SPA can resolve from user_id
+                        "started_at": _now_iso(),
+                    },
+                    source="voice_agent",
+                )
+            )
+
         # Mark the session ACTIVE so the engine fires its opening
         # policy (SPEAK_FIRST). Done after task creation so the
         # status loop is running when the event arrives.
@@ -1397,6 +1416,23 @@ class VoiceAgentService(Service):
                         source="voice_agent",
                     )
                 )
+                # Cross-provider event the /conversations SPA page
+                # subscribes to. Same shape as Mentra's so the UI
+                # only wires one event name.
+                await self._bus.publish(
+                    Event(
+                        event_type="conversation.transcript_turn",
+                        data={
+                            "provider": "voice_agent",
+                            "session_id": active.conversation_id,
+                            "user_id": active.user_id,
+                            "who": who,
+                            "text": text,
+                            "ts": ts_seconds,
+                        },
+                        source="voice_agent",
+                    )
+                )
 
         async def _on_speaking_done() -> None:
             """Fired by the engine after each TTS playback completes.
@@ -1655,6 +1691,24 @@ class VoiceAgentService(Service):
                         )
                         if outcome
                         else "",
+                    },
+                    source="voice_agent",
+                )
+            )
+            # Cross-provider event the /conversations page subscribes
+            # to. Mirrors Mentra's session_ended shape.
+            await self._bus.publish(
+                Event(
+                    event_type="conversation.session_ended",
+                    data={
+                        "provider": "voice_agent",
+                        "session_id": active.conversation_id,
+                        "user_id": active.user_id,
+                        "reason": (
+                            "end_conversation"
+                            if outcome and outcome.outcome.get("end_requested")
+                            else "closed"
+                        ),
                     },
                     source="voice_agent",
                 )

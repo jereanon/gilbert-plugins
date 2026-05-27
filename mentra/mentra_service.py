@@ -846,6 +846,19 @@ class MentraService(Service):
                 f"Disconnected — code={code} reason={reason or '(none)'}",
                 level="warning",
             )
+            # Same cross-provider session-ended event the /conversations
+            # SPA watches. Fires on a WS-side disconnect (user took
+            # the glasses off / network blip) as well as the stop-
+            # request path below — UI just sees one consistent event.
+            await self._publish_bus_event(
+                "conversation.session_ended",
+                {
+                    "provider": "mentra",
+                    "session_id": session.session_id,
+                    "user_id": session.gilbert_user_id or "",
+                    "reason": reason or f"ws_close_{code}",
+                },
+            )
             task = self._engine_tasks.pop(session.session_id, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -885,6 +898,20 @@ class MentraService(Service):
                 "session_id": req.session_id,
                 "user_id": gilbert_user.user_id,
                 "mentra_user": req.user_id,
+            },
+        )
+        # Cross-provider event the SPA's /conversations page
+        # subscribes to. Same shape across every modality (mentra,
+        # voice-agent, phone) so the UI only has to wire one event
+        # name to render any kind of live session.
+        await self._publish_bus_event(
+            "conversation.session_started",
+            {
+                "provider": "mentra",
+                "session_id": req.session_id,
+                "user_id": gilbert_user.user_id,
+                "display_name": req.user_id,  # mentra email is the human-readable name
+                "started_at": _now_iso(),
             },
         )
         # Record events for the debug webview. The model + capability
@@ -1032,6 +1059,23 @@ class MentraService(Service):
                 "session_id": req.session_id,
                 "mentra_user": req.user_id,
                 "reason": req.reason,
+            },
+        )
+        # Cross-provider event so /conversations can mark the
+        # session ended in its UI list. user_id is the gilbert-side
+        # id we recorded on session_started — re-resolve from the
+        # mapping. Falls back to "" if the mapping was removed
+        # between admit and stop.
+        gilbert_user_id = ""
+        if session is not None:
+            gilbert_user_id = session.gilbert_user_id or ""
+        await self._publish_bus_event(
+            "conversation.session_ended",
+            {
+                "provider": "mentra",
+                "session_id": req.session_id,
+                "user_id": gilbert_user_id,
+                "reason": req.reason or "stop_request",
             },
         )
         return WebhookResponse(status="success")
@@ -1282,6 +1326,20 @@ class MentraService(Service):
                 session.user_id,
                 kind,
                 f'{label}: "{text[:200]}"',
+            )
+            # Cross-provider bus event the /conversations SPA page
+            # subscribes to. Identical shape from every modality so
+            # the UI only wires one event name.
+            await self._publish_bus_event(
+                "conversation.transcript_turn",
+                {
+                    "provider": "mentra",
+                    "session_id": session.session_id,
+                    "user_id": gilbert_user.user_id,
+                    "who": who,
+                    "text": text,
+                    "ts": ts_seconds,
+                },
             )
 
         async def _on_llm_turn(text: str, tool_names: list[str]) -> None:
