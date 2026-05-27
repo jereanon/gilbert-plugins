@@ -23,36 +23,49 @@ Per-session flow:
 3. Construct ``WebSocketTransport`` against the cloud-supplied
    ``websocketUrl`` with the standard auth headers (apiKey,
    sessionId, userId, packageName).
-4. Construct ``MentraSession``, register the transcription handler
-   that dispatches finals into ``AIService.chat(source="mentra")``,
-   wire the AI response back to ``session.display`` +
-   ``session.speaker.speak``.
-5. ``await session.connect()`` runs the handshake. Cloud responds
-   with capabilities → we know which managers can do anything.
-6. On ``stop_request``, tear down the session and forget the
-   mapping.
+4. Construct ``MentraSession``, ``await session.connect()`` so the
+   cloud handshake completes and we know which managers the device
+   actually supports.
+5. Build a ``_MentraConversationSession`` adapter around the live
+   session and hand it to the ``voice_brain`` ConversationEngine
+   capability via ``run_conversation(session, config)``. The engine
+   owns the transcription → AI → TTS loop (with echo suppression,
+   local VAD, barge-in, tool dispatch); this plugin just wires the
+   transport.
+6. On ``stop_request`` (or WS drop), cancel the engine task and
+   forget the session.
 
 This service is intentionally narrow — most of the heavy lifting
-happens in the ``MentraSession`` + manager layer. The service is
-the place where Gilbert's identity model and the Mentra protocol
-meet.
+happens in the ``MentraSession`` + manager layer, with conversation
+orchestration delegated to ``voice_brain``. The service is the
+place where Gilbert's identity model and the Mentra protocol meet.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
-from gilbert.interfaces.ai import AIProvider
+from gilbert.interfaces.ai import Message, MessageRole
+from gilbert.interfaces.audio_blob import AudioBlobStore
 from gilbert.interfaces.auth import UserContext
 from gilbert.interfaces.configuration import (
     ConfigParam,
     ConfigurationReader,
 )
 from gilbert.interfaces.context import set_current_user
+from gilbert.interfaces.conversation import (
+    ConversationConfig,
+    ConversationEngine,
+    ConversationStatus,
+    ConversationStatusEvent,
+    OpeningBehavior,
+    OpeningPolicy,
+)
 from gilbert.interfaces.events import Event, EventBusProvider
 from gilbert.interfaces.mentra import (
     SessionWebhookRequest,
@@ -69,8 +82,16 @@ from gilbert.interfaces.storage import (
     StorageProvider,
 )
 from gilbert.interfaces.tools import ToolParameterType
+from gilbert.interfaces.transcription import (
+    AudioEncoding,
+)
+from gilbert.interfaces.transcription import (
+    AudioFormat as STTAudioFormat,
+)
+from gilbert.interfaces.tts import AudioFormat as TTSAudioFormat
 
 from .session import MentraSession, MentraSessionConfig, WebSocketTransport
+from .voice_session import _MentraAudioSink, _MentraConversationSession
 
 logger = logging.getLogger(__name__)
 
@@ -103,14 +124,56 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+class _NoopBrainToolProvider:
+    """No-op ``BrainToolProvider`` for the ``use_full_ai_service=True``
+    engine path.
+
+    The engine requires a brain_tool_provider on its config, but in
+    ``use_full_ai_service=True`` mode it routes tools through
+    ``AIProvider.chat()``'s standard tool aggregation rather than
+    the brain-tool provider. The provider's methods are never
+    called. We still satisfy the protocol so the dataclass
+    construction type-checks.
+
+    If voice-agent is also loaded, its ``end_conversation`` Gilbert
+    tool is automatically visible during Mentra sessions (the tool
+    gates on ``get_current_conversation_ctx() is not None`` which
+    the engine sets uniformly). Plugins that want a Mentra-specific
+    session-end tool can declare their own ``ToolProvider`` with
+    the same ContextVar gate.
+    """
+
+    def get_brain_tools(self) -> list[Any]:
+        return []
+
+    async def handle_brain_tool(
+        self, name: str, args: dict[str, Any], ctx: Any
+    ) -> Any:
+        # Engine in use_full_ai_service mode never dispatches here.
+        # If it ever does (config mismatch / future change), log
+        # loud rather than silently returning OK.
+        from gilbert.interfaces.conversation import BrainToolResult
+
+        logger.warning(
+            "Mentra _NoopBrainToolProvider received unexpected "
+            "brain tool dispatch: name=%r — voice_brain may be "
+            "running in the wrong mode for this plugin",
+            name,
+        )
+        return BrainToolResult.OK
+
+
 class MentraService(Service):
     """Mentra smart-glasses orchestration service.
 
     Capabilities provided: ``mentra``, ``mentra_webhook``,
     ``ws_handlers``.
-    Capabilities consumed: ``entity_storage``, ``ai_chat`` (required —
-    no point in glasses input without an AI to dispatch to), plus
-    ``event_bus`` and ``configuration`` (optional).
+    Capabilities consumed: ``entity_storage`` (user mappings),
+    ``voice_brain`` (the ConversationEngine the plugin hands every
+    glasses session off to), ``audio_blob_store`` (short-lived
+    public URL for engine-synthesized TTS bytes), and ``ai_chat``
+    (transitively — voice_brain itself requires it). ``event_bus``
+    and ``configuration`` are optional.
     """
 
     slash_namespace = "mentra"
@@ -121,18 +184,28 @@ class MentraService(Service):
         self._api_key: str = ""
         self._package_name: str = ""
         self._public_base_url: str = ""
-        self._tts_via_cloud: bool = True
         self._system_prompt: str = _DEFAULT_SYSTEM_PROMPT
         self._display_duration_ms: int = 8000
 
         # ── Resolved dependencies ─────────────────────────────────
         self._resolver: ServiceResolver | None = None
         self._storage: StorageProvider | None = None
-        self._ai: AIProvider | None = None
+        # The voice_brain ConversationEngine runs the actual
+        # conversation loop (echo suppression, local VAD, AI dispatch,
+        # TTS pacing, barge-in). Mentra is a transport — we feed mic
+        # PCM in, play TTS bytes back.
+        self._voice_brain: ConversationEngine | None = None
+        # Short-lived blob cache so engine-synthesized MP3 bytes get
+        # an HTTPS URL Mentra Cloud can fetch server-side.
+        self._blob_store: AudioBlobStore | None = None
         self._bus: Any = None
 
         # ── Live session registry — keyed by Mentra sessionId ─────
         self._sessions: dict[str, MentraSession] = {}
+        # Per-session engine task (one ``voice_brain.run_conversation``
+        # in flight per glasses session). Tracked so disconnects can
+        # cancel cleanly and ``stop()`` can drain on shutdown.
+        self._engine_tasks: dict[str, asyncio.Task[Any]] = {}
         # Tracks when each live session was admitted (ISO8601 UTC).
         # Surfaced via the ``mentra.sessions.list`` WS RPC so the
         # admin SPA can show "connected 4m ago" without reaching
@@ -153,7 +226,21 @@ class MentraService(Service):
             capabilities=frozenset(
                 {"mentra", "mentra_webhook", "ws_handlers"}
             ),
-            requires=frozenset({"entity_storage", "ai_chat"}),
+            # ``voice_brain`` runs the conversation loop;
+            # ``audio_blob_store`` exposes engine TTS to Mentra Cloud
+            # via a public URL. ``entity_storage`` keeps the
+            # email→user mapping. ``ai_chat`` is still required
+            # transitively by voice_brain itself — declaring it here
+            # too makes the dependency tree explicit and lets
+            # ``gilbert doctor`` flag missing AI early.
+            requires=frozenset(
+                {
+                    "entity_storage",
+                    "voice_brain",
+                    "audio_blob_store",
+                    "ai_chat",
+                }
+            ),
             optional=frozenset({"configuration", "event_bus"}),
             toggleable=True,
             toggle_description=(
@@ -426,9 +513,12 @@ class MentraService(Service):
         storage = resolver.get_capability("entity_storage")
         if isinstance(storage, StorageProvider):
             self._storage = storage
-        ai_svc = resolver.get_capability("ai_chat")
-        if isinstance(ai_svc, AIProvider):
-            self._ai = ai_svc
+        brain_svc = resolver.get_capability("voice_brain")
+        if isinstance(brain_svc, ConversationEngine):
+            self._voice_brain = brain_svc
+        blob_svc = resolver.get_capability("audio_blob_store")
+        if isinstance(blob_svc, AudioBlobStore):
+            self._blob_store = blob_svc
         bus_svc = resolver.get_capability("event_bus")
         if isinstance(bus_svc, EventBusProvider):
             self._bus = bus_svc.bus
@@ -454,20 +544,42 @@ class MentraService(Service):
             return
 
         logger.info(
-            "Mentra service started — package=%s public_base_url=%r tts_via_cloud=%s",
+            "Mentra service started — package=%s public_base_url=%r "
+            "voice_brain=%s audio_blob_store=%s",
             self._package_name,
             self._public_base_url or "<unset>",
-            self._tts_via_cloud,
+            "✓" if self._voice_brain else "✗",
+            "✓" if self._blob_store else "✗",
         )
-        if self._tts_via_cloud and not self._public_base_url:
+        if not self._public_base_url:
             logger.warning(
-                "Mentra TTS-via-cloud is on but public_base_url is "
-                "unset — speak() calls will be skipped. Set "
-                "Settings → Mentra → public_base_url to the Server "
-                "URL registered with the Mentra developer console."
+                "Mentra public_base_url is unset — engine-synthesized "
+                "TTS will be dropped (cloud has no host to fetch the "
+                "blob URL from). Set Settings → Mentra → "
+                "public_base_url to the Server URL registered with "
+                "the Mentra developer console."
+            )
+        if self._voice_brain is None:
+            logger.warning(
+                "Mentra: voice_brain capability missing — sessions "
+                "will admit but no conversation loop will run."
+            )
+        if self._blob_store is None:
+            logger.warning(
+                "Mentra: audio_blob_store capability missing — TTS "
+                "audio cannot be served back to Mentra Cloud."
             )
 
     async def stop(self) -> None:
+        # Cancel every in-flight engine task first so the brain
+        # stops trying to write to a transport we're about to tear
+        # down. Awaiting them isn't necessary — the engine reacts to
+        # cancellation by exiting its gather() and we don't care
+        # about partial outcomes during shutdown.
+        for task in list(self._engine_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._engine_tasks.clear()
         # Close every live session before the service goes away.
         for sid, session in list(self._sessions.items()):
             try:
@@ -523,26 +635,13 @@ class MentraService(Service):
                     '(e.g. "https://gilbert.example.com"). Must match '
                     "the Server URL registered with the Mentra "
                     "developer console. Mentra Cloud fetches "
-                    "``<this>/api/tts?text=...`` server-side to get "
-                    "TTS audio when AI replies are spoken, so the URL "
-                    "has to be reachable from the public internet — "
-                    "localhost / LAN-only values will not work."
+                    "``<this>/api/audio-blob/<id>`` server-side for "
+                    "every TTS clip the voice_brain engine synthesizes, "
+                    "so the URL has to be reachable from the public "
+                    "internet — localhost / LAN-only values will not "
+                    "work."
                 ),
                 default="",
-            ),
-            ConfigParam(
-                key="tts_via_cloud",
-                type=ToolParameterType.BOOLEAN,
-                description=(
-                    "When enabled, AI replies are spoken via Mentra "
-                    "Cloud's built-in TTS (consistent voice across "
-                    "Mentra apps). When disabled, the plugin falls "
-                    "back to showing the reply on-display only — "
-                    "useful when you want voice consistency with "
-                    "Gilbert's other speakers (Sonos, Browser TTS) "
-                    "and plan to wire those up separately later."
-                ),
-                default=True,
             ),
             ConfigParam(
                 key="display_duration_ms",
@@ -575,7 +674,6 @@ class MentraService(Service):
         self._api_key = str(section.get("api_key") or "")
         self._package_name = str(section.get("package_name") or "")
         self._public_base_url = str(section.get("public_base_url") or "")
-        self._tts_via_cloud = bool(section.get("tts_via_cloud", True))
         try:
             self._display_duration_ms = int(
                 section.get("display_duration_ms") or 8000
@@ -625,9 +723,15 @@ class MentraService(Service):
                 status="error",
                 message="mentra service missing api_key / package_name",
             )
-        if self._ai is None:
+        if self._voice_brain is None:
             return WebhookResponse(
-                status="error", message="ai_chat capability unavailable"
+                status="error",
+                message="voice_brain capability unavailable",
+            )
+        if self._blob_store is None:
+            return WebhookResponse(
+                status="error",
+                message="audio_blob_store capability unavailable",
             )
 
         req = _parse_session_request(payload)
@@ -689,10 +793,30 @@ class MentraService(Service):
         )
         session = MentraSession(config=config, transport=transport)
 
-        # Wire the transcription → AI → display+TTS loop. Pre-bind
-        # the UserContext into the closure's task-local context so the
-        # AI service sees the right caller identity.
-        self._wire_session(session, gilbert_user)
+        # Hook the session-closed event up to engine task cancellation
+        # so a glasses-side disconnect tears down the conversation
+        # loop too. Without this the engine sits forever waiting for
+        # an audio_in chunk that will never come.
+        async def _on_disconnect(code: int, reason: str) -> None:
+            self._sessions.pop(session.session_id, None)
+            self._connected_at.pop(session.session_id, None)
+            logger.info(
+                "Mentra session %s closed: code=%s reason=%r",
+                session.session_id,
+                code,
+                reason,
+            )
+            self._record_event(
+                session.user_id,
+                "session_closed",
+                f"Disconnected — code={code} reason={reason or '(none)'}",
+                level="warning",
+            )
+            task = self._engine_tasks.pop(session.session_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+
+        session.on_disconnected(_on_disconnect)
 
         try:
             await session.connect()
@@ -820,53 +944,30 @@ class MentraService(Service):
         session.on_message(
             CloudToAppMessageType.CONNECTION_ACK.value, _on_settings_update
         )
-        # Welcome the user — display + speaker, gated on whichever
-        # surfaces the device actually has. Mentra Live has no
-        # display (audio is the only feedback channel); Even
-        # Realities G1 has a display but check before assuming
-        # speaker — some SKUs don't ship one. Sending a frame for a
-        # surface the device lacks silently drops at the cloud
-        # without an error response.
-        welcome_text = "Welcome to Gilbert."
-        if caps is None or caps.has_display:
-            try:
-                await session.display.show_text_wall(
-                    welcome_text, duration_ms=3000
-                )
-                logger.info(
-                    "Mentra welcome display sent for session=%s",
-                    req.session_id,
-                )
-            except Exception:
-                logger.warning(
-                    "Mentra welcome display failed for session=%s",
-                    req.session_id,
-                    exc_info=True,
-                )
-        if self._tts_via_cloud and (caps is None or caps.has_speaker):
-            try:
-                await session.speaker.speak(welcome_text)
-                logger.info(
-                    "Mentra welcome speech sent for session=%s",
-                    req.session_id,
-                )
-                self._record_event(
-                    req.user_id,
-                    "audio_play_request",
-                    f'Sent welcome TTS: "{welcome_text}"',
-                )
-            except Exception:
-                logger.warning(
-                    "Mentra welcome speech failed for session=%s",
-                    req.session_id,
-                    exc_info=True,
-                )
-                self._record_event(
-                    req.user_id,
-                    "audio_play_request",
-                    "Welcome TTS send FAILED",
-                    level="error",
-                )
+        # Hand the session off to the voice_brain ConversationEngine.
+        # The engine drives the welcome-greeting (SPEAK_FIRST opening
+        # policy), runs the transcription → AI → TTS loop, handles
+        # echo suppression / local VAD / barge-in / tool dispatch
+        # without us reimplementing any of it. The engine task runs
+        # for the lifetime of the glasses connection and exits when
+        # the WS drops (we push ENDED on disconnect) or the LLM
+        # calls a hang-up tool.
+        engine_task = asyncio.create_task(
+            self._run_voice_session(
+                session=session, gilbert_user=gilbert_user, caps=caps
+            ),
+            name=f"mentra-brain:{req.session_id}",
+        )
+        self._engine_tasks[req.session_id] = engine_task
+
+        # Pop the task off the registry when it finishes so we don't
+        # leak references after a clean disconnect.
+        def _on_engine_done(
+            _t: asyncio.Task[Any], sid: str = req.session_id
+        ) -> None:
+            self._engine_tasks.pop(sid, None)
+
+        engine_task.add_done_callback(_on_engine_done)
 
         return WebhookResponse(status="success")
 
@@ -876,6 +977,13 @@ class MentraService(Service):
         req = _parse_stop_request(payload)
         session = self._sessions.pop(req.session_id, None)
         self._connected_at.pop(req.session_id, None)
+        # Cancel the in-flight engine task first so it stops trying
+        # to write to a transport we're about to close. The session
+        # disconnect callback also tries to cancel it; both paths
+        # are idempotent.
+        task = self._engine_tasks.pop(req.session_id, None)
+        if task is not None and not task.done():
+            task.cancel()
         if session is not None:
             try:
                 await session.disconnect()
@@ -894,149 +1002,205 @@ class MentraService(Service):
         )
         return WebhookResponse(status="success")
 
-    # ── Session wiring ─────────────────────────────────────────────
+    # ── voice_brain handoff ──────────────────────────────────────
 
-    def _wire_session(
-        self, session: MentraSession, user: UserContext
+    async def _run_voice_session(
+        self,
+        *,
+        session: MentraSession,
+        gilbert_user: UserContext,
+        caps: Any,
     ) -> None:
-        """Attach the per-session handlers that turn transcription
-        events into AI dispatches and play the response back."""
+        """Drive one glasses session through the voice_brain engine.
 
-        async def on_final_transcript(data: Any) -> None:
-            # Only react to final (committed) transcripts. Partials
-            # are useful for UI feedback but the AI shouldn't fire
-            # on every keystroke.
-            if not getattr(data, "is_final", False):
-                return
-            text = (getattr(data, "text", "") or "").strip()
+        Builds the ``ConversationSession`` adapter, wires MicManager
+        → engine audio_in, builds the ``AudioSink`` that ships
+        engine TTS back through SpeakerManager + the blob route,
+        configures the engine for Mentra's audio formats, then awaits
+        ``voice_brain.run_conversation()``.
+
+        Engine returns when the conversation ends — terminal status
+        event (disconnect / stop request), end-of-conversation tool
+        call (``end_conversation``), or the watchdog cap. Cleanup
+        runs in the wrapping ``finally``."""
+        if self._voice_brain is None or self._blob_store is None:
+            return  # already logged at start()
+
+        # Pre-set the user context so every ai.chat() inside the
+        # engine sees the right identity. Lives in this task's
+        # ContextVar — no bleed to sibling sessions.
+        set_current_user(gilbert_user)
+
+        # Build the adapter session — the engine will read inbound
+        # mic chunks from its audio_in queue and write TTS bytes
+        # via the sink.
+        sink = _MentraAudioSink(
+            blob_store=self._blob_store,
+            speaker=session.speaker,
+            public_base_url=self._public_base_url,
+            mime="audio/mpeg",
+            session_id_for_log=session.session_id,
+        )
+        conv_session = _MentraConversationSession(
+            session_id=session.session_id,
+            audio_in=None,  # type: ignore[arg-type]  — set below
+            audio_out=sink,
+            events=None,  # type: ignore[arg-type]
+        )
+        conv_session.audio_in = conv_session._audio_in_iter()  # type: ignore[assignment]
+        conv_session.events = conv_session._events_iter()  # type: ignore[assignment]
+
+        # Wire MicManager → engine queue. Subscribing also tells the
+        # cloud to start shipping binary frames (lazy — no bandwidth
+        # without a consumer). Held in scope so the cleanup block
+        # can unsubscribe explicitly.
+        async def _on_audio_chunk(chunk: Any) -> None:
+            await conv_session.push_audio_chunk(chunk.data)
+
+        mic_cleanup = session.mic.on_audio_chunk(_on_audio_chunk)
+
+        # Engine callbacks — Mentra-specific behaviour bolted onto
+        # the otherwise modality-agnostic engine.
+        async def _on_transcript_turn(
+            who: str, text: str, ts_seconds: float
+        ) -> None:
+            # Feed the per-user debug ring buffer so the webview
+            # shows what the user said + what Gilbert said.
+            label = "You said" if who == "them" else "Gilbert said"
+            kind = (
+                "transcription_final" if who == "them" else "ai_reply"
+            )
+            self._record_event(
+                session.user_id,
+                kind,
+                f'{label}: "{text[:200]}"',
+            )
+
+        async def _on_llm_turn(text: str, tool_names: list[str]) -> None:
+            # Surface the reply on the heads-up display (if device
+            # has one). Truncated so it fits the small screen.
             if not text:
                 return
-            logger.info(
-                "Mentra transcription final — session=%s len=%d text=%r",
-                session.session_id,
-                len(text),
-                text[:100],
+            if caps is not None and not caps.has_display:
+                return
+            snippet = _summarize_for_display(text)
+            duration = (
+                self._display_duration_ms
+                if self._display_duration_ms > 0
+                else None
             )
-            self._record_event(
-                session.user_id,
-                "transcription_final",
-                f'You said: "{text[:200]}"',
-            )
-            await self._dispatch_to_ai(session, user, text)
+            try:
+                await session.display.show_text_wall(
+                    snippet, duration_ms=duration
+                )
+            except Exception:
+                logger.debug(
+                    "Mentra display.show_text_wall raised "
+                    "(session=%s)",
+                    session.session_id,
+                    exc_info=True,
+                )
 
-        session.transcription.on_transcription(on_final_transcript)
-
-        async def on_disconnect(code: int, reason: str) -> None:
-            self._sessions.pop(session.session_id, None)
-            self._connected_at.pop(session.session_id, None)
+        async def _on_status_change(
+            status: ConversationStatus, reason: str
+        ) -> None:
             logger.info(
-                "Mentra session %s closed: code=%s reason=%r",
+                "Mentra engine status: session=%s status=%s reason=%r",
                 session.session_id,
-                code,
+                status.value,
                 reason,
             )
-            self._record_event(
-                session.user_id,
-                "session_closed",
-                f"Disconnected — code={code} reason={reason or '(none)'}",
-                level="warning",
+
+        # Synthetic user-role priming so the SPEAK_FIRST opener has
+        # something to respond to. The Anthropic Messages API
+        # rejects ``messages=[]`` — without this the engine's first
+        # ai.chat() call would crash on a brand-new session. Same
+        # priming shape as voice-agent.
+        priming = [
+            Message(
+                role=MessageRole.USER,
+                content=(
+                    "(SYSTEM) The user just put on their smart glasses "
+                    "and activated Gilbert. Greet them briefly — one "
+                    "short sentence — and let them know you're "
+                    "listening."
+                ),
             )
+        ]
 
-        session.on_disconnected(on_disconnect)
+        # Mic format coming off the glasses (per MicManager): 16 kHz
+        # mono 16-bit signed PCM. Engine should NOT decode ulaw on
+        # the way to STT.
+        pcm_16k_mono = STTAudioFormat(
+            encoding=AudioEncoding.PCM_S16LE,
+            sample_rate=16000,
+            channels=1,
+        )
 
-    async def _dispatch_to_ai(
-        self, session: MentraSession, user: UserContext, text: str
-    ) -> None:
-        """Run ``text`` through the AI service as if it were a chat
-        turn from ``user``, and pipe the response back to the
-        glasses (display + optional TTS).
+        config = ConversationConfig(
+            system_prompt=self._system_prompt,
+            # No brain-tool provider needed — we run in
+            # use_full_ai_service mode where end-of-conversation
+            # comes through the regular Gilbert tool ecosystem
+            # (voice-agent's ``end_conversation`` tool is visible
+            # via ContextVar-gated discovery; it ends both modes).
+            brain_tool_provider=_NoopBrainToolProvider(),
+            opening_policy=OpeningPolicy(
+                behavior=OpeningBehavior.SPEAK_FIRST,
+                fallback_timeout_seconds=1.0,
+            ),
+            max_conversation_seconds=900,
+            priming_messages=priming,
+            on_status_change=_on_status_change,
+            on_transcript_turn=_on_transcript_turn,
+            on_llm_turn=_on_llm_turn,
+            # MP3 + no realtime pacing: Mentra Cloud fetches the
+            # whole clip in one shot and plays it; per-chunk pacing
+            # would stretch a 5s clip into 10s of buffering for no
+            # benefit.
+            tts_output_format=TTSAudioFormat.MP3,
+            tts_output_mime="audio/mpeg",
+            tts_realtime_pacing=False,
+            use_full_ai_service=True,
+            source="mentra",
+            audio_input_format=pcm_16k_mono,
+            stt_audio_format=pcm_16k_mono,
+        )
 
-        Each session has its own WS reader task, so per-session
-        ``UserContext`` doesn't bleed across sessions — we pass
-        ``user_ctx=user`` explicitly anyway as belt-and-suspenders
-        (the AI service prefers the explicit param over the
-        ContextVar) and ALSO set the ContextVar so any tools the AI
-        invokes inherit the right identity."""
-        if self._ai is None:
-            return
-        set_current_user(user)
+        # Kick the engine off with an ACTIVE event so its opening
+        # policy fires immediately. The status loop schedules
+        # ``_open_proactively`` on ACTIVE, which is what generates
+        # the "Welcome to Gilbert"-style greeting.
+        await conv_session.push_event(
+            ConversationStatusEvent(status=ConversationStatus.ACTIVE)
+        )
+
         try:
-            result = await self._ai.chat(
-                user_message=text,
-                user_ctx=user,
-                system_prompt=self._system_prompt,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Mentra AI dispatch failed for session %s",
-                session.session_id,
-            )
-            self._record_event(
-                session.user_id,
-                "ai_dispatch_failed",
-                f"AI dispatch failed: {exc}",
-                level="error",
-            )
-            await session.display.show_text_wall(
-                "Gilbert had an error.",
-                duration_ms=3000,
-            )
-            return
-        reply = (result.response_text or "").strip()
-        if not reply:
+            await self._voice_brain.run_conversation(conv_session, config)
+        except asyncio.CancelledError:
             logger.info(
-                "Mentra AI returned empty response for session=%s",
+                "Mentra engine task cancelled for session=%s",
                 session.session_id,
             )
-            self._record_event(
-                session.user_id,
-                "ai_reply_empty",
-                "AI returned empty response",
-                level="warning",
-            )
-            return
-        logger.info(
-            "Mentra AI reply — session=%s len=%d preview=%r",
-            session.session_id,
-            len(reply),
-            reply[:100],
-        )
-        self._record_event(
-            session.user_id,
-            "ai_reply",
-            f'Gilbert says: "{reply[:200]}"',
-        )
-        await self._render_reply(session, reply)
-
-    async def _render_reply(
-        self, session: MentraSession, reply: str
-    ) -> None:
-        """Send the reply to the glasses — display + TTS (if
-        cloud-side TTS is enabled).
-
-        Long replies get a reference-card layout with the first two
-        sentences; very long replies are truncated with an ellipsis
-        so the display stays readable.
-        """
-        snippet = _summarize_for_display(reply)
-        duration = (
-            self._display_duration_ms
-            if self._display_duration_ms > 0
-            else None
-        )
-        try:
-            await session.display.show_text_wall(
-                snippet, duration_ms=duration
-            )
+            raise
         except Exception:
-            logger.debug(
-                "Mentra display.show_text_wall raised", exc_info=True
+            logger.exception(
+                "Mentra voice_brain.run_conversation crashed for "
+                "session=%s",
+                session.session_id,
             )
-        if self._tts_via_cloud:
+        finally:
+            # Unsubscribe from mic chunks so we stop paying bandwidth
+            # for a session that no longer has anyone listening.
             try:
-                await session.speaker.speak(reply)
+                mic_cleanup()
             except Exception:
-                logger.debug("Mentra speaker.speak raised", exc_info=True)
+                logger.debug(
+                    "mic cleanup raised (session=%s)",
+                    session.session_id,
+                    exc_info=True,
+                )
+            conv_session.closed = True
 
     # ── Debug ring buffer (MentraDebugProvider) ──────────────────
 

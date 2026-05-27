@@ -793,8 +793,8 @@ Smart-glasses platform — connects Gilbert to [MentraOS](https://mentra.glass),
 1. Webhook arrives → service looks up Mentra `userId` (email) in the `mentra_user_mappings` collection → refuses if no mapping (no auto-create).
 2. `WebSocketTransport` opens the back-channel; `MentraSession` runs the handshake.
 3. Cloud-side capabilities (`hasDisplay`, `hasCamera`, `hasMicrophone`, …) populate `session.capabilities`; manager methods that don't apply on a given device degrade gracefully.
-4. Transcription stream subscribed automatically; only `isFinal=True` finals dispatch into `AIService.chat(user_ctx=<mapped UserContext>)`. The system prompt biases the LLM toward glasses-appropriate brevity.
-5. AI reply rendered to the heads-up display via `session.display.show_text_wall` AND spoken via cloud TTS through `session.speaker.speak`.
+4. The plugin builds a `_MentraConversationSession` adapter (mic PCM in / TTS bytes out) and hands it to the core `voice_brain` `ConversationEngine`. The engine owns the transcription → AI → TTS loop, including echo suppression, local VAD, barge-in, and tool dispatch — same engine that drives phone calls and the wake-word voice agent.
+5. Engine-synthesized MP3 lands on a `_MentraAudioSink` which registers the bytes with the `audio_blob_store` capability and tells `session.speaker.play_url` to fetch `<public_base_url>/api/audio-blob/<id>`. Mentra Cloud's server-side fetcher pulls that URL and streams the audio to the glasses speaker. AI replies also surface on the heads-up display via the engine's `on_llm_turn` callback.
 
 **Managers shipped in v1**
 - `session.transcription.on_transcription(handler)` — final + interim transcripts
@@ -809,9 +809,9 @@ Camera, LED, location, and livestream managers are stubbed for follow-up — the
 - `enabled` — Toggle the service on. Defaults `false`.
 - `api_key` *(sensitive)* — Mentra app API key from the MentraOS developer console. Sent in the WebSocket upgrade headers (`x-api-key`) and the first JSON frame to authenticate this app instance.
 - `package_name` — Reverse-DNS app identifier registered in the Mentra developer console (e.g. `com.example.gilbert`).
-- `tts_via_cloud` — When enabled (default), AI replies are spoken via Mentra Cloud's built-in TTS. Disable to suppress audio output if you want to wire TTS through a different Gilbert speaker later.
+- `public_base_url` — Public HTTPS URL where Gilbert is reachable (e.g. `https://gilbert.example.com`). Must match the Server URL registered with the Mentra developer console. Mentra Cloud fetches `<this>/api/audio-blob/<id>` server-side for every TTS clip the `voice_brain` engine synthesizes, so the URL has to be reachable from the public internet — localhost / LAN-only values will not work. Empty string disables outbound TTS.
 - `display_duration_ms` — How long an AI reply stays on the heads-up display before auto-clearing (default `8000`, `0` for indefinite).
-- `system_prompt` *(AI prompt, multi-line)* — System prompt the LLM uses for glasses-originated requests. Tuned for brevity (small display, audio readback).
+- `system_prompt` *(AI prompt, multi-line)* — System prompt the engine passes to `AIProvider.chat()` for glasses-originated turns. Tuned for brevity (small display, audio readback).
 
 **User mappings** — Operators add rows to the `mentra_user_mappings` collection mapping each authorized Mentra email to a Gilbert user. Sessions for unmapped Mentra users are refused at the webhook stage. (A future UI panel will manage this; for now use the SPA's entity-store admin tools or seed via `gilbert.yaml`.)
 

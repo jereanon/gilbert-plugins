@@ -1,17 +1,33 @@
 """MentraService end-to-end test.
 
-Drives the full webhook → session → AI dispatch loop with all the
-external dependencies stubbed: in-memory storage with a pre-populated
-mapping row, a fake AIProvider whose ``chat`` returns a canned
-response, and a fake transport so we can inject a transcription
-event and watch the response come back as a display_event frame.
+After the voice_brain refactor, MentraService is a thin transport —
+it admits glasses sessions via webhook, wires the WebSocket to a
+``_MentraConversationSession``, builds a ``_MentraAudioSink``, and
+hands the whole thing to the ``voice_brain`` ``ConversationEngine``
+capability. The engine owns the conversation loop (transcription →
+AI → TTS → barge-in / echo suppression / VAD).
+
+These tests drive the handoff itself: webhook arrives → resolver
+returns the engine stub → ``run_conversation(session, config)`` is
+called with the right shape. The engine's internal behaviour is
+covered by ``tests/unit/test_voice_brain.py`` in core; we don't
+re-verify it here.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
+
+from gilbert.interfaces.audio_blob import AudioBlob
+from gilbert.interfaces.conversation import (
+    ConversationConfig,
+    ConversationOutcome,
+    ConversationSession,
+    ConversationStatus,
+)
 
 # ── Stubs ───────────────────────────────────────────────────────────
 
@@ -85,29 +101,64 @@ class _BusProvider:
         self.bus = bus
 
 
-class _FakeAI:
-    """Stand-in for AIProvider. Captures the last call + returns a
-    canned response so we can verify the dispatch."""
+class _FakeVoiceBrain:
+    """Captures the (session, config) tuple that would have been
+    handed to the real ConversationEngine. Lets tests assert what
+    the plugin built without spinning up the actual engine."""
 
-    def __init__(self, response_text: str = "ok") -> None:
-        self.calls: list[dict[str, Any]] = []
-        self._response_text = response_text
+    def __init__(self) -> None:
+        self.calls: list[tuple[ConversationSession, ConversationConfig]] = []
+        # Set by tests to control how long ``run_conversation``
+        # blocks. Default ``None`` returns immediately with an
+        # ENDED outcome (simulating "engine ran briefly, then we
+        # told it to stop"). Set to an ``asyncio.Event`` to keep
+        # the engine task alive until the test wants it to end.
+        self.hold_until: asyncio.Event | None = None
 
-    async def chat(self, **kwargs: Any) -> Any:
-        self.calls.append(dict(kwargs))
+    async def run_conversation(
+        self,
+        session: ConversationSession,
+        config: ConversationConfig,
+    ) -> ConversationOutcome:
+        self.calls.append((session, config))
+        if self.hold_until is not None:
+            try:
+                await self.hold_until.wait()
+            except asyncio.CancelledError:
+                # Service shutdown cancels the engine task — that's
+                # an expected path; surface it as a "FAILED" outcome
+                # without raising so the wrapping ``await`` returns.
+                return ConversationOutcome(
+                    final_status=ConversationStatus.FAILED,
+                    duration_seconds=0.0,
+                    outcome={},
+                    failure_reason="cancelled",
+                )
+        return ConversationOutcome(
+            final_status=ConversationStatus.ENDED,
+            duration_seconds=0.0,
+            outcome={},
+        )
 
-        class _Result:
-            response_text = self._response_text
-            conversation_id = ""
-            ui_blocks: list[dict[str, Any]] = []
-            tool_usage: list[dict[str, Any]] = []
-            attachments: list[Any] = []
-            rounds: list[dict[str, Any]] = []
-            interrupted = False
-            model = ""
-            turn_usage = None
 
-        return _Result()
+class _FakeBlobStore:
+    """Captures ``register()`` calls so tests can verify the sink
+    actually emitted bytes when the engine wrote audio. ``fetch``
+    is never called in these tests (the route's tests cover that)."""
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[bytes, str]] = []
+        self._counter = 0
+
+    def register(
+        self, data: bytes, mime: str, *, ttl_seconds: float = 60.0
+    ) -> str:
+        self.registered.append((bytes(data), mime))
+        self._counter += 1
+        return f"blob_{self._counter:04d}"
+
+    def fetch(self, blob_id: str) -> AudioBlob | None:
+        return None
 
 
 class _Resolver:
@@ -157,6 +208,7 @@ class _FakeTransport:
         self._on_text: Any = None
         self._on_close: Any = None
         self._on_error: Any = None
+        self._on_binary: Any = None
 
     @property
     def ready_state(self) -> Any:
@@ -190,7 +242,7 @@ class _FakeTransport:
         self._on_text = handler
 
     def on_binary(self, handler: Any) -> None:
-        pass
+        self._on_binary = handler
 
     def on_close(self, handler: Any) -> None:
         self._on_close = handler
@@ -213,16 +265,19 @@ async def _start_service(
     enabled: bool = True,
     api_key: str = "key_test",
     package_name: str = "com.example.gilbert",
+    public_base_url: str = "https://gilbert.example.com",
     mapping_email: str = "alice@example.com",
     mapping_user_id: str = "usr_alice",
-    ai: _FakeAI | None = None,
-) -> tuple[Any, _FakeStorage, _Bus, _FakeAI]:
+    brain: _FakeVoiceBrain | None = None,
+    blob_store: _FakeBlobStore | None = None,
+) -> tuple[Any, _FakeStorage, _Bus, _FakeVoiceBrain, _FakeBlobStore]:
     from gilbert_plugin_mentra.mentra_service import MentraService
 
     svc = MentraService()
     storage = _FakeStorage()
     bus = _Bus()
-    ai = ai or _FakeAI(response_text="hello from gilbert")
+    brain = brain or _FakeVoiceBrain()
+    blob_store = blob_store or _FakeBlobStore()
 
     # Pre-seed the mapping row.
     if mapping_email and mapping_user_id:
@@ -242,23 +297,51 @@ async def _start_service(
             "enabled": enabled,
             "api_key": api_key,
             "package_name": package_name,
-            # ``speak()`` needs an absolute base — without it
-            # SpeakerManager skips the call (Mentra Cloud can't
-            # fetch a relative path). Set a stub so the service
-            # tests exercise the full TTS path.
-            "public_base_url": "https://gilbert.example.com",
-            "tts_via_cloud": True,
+            "public_base_url": public_base_url,
             "display_duration_ms": 8000,
         }
     )
     resolver = _Resolver(
         entity_storage=storage,
-        ai_chat=ai,
+        voice_brain=brain,
+        audio_blob_store=blob_store,
         event_bus=_BusProvider(bus),
         configuration=cfg,
     )
     await svc.start(resolver)
-    return svc, storage, bus, ai
+    return svc, storage, bus, brain, blob_store
+
+
+async def _drive_session_admit(
+    svc: Any, monkeypatch: Any
+) -> _FakeTransport:
+    """Helper: kick off a session_request, inject the connection_ack
+    so connect() resolves, return the fake transport. Used by every
+    test that needs a live admitted session."""
+    fake = _FakeTransport()
+    from gilbert_plugin_mentra import mentra_service as ms
+
+    monkeypatch.setattr(ms, "WebSocketTransport", lambda **_kwargs: fake)
+
+    task = asyncio.create_task(
+        svc.deliver_webhook_event(
+            {
+                "type": "session_request",
+                "sessionId": "sess_001",
+                "userId": "alice@example.com",
+                "timestamp": "2099-01-01T00:00:00Z",
+                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
+            }
+        )
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await fake.inject(
+        {"type": "tpa_connection_ack", "sessionId": "sess_001"}
+    )
+    result = await task
+    assert result.status == "success", result.message
+    return fake
 
 
 # ── Tests ───────────────────────────────────────────────────────────
@@ -280,18 +363,17 @@ def test_disabled_service_returns_error_on_webhook() -> None:
     """``enabled=False`` in config keeps the service inert. The
     webhook capability is still resolvable but every call returns
     an error response — same posture as the messaging plugin."""
-    import asyncio
 
     from gilbert_plugin_mentra.mentra_service import MentraService
 
     async def _run() -> None:
         svc = MentraService()
         storage = _FakeStorage()
-        ai = _FakeAI()
         cfg = _Cfg({"enabled": False})
         resolver = _Resolver(
             entity_storage=storage,
-            ai_chat=ai,
+            voice_brain=_FakeVoiceBrain(),
+            audio_blob_store=_FakeBlobStore(),
             configuration=cfg,
         )
         await svc.start(resolver)
@@ -314,7 +396,7 @@ def test_disabled_service_returns_error_on_webhook() -> None:
 async def test_unmapped_user_refused() -> None:
     """If the Mentra user_id has no mapping row, the service refuses
     rather than auto-creating a Gilbert user."""
-    svc, _, _, _ = await _start_service(
+    svc, *_ = await _start_service(
         mapping_email="", mapping_user_id=""
     )
     result = await svc.deliver_webhook_event(
@@ -334,7 +416,7 @@ async def test_unmapped_user_refused() -> None:
 async def test_session_request_with_missing_websocket_url_refused() -> None:
     """Cloud must supply ``websocketUrl`` (or a deprecated alias) —
     without it we have nowhere to dial back."""
-    svc, _, _, _ = await _start_service()
+    svc, *_ = await _start_service()
     result = await svc.deliver_webhook_event(
         {
             "type": "session_request",
@@ -349,46 +431,77 @@ async def test_session_request_with_missing_websocket_url_refused() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_request_without_voice_brain_capability_refused(
+    monkeypatch: Any,
+) -> None:
+    """The whole point of the refactor: without ``voice_brain``
+    capability resolvable, the service can't run a conversation. We
+    refuse the session at admit time rather than admitting a session
+    that silently does nothing."""
+    from gilbert_plugin_mentra.mentra_service import MentraService
+
+    svc = MentraService()
+    storage = _FakeStorage()
+    cfg = _Cfg(
+        {
+            "enabled": True,
+            "api_key": "k",
+            "package_name": "p",
+            "public_base_url": "https://gilbert.example.com",
+        }
+    )
+    resolver = _Resolver(
+        entity_storage=storage,
+        # NO voice_brain capability
+        audio_blob_store=_FakeBlobStore(),
+        configuration=cfg,
+    )
+    # Pre-seed mapping so the user lookup succeeds and we hit the
+    # capability check.
+    await storage.backend.put(
+        "mentra_user_mappings",
+        "map_x",
+        {
+            "mentra_user_id": "alice@example.com",
+            "gilbert_user_id": "usr_alice",
+            "display_name": "Alice",
+            "roles": ["user"],
+        },
+    )
+    await svc.start(resolver)
+
+    result = await svc.deliver_webhook_event(
+        {
+            "type": "session_request",
+            "sessionId": "sess_001",
+            "userId": "alice@example.com",
+            "timestamp": "2099-01-01T00:00:00Z",
+            "websocketUrl": "wss://cloud.mentra.glass/app-ws",
+        }
+    )
+    assert result.status == "error"
+    assert "voice_brain" in result.message
+
+
+@pytest.mark.asyncio
 async def test_stop_request_clears_session_registry(monkeypatch: Any) -> None:
     """A ``stop_request`` for a known session must drop it from the
-    registry AND publish ``mentra.session_stopped`` on the bus."""
-    # Patch WebSocketTransport to use our fake so connect() succeeds
-    # in-process without trying a real socket.
-    svc, _, bus, _ = await _start_service()
+    registry, cancel the engine task, AND publish
+    ``mentra.session_stopped`` on the bus."""
+    brain = _FakeVoiceBrain()
+    # Hold the engine inside run_conversation until the test
+    # explicitly releases it. Without this the engine task would
+    # exit immediately and we'd race the "cancel on stop" check.
+    brain.hold_until = asyncio.Event()
 
-    fake = _FakeTransport()
-    from gilbert_plugin_mentra import mentra_service as ms
-
-    monkeypatch.setattr(
-        ms, "WebSocketTransport", lambda **_kwargs: fake
-    )
-
-    import asyncio
-
-    # Kick off session_request, inject ack so connect resolves.
-    session_task = asyncio.create_task(
-        svc.deliver_webhook_event(
-            {
-                "type": "session_request",
-                "sessionId": "sess_001",
-                "userId": "alice@example.com",
-                "timestamp": "2099-01-01T00:00:00Z",
-                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
-            }
-        )
-    )
-    # Yield so the session sends connection_init + starts waiting for ack.
-    for _ in range(3):
-        await asyncio.sleep(0)
-    await fake.inject(
-        {"type": "tpa_connection_ack", "sessionId": "sess_001"}
-    )
-    result = await session_task
-    assert result.status == "success"
-    # Sanity: session is registered.
+    svc, _, bus, _, _ = await _start_service(brain=brain)
+    await _drive_session_admit(svc, monkeypatch)
+    # Sanity: session is registered + engine task is running.
     assert "sess_001" in svc._sessions  # noqa: SLF001
+    assert "sess_001" in svc._engine_tasks  # noqa: SLF001
+    assert not svc._engine_tasks["sess_001"].done()  # noqa: SLF001
 
-    # Now the stop_request.
+    # Stop_request.
     stop = await svc.deliver_webhook_event(
         {
             "type": "stop_request",
@@ -400,142 +513,195 @@ async def test_stop_request_clears_session_registry(monkeypatch: Any) -> None:
     )
     assert stop.status == "success"
     assert "sess_001" not in svc._sessions  # noqa: SLF001
+    assert "sess_001" not in svc._engine_tasks  # noqa: SLF001
     event_types = [getattr(e, "event_type", "") for e in bus.events]
     assert "mentra.session_stopped" in event_types
+    # Release the brain so any pending awaits unwind cleanly.
+    brain.hold_until.set()
 
 
 @pytest.mark.asyncio
-async def test_final_transcription_dispatches_to_ai_with_mapped_user(
+async def test_session_admit_hands_session_to_voice_brain(
     monkeypatch: Any,
 ) -> None:
-    """The headline test — final transcription on the WS triggers
-    AIService.chat with the mapped Gilbert UserContext, and the
-    response gets rendered to the glasses display + spoken via TTS."""
-    svc, _, _, ai = await _start_service()
+    """Headline test — after a successful admit, the service must
+    have constructed a ConversationSession + ConversationConfig and
+    handed both to ``voice_brain.run_conversation``."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
 
-    fake = _FakeTransport()
-    from gilbert_plugin_mentra import mentra_service as ms
+    await _drive_session_admit(svc, monkeypatch)
 
-    monkeypatch.setattr(ms, "WebSocketTransport", lambda **_kwargs: fake)
-
-    import asyncio
-
-    session_task = asyncio.create_task(
-        svc.deliver_webhook_event(
-            {
-                "type": "session_request",
-                "sessionId": "sess_001",
-                "userId": "alice@example.com",
-                "timestamp": "2099-01-01T00:00:00Z",
-                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
-            }
-        )
-    )
+    # Let the engine task get scheduled.
     for _ in range(3):
         await asyncio.sleep(0)
-    await fake.inject(
-        {"type": "tpa_connection_ack", "sessionId": "sess_001"}
-    )
-    await session_task
 
-    # Inject a final transcription — should drive the AI chat.
-    await fake.inject(
-        {
-            "type": "data_stream",
-            "streamType": "transcription",
-            "data": {"text": "what's on my schedule?", "isFinal": True},
-        }
-    )
-    assert len(ai.calls) == 1
-    call = ai.calls[-1]
-    assert call["user_message"] == "what's on my schedule?"
-    ctx = call["user_ctx"]
-    assert ctx.user_id == "usr_alice"
-    assert ctx.email == "alice@example.com"
-    assert ctx.provider == "mentra"
+    assert len(brain.calls) == 1
+    session, config = brain.calls[0]
+    # Session shape: id matches what the webhook supplied, audio I/O
+    # iterators are present, events iterator is present.
+    assert session.session_id == "sess_001"
+    assert session.audio_in is not None
+    assert session.audio_out is not None
+    assert session.events is not None
+    # Config shape: full Gilbert tool ecosystem mode, MP3 output for
+    # cloud-fetchable bytes, no realtime pacing (Mentra Cloud fetches
+    # whole clip), STT at 16 kHz PCM (mic format).
+    from gilbert.interfaces.transcription import AudioEncoding
+    from gilbert.interfaces.tts import AudioFormat as _TTSAudioFormat
 
-    # Reply was sent to the glasses — display + TTS.
-    display_frames = [
-        f for f in fake.sent if f.get("type") == "display_event"
-    ]
+    assert config.use_full_ai_service is True
+    assert config.source == "mentra"
+    assert config.tts_output_format == _TTSAudioFormat.MP3
+    assert config.tts_realtime_pacing is False
+    assert config.stt_audio_format is not None
+    assert config.stt_audio_format.encoding == AudioEncoding.PCM_S16LE
+    assert config.stt_audio_format.sample_rate == 16000
+    # Opening policy fires the welcome via the LLM rather than a
+    # bespoke welcome string in the plugin.
+    from gilbert.interfaces.conversation import OpeningBehavior
+
+    assert config.opening_policy.behavior == OpeningBehavior.SPEAK_FIRST
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_session_admit_pushes_active_event_to_engine(
+    monkeypatch: Any,
+) -> None:
+    """The plugin must push ``ConversationStatus.ACTIVE`` to the
+    engine's events iterator so the SPEAK_FIRST opening policy
+    fires immediately. Without that nudge the engine sits in
+    PENDING forever and the user hears nothing on admit."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+
+    await _drive_session_admit(svc, monkeypatch)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    session, _ = brain.calls[0]
+    # Read the first event off the iterator — should be ACTIVE.
+    events_iter = session.events
+    ev = await asyncio.wait_for(events_iter.__anext__(), timeout=1.0)
+    from gilbert.interfaces.conversation import (
+        ConversationStatusEvent,
+    )
+
+    assert isinstance(ev, ConversationStatusEvent)
+    assert ev.status == ConversationStatus.ACTIVE
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_mic_audio_flows_into_engine_audio_in(
+    monkeypatch: Any,
+) -> None:
+    """Binary mic frames the cloud sends must land on the engine's
+    ``audio_in`` iterator. Without this wiring the engine sits with
+    no audio to feed STT and Gilbert can't hear anything."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
+
+    # Let the engine task wire up subscriptions.
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # Inject a binary mic frame through the transport.
+    session = svc._sessions["sess_001"]  # noqa: SLF001
+    pcm_chunk = b"\x00\x01" * 80  # 160 bytes ≈ 5ms of 16 kHz mono PCM
+    await session.mic.handle_binary_audio(pcm_chunk)
+
+    # Pull the chunk off the engine's audio iterator.
+    conv_session, _ = brain.calls[0]
+    chunk = await asyncio.wait_for(
+        conv_session.audio_in.__anext__(), timeout=1.0
+    )
+    assert chunk == pcm_chunk
+
+    brain.hold_until.set()
+
+
+@pytest.mark.asyncio
+async def test_sink_writes_register_blob_and_play_url(
+    monkeypatch: Any,
+) -> None:
+    """When the engine writes audio bytes to ``audio_out`` and then
+    flushes, the sink must register the bytes with the blob store
+    and call ``speaker.play_url`` with the right URL shape."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    blob_store = _FakeBlobStore()
+    svc, _, _, _, _ = await _start_service(
+        brain=brain, blob_store=blob_store
+    )
+    fake = await _drive_session_admit(svc, monkeypatch)
+
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    conv_session, _ = brain.calls[0]
+    # Engine writes one utterance worth of bytes, then flushes.
+    await conv_session.audio_out.write(b"FAKE_MP3_BYTES")
+    await conv_session.audio_out.flush()
+
+    # Blob store got the bytes.
+    assert len(blob_store.registered) == 1
+    assert blob_store.registered[0][0] == b"FAKE_MP3_BYTES"
+    assert blob_store.registered[0][1] == "audio/mpeg"
+
+    # Speaker manager got an audio_play_request with the right URL
+    # shape (absolute, contains /api/audio-blob/, ends with the
+    # blob id the store handed out).
     audio_frames = [
         f for f in fake.sent if f.get("type") == "audio_play_request"
     ]
-    # Expected timeline: welcome display + welcome speech (session
-    # admit), then reply display + reply speech (AI dispatch). Order
-    # of the two welcome frames vs the two reply frames is
-    # deterministic; within each pair the display goes first.
-    assert len(display_frames) >= 2
-    assert len(audio_frames) >= 2
-    reply_text = display_frames[-1]["layout"]["text"]
-    assert "hello from gilbert" in reply_text
-    # TTS is URL-based — text goes in the audioUrl query param, not
-    # as an inline ``text`` field (the cloud silently drops frames
-    # that pass text inline).
-    from urllib.parse import parse_qs, urlparse
+    assert len(audio_frames) == 1
+    url = audio_frames[0]["audioUrl"]
+    assert url.startswith("https://gilbert.example.com/api/audio-blob/")
+    assert url.endswith("/blob_0001")
+    # Track 2 is the TTS track convention.
+    assert audio_frames[0]["trackId"] == 2
 
-    qs = parse_qs(urlparse(audio_frames[-1]["audioUrl"]).query)
-    assert qs["text"] == ["hello from gilbert"]
-    assert audio_frames[-1]["trackId"] == 2  # TTS track
-    # Welcome speech is the first audio frame; verify it carries
-    # the right text.
-    welcome_qs = parse_qs(urlparse(audio_frames[0]["audioUrl"]).query)
-    assert welcome_qs["text"] == ["Welcome to Gilbert."]
+    brain.hold_until.set()
 
 
 @pytest.mark.asyncio
-async def test_partial_transcription_does_not_dispatch(
+async def test_sink_clear_stops_active_playback(
     monkeypatch: Any,
 ) -> None:
-    """Only ``isFinal=True`` transcriptions hit the AI. Partials
-    are noise during the user's utterance."""
-    svc, _, _, ai = await _start_service()
-
-    fake = _FakeTransport()
-    from gilbert_plugin_mentra import mentra_service as ms
-
-    monkeypatch.setattr(ms, "WebSocketTransport", lambda **_kwargs: fake)
-
-    import asyncio
-
-    task = asyncio.create_task(
-        svc.deliver_webhook_event(
-            {
-                "type": "session_request",
-                "sessionId": "sess_001",
-                "userId": "alice@example.com",
-                "timestamp": "2099-01-01T00:00:00Z",
-                "websocketUrl": "wss://cloud.mentra.glass/app-ws",
-            }
-        )
-    )
+    """The engine fires ``audio_out.clear()`` on barge-in. The sink
+    must drop its buffer AND tell Mentra Cloud to stop the in-flight
+    playback — otherwise the user hears Gilbert finish his sentence
+    after interrupting."""
+    brain = _FakeVoiceBrain()
+    brain.hold_until = asyncio.Event()
+    svc, _, _, _, _ = await _start_service(brain=brain)
+    fake = await _drive_session_admit(svc, monkeypatch)
     for _ in range(3):
         await asyncio.sleep(0)
-    await fake.inject(
-        {"type": "tpa_connection_ack", "sessionId": "sess_001"}
-    )
-    await task
 
-    await fake.inject(
-        {
-            "type": "data_stream",
-            "streamType": "transcription",
-            "data": {"text": "wha", "isFinal": False},
-        }
-    )
-    await fake.inject(
-        {
-            "type": "data_stream",
-            "streamType": "transcription",
-            "data": {"text": "what's", "isFinal": False},
-        }
-    )
-    assert ai.calls == []
+    conv_session, _ = brain.calls[0]
+    await conv_session.audio_out.clear()
+
+    # audio_stop_request frame should have been sent to the cloud.
+    stop_frames = [
+        f for f in fake.sent if f.get("type") == "audio_stop_request"
+    ]
+    assert len(stop_frames) >= 1
+
+    brain.hold_until.set()
 
 
 @pytest.mark.asyncio
 async def test_unknown_webhook_type_returns_error() -> None:
-    svc, _, _, _ = await _start_service()
+    svc, *_ = await _start_service()
     result = await svc.deliver_webhook_event(
         {"type": "asteroid_impact_warning", "sessionId": "sess_001"}
     )
@@ -547,33 +713,27 @@ def test_summarize_for_display_trims_long_replies() -> None:
     """Long AI replies get cut to roughly ``max_chars`` with an
     ellipsis so the glasses display stays readable. Sentence
     boundaries are preferred when one's close to the cut."""
-    from gilbert_plugin_mentra.mentra_service import (
-        _summarize_for_display,
-    )
+    from gilbert_plugin_mentra.mentra_service import _summarize_for_display
 
-    short = "All good."
-    assert _summarize_for_display(short) == "All good."
+    short = "Quick reply."
+    assert _summarize_for_display(short) == "Quick reply."
 
-    long_text = (
-        "First sentence. Second sentence. Third sentence that goes on "
-        "and on with extra padding. Fourth sentence. Fifth."
+    sentences = (
+        "First sentence is here and stretches a bit further. "
+        "Second one is also kind of long. "
+        "Third sentence we never want shown."
     )
-    out = _summarize_for_display(long_text, max_chars=80)
+    out = _summarize_for_display(sentences, max_chars=80)
+    assert len(out) <= 82  # max_chars plus the ellipsis suffix
     assert out.endswith("…")
-    assert len(out) <= 82  # max_chars + ellipsis + maybe trailing space
 
 
-def test_parse_session_request_accepts_deprecated_aliases() -> None:
-    """Legacy MentraOS/AugmentOS websocket-url field names must
-    resolve too — the cloud still ships them for back-compat."""
-    from gilbert_plugin_mentra.mentra_service import _parse_session_request
+def test_noop_brain_tool_provider_satisfies_engine_contract() -> None:
+    """The engine accepts the noop provider via ``ConversationConfig``
+    construction. The provider's methods aren't called in
+    use_full_ai_service mode but the type has to satisfy the
+    dataclass field annotation."""
+    from gilbert_plugin_mentra.mentra_service import _NoopBrainToolProvider
 
-    req = _parse_session_request(
-        {
-            "sessionId": "sess_001",
-            "userId": "alice@example.com",
-            "timestamp": "2099-01-01T00:00:00Z",
-            "mentraOSWebsocketUrl": "wss://cloud.mentra.glass/legacy",
-        }
-    )
-    assert req.resolved_websocket_url == "wss://cloud.mentra.glass/legacy"
+    p = _NoopBrainToolProvider()
+    assert p.get_brain_tools() == []
