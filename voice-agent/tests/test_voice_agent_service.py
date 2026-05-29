@@ -113,3 +113,46 @@ async def test_session_end_pushes_terminal_event() -> None:
         and e.status == ConversationStatus.ENDED
         for e in events
     )
+
+
+def test_parse_noise_words_accepts_comma_string() -> None:
+    """The Settings UI surfaces a STRING ConfigParam for noise_words
+    so users can edit a comma list. The parser must accept that form
+    AND the programmatic list form (used by plugin.yaml defaults)."""
+    from gilbert_plugin_voice_agent.voice_agent_service import (
+        _parse_noise_words,
+    )
+
+    out = _parse_noise_words("uh, hmm, yeah")
+    assert "uh" in out
+    assert "hmm" in out
+    assert "yeah" in out
+    assert len(out) == 3
+
+
+def test_parse_noise_words_handles_list() -> None:
+    """Programmatic list form (plugin.yaml or test fixture)."""
+    from gilbert_plugin_voice_agent.voice_agent_service import (
+        _parse_noise_words,
+    )
+
+    out = _parse_noise_words(["UH", "  Hmm  ", "yeah"])
+    # Normalized to lowercase + stripped of whitespace.
+    assert out == frozenset({"uh", "hmm", "yeah"})
+
+
+def test_parse_noise_words_empty_falls_back_to_defaults() -> None:
+    """Empty string / None should NOT silently disable the gate —
+    falls back to the bundled default set so a half-cleared config
+    field doesn't open the floodgates."""
+    from gilbert_plugin_voice_agent.voice_agent_service import (
+        _DEFAULT_NOISE_WORDS,
+        _parse_noise_words,
+    )
+
+    out_none = _parse_noise_words(None)
+    out_empty = _parse_noise_words("")
+    assert out_none == out_empty
+    # Every default appears in the parsed set.
+    for w in _DEFAULT_NOISE_WORDS:
+        assert w.lower() in out_none

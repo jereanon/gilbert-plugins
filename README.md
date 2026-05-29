@@ -1421,7 +1421,7 @@ The doorbell backend uses a flat config pointing at Protect:
 
 ### voice-agent
 
-Wake-word-activated voice conversations in the browser. Press "Start Conversation" on the `/voice` page (or trigger the configured wake-word), Gilbert listens through the browser microphone, runs the audio through STT, drives the response through the core `voice_brain` engine, and plays the synthesized speech back through the page's audio output. v1 is turn-taking; barge-in is on the roadmap.
+Wake-word-activated voice conversations in the browser. Press "Start Conversation" on the `/voice` page (or trigger the configured wake-word), Gilbert listens through the browser microphone, runs the audio through STT, drives the response through the core `voice_brain` engine, and plays the synthesized speech back through the page's audio output. True barge-in is on by default — a new user utterance while Gilbert is still speaking cancels the in-flight response, stops the TTS playback, and the new utterance gets the floor.
 
 The full Gilbert tool ecosystem is available during a session — knowledge search, MCP tools, agent dispatch, scheduler, … — because the engine runs in `use_full_ai_service` mode and hands the LLM whatever the AI service currently exposes.
 
@@ -1431,7 +1431,13 @@ The full Gilbert tool ecosystem is available during a session — knowledge sear
 
 **AI tool exposed only inside a voice session** — `end_conversation` (brain-mediated; not a slash command). The provider's `slash_namespace = "voice"`, kept defensive in case future tools expose user-facing commands.
 
-**No user-facing configuration** beyond the standard service on/off toggle and per-session opening policy (which lives on the engine config, not the service).
+**Configure** (Settings → Speech → Voice Agent)
+- `idle_timeout_seconds` — Close the active conversation after this many seconds of silence (default `12`).
+- `system_prompt` *(AI prompt)* — System prompt the brain runs with during a voice session. Short, conversational, smart-speaker register.
+- `min_address_chars` — Drop transcripts shorter than this many characters (after stripping punctuation) without dispatching a response. Catches coughs / throat-clears Scribe transcribes as one or two chars (default `2`; `0` disables the gate).
+- `noise_words` — Comma-separated list of single-word fillers (`uh, hmm, yeah, ok, …`). A transcript whose tokens are ALL in this list is dropped before any LLM call. Case-insensitive; leave blank to fall back to the bundled default set.
+- `address_gate_enabled` — When on, a cheap LLM call runs before every response to decide whether the user was addressing the assistant. Adds ~100-300 ms to genuine turns but skips the full agentic LLM call when the answer is no — the much bigger win on open-mic browser sessions (default `true`).
+- `address_gate_prompt` *(AI prompt)* — System prompt for the addressing-gate LLM call. Must instruct the model to reply EXACTLY `yes` or `no`; the engine treats any response starting with `y` as addressed.
 
 **No third-party Python dependencies** — relies entirely on capabilities already resolved through the core service manager.
 

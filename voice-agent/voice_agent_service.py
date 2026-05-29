@@ -112,6 +112,61 @@ _DEFAULT_GOODBYE_PHRASES = [
 ]
 
 
+# Lowercased single-word filler / non-content tokens. A transcript
+# whose token set is a subset of this gets dropped by the engine's
+# cheap noise filter before any LLM gate runs. Tuned for the
+# common "Scribe transcribed a cough as a single word" case:
+# coughs, throat-clears, ambient "uh" / "hmm" / "huh" that aren't
+# meant to address the assistant. Conservative — if Scribe heard
+# "uh, what time is it" the noise tokens alone aren't the whole
+# utterance and it passes through.
+_DEFAULT_NOISE_WORDS = [
+    "uh", "um", "umm", "hmm", "hm", "mmm", "mm", "mhm",
+    "ah", "ahh", "oh", "ohh", "eh", "ehh", "huh",
+    "yeah", "yep", "yup", "nah", "nope",
+    "ok", "okay", "right",
+    "haha", "hehe", "lol",
+    "you", "the",  # Scribe occasionally truncates a noise to one tiny word
+]
+
+
+def _parse_noise_words(raw: Any) -> frozenset[str]:
+    """Accept either a list (programmatic / YAML) or a
+    comma-separated string (Settings UI) and return a normalized
+    frozenset of lowercased single-word tokens. Empty / None falls
+    back to ``_DEFAULT_NOISE_WORDS``.
+    """
+    if raw is None or raw == "":
+        items: list[Any] = list(_DEFAULT_NOISE_WORDS)
+    elif isinstance(raw, str):
+        items = [w for w in raw.replace("\n", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        items = [raw]
+    return frozenset(
+        str(w).strip().lower()
+        for w in items
+        if str(w).strip()
+    )
+
+
+_DEFAULT_ADDRESS_GATE_PROMPT = (
+    "You are a gate that decides whether the latest user utterance "
+    "is directed at the AI assistant (Gilbert), versus background "
+    "chatter, a remark to someone else nearby, a cough/throat-clear "
+    "the speech recognizer interpreted as words, or an aside the "
+    "user didn't intend the assistant to hear. The assistant is "
+    "always listening in a long-running open-mic voice session, so "
+    "the default should NOT be 'yes' — only answer yes when the "
+    "utterance reads like a question, command, or statement clearly "
+    "meant for the assistant. Single-word fillers, partial sentences "
+    "that don't form a coherent address, casual asides, and "
+    "obviously incomplete fragments → no. Reply with EXACTLY one "
+    "word: 'yes' or 'no'. No punctuation, no explanation."
+)
+
+
 _DEFAULT_SYSTEM_PROMPT = (
     "You are Gilbert, the user's personal AI assistant, responding to a "
     "voice interaction. Keep replies short — one or two sentences max. "
@@ -1227,6 +1282,58 @@ class VoiceAgentService(Service):
                 multiline=True,
                 ai_prompt=True,
             ),
+            ConfigParam(
+                key="min_address_chars",
+                type=ToolParameterType.NUMBER,
+                description=(
+                    "Drop transcripts shorter than this many characters "
+                    "(after stripping punctuation) without dispatching a "
+                    "response. Catches coughs and throat-clears that "
+                    "Scribe transcribes as one or two characters. Set to "
+                    "0 to disable the length gate."
+                ),
+                default=2,
+            ),
+            ConfigParam(
+                key="noise_words",
+                type=ToolParameterType.STRING,
+                description=(
+                    "Comma-separated list of single-word fillers (uh, "
+                    "hmm, yeah, …). A transcript whose tokens are ALL "
+                    "in this list gets dropped before any LLM call. "
+                    "Lowercased; the engine does case-insensitive "
+                    "comparison. Leave blank to disable the noise-word "
+                    "gate."
+                ),
+                default=", ".join(_DEFAULT_NOISE_WORDS),
+            ),
+            ConfigParam(
+                key="address_gate_enabled",
+                type=ToolParameterType.BOOLEAN,
+                description=(
+                    "When on, a cheap LLM call runs before every "
+                    "response to decide whether the user was addressing "
+                    "the assistant (vs. talking to someone else / "
+                    "muttering). Adds ~100-300 ms to genuine turns but "
+                    "skips the FULL agentic LLM call when the answer "
+                    "is no, which is the much bigger win on open-mic "
+                    "browser sessions."
+                ),
+                default=True,
+            ),
+            ConfigParam(
+                key="address_gate_prompt",
+                type=ToolParameterType.STRING,
+                description=(
+                    "System prompt for the addressing-gate LLM call. "
+                    "Must instruct the model to reply EXACTLY 'yes' or "
+                    "'no'. The engine treats any response starting "
+                    "with 'y' as addressed."
+                ),
+                default=_DEFAULT_ADDRESS_GATE_PROMPT,
+                multiline=True,
+                ai_prompt=True,
+            ),
         ]
 
     async def on_config_changed(self, config: dict[str, Any]) -> None:
@@ -1619,6 +1726,26 @@ class VoiceAgentService(Service):
             # its own _VoiceConversationRecord (visible at /voice);
             # the chat() history entity is internal bookkeeping.
             source="voice_agent",
+            # Addressing gates. Open-mic browser sessions hear every
+            # cough, throat clear, and ambient chatter — the engine
+            # would otherwise dispatch each as a full LLM turn (and
+            # often try to respond to coughs). Both gates default
+            # off in ``ConversationConfig``; voice-agent opts BOTH
+            # in with sensible defaults users can override from
+            # /settings.
+            min_address_chars=int(
+                self._config.get("min_address_chars", 2) or 2
+            ),
+            noise_words=_parse_noise_words(
+                self._config.get("noise_words"),
+            ),
+            address_gate_enabled=bool(
+                self._config.get("address_gate_enabled", True)
+            ),
+            address_gate_prompt=str(
+                self._config.get("address_gate_prompt")
+                or _DEFAULT_ADDRESS_GATE_PROMPT
+            ),
             audio_input_format=_STTAudioFormat(
                 encoding=_STTAudioEncoding.PCM_S16LE,
                 sample_rate=16000,
